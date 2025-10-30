@@ -1,0 +1,60 @@
+# Copy this file to .env and fill in credentials as needed
+# cp example_env.txt .env
+
+# ---------------------------
+# Pipeline storage backend
+# ---------------------------
+# LOCAL: use local filesystem (default)
+# BLOB: Azure Blob Storage (read/write)
+# RO_BLOB: Azure Blob Storage (read-only)
+export DATA_PIPELINE_DB=LOCAL
+
+# ---------------------------
+# Output locations
+# ---------------------------
+# Bounding box and storms registry
+export RESULTS_DIR=results
+export BBOX_FILE=bbox.parquet
+export STORMS_FILE=storms.json
+
+# Base and impact views
+export ROOT_DATA_DIR=geodb
+export VIEWS_DIR=aos_views
+
+# ---------------------------
+# Snowflake (required for data)
+# ---------------------------
+export SNOWFLAKE_ACCOUNT=your_account
+export SNOWFLAKE_USER=your_user
+export SNOWFLAKE_PASSWORD=your_password
+export SNOWFLAKE_WAREHOUSE=your_warehouse
+export SNOWFLAKE_DATABASE=your_database
+export SNOWFLAKE_SCHEMA=your_schema
+
+# ---------------------------
+# Azure Blob Storage (only if DATA_PIPELINE_DB=BLOB or RO_BLOB)
+# ---------------------------
+# ACCOUNT_URL example: https://<account_name>.blob.core.windows.net
+# SAS_TOKEN should start with ?sv=...
+# export ACCOUNT_URL=
+# export SAS_TOKEN=
+
+# ---------------------------
+# API tokens
+# ---------------------------
+# REQUIRED for school locations via GIGA API
+# Obtain from GIGA and set to enable school fetching
+export GIGA_SCHOOL_LOCATION_API_KEY=
+
+# REQUIRED for HealthSites facility fetching
+# Obtain from HealthSites/OpenStreetMap ecosystem as configured by your org
+export HEALTHSITES_API_KEY=
+
+# Optional: Mapbox token if used elsewhere
+# export MAPBOX_TOKEN=
+
+# GeoRepo token (preferred/required depending on your access policy)
+# If your organization requires authenticated access to GeoRepo, set this
+# export GEOREPO_TOKEN=
+
+# Note: Admin boundaries are usually public via GigaSpatial handlers if not restricted

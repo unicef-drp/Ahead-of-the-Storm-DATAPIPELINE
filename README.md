@@ -5,6 +5,34 @@
 1. **Python 3.11+** installed
 2. **Virtual environment** activated (`.venv`)
 3. **Environment variables** configured in `.env` file
+   - Start from the provided example: `cp example_env.txt .env`
+   - Edit values to match your environment (Snowflake, optional Azure)
+
+### Environment setup (recommended)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Required environment variables
+
+- RESULTS_DIR (default: `results`)
+- BBOX_FILE (e.g., `bbox.parquet`)
+- STORMS_FILE (e.g., `storms.json`)
+- ROOT_DATA_DIR (e.g., `geodb`)
+- VIEWS_DIR (e.g., `aos_views`)
+- SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
+- DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` or `RO_BLOB` for Azure)
+  - If `BLOB` or `RO_BLOB`, also set: `ACCOUNT_URL`, `SAS_TOKEN`
+
+### API tokens
+- GIGA_SCHOOL_LOCATION_API_KEY (required to fetch school locations)
+- HEALTHSITES_API_KEY (required to fetch health center locations)
+- GEOREPO_TOKEN (preferred/required if your org restricts GeoRepo access)
+
 
 ## Step 1: Set Up Bounding Box (Required Only Once)
 
@@ -42,6 +70,10 @@ python main_pipeline.py --type initialize
 
 **Note:** This process can take 30-60 minutes and downloads several GB of data. It only needs to be run once, or when you add new countries.
 
+Requirements:
+- GIGA_SCHOOL_LOCATION_API_KEY and HEALTHSITES_API_KEY must be set
+- Network access to data sources (WorldPop, GHSL, SMOD, GIGA, HealthSites)
+
 
 ## Step 3: Process Storm Data
 
@@ -68,6 +100,13 @@ python main_pipeline.py
    - Checks if envelopes intersect with region of interest
    - Creates impact views for each country in the region
    - Marks storm as processed in `storms.json`
+
+Requirements:
+- Valid Snowflake credentials (`SNOWFLAKE_*`)
+- Network access to Snowflake
+
+Note:
+- `--skip-analysis` does not bypass Snowflake fetching in the current `update` flow.
 
 **Output Example:**
 ```
@@ -122,6 +161,18 @@ Impact analysis completed successfully
 - You can skip problematic countries or run with only working ones:
   ```bash
   python main_pipeline.py --countries ATG BLZ DOM
+  ```
+
+### "Operation not permitted" during initialize (WorldPop/GHSL downloads)
+- Ensure your output/base directories exist and are writable:
+  ```bash
+  mkdir -p "${RESULTS_DIR:-results}" "${ROOT_DATA_DIR:-geodb}"/aos_views/{mercator_views,school_views,hc_views,track_views}
+  ```
+- If you are working from a protected/synced folder (e.g., OneDrive), consider running the project from a regular local path (e.g., `~/Projects/...`) or set your paths to a local writable directory.
+- On macOS, you may need to grant Terminal/IDE Full Disk Access.
+- If SSL issues appear during downloads, install system certs:
+  ```bash
+  pip install pip-system-certs
   ```
 
 ## Quick Start Summary

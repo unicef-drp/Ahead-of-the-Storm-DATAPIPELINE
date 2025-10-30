@@ -112,7 +112,6 @@ def get_envelopes_from_snowflake(track_id, forecast_time):
         FORECAST_TIME,
         TRACK_ID,
         ENSEMBLE_MEMBER,
-        VALID_TIME,
         LEAD_TIME_RANGE,
         WIND_THRESHOLD,
         ST_ASWKT(ENVELOPE_REGION) AS ENVELOPE_REGION
