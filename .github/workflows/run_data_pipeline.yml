@@ -1,0 +1,207 @@
+name: Run Data Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipeline_type:
+        description: 'Pipeline type to run'
+        required: true
+        default: 'update'
+        type: choice
+        options:
+          - initialize
+          - update
+      countries:
+        description: 'Comma-separated country codes (e.g., ATG,BLZ,DOM). Leave empty for default.'
+        required: false
+        type: string
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3 hours max (initialize can take 30-60 min per country)
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gdal-bin \
+            libgdal-dev \
+            python3-gdal
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Create temporary requirements file without giga-spatial
+          grep -v "giga-spatial" requirements.txt > /tmp/requirements_temp.txt || true
+          pip install -r /tmp/requirements_temp.txt
+          # Install giga-spatial separately (may need special handling)
+          pip install giga-spatial>=0.7.0
+
+      - name: Create output directories
+        run: |
+          mkdir -p results geodb/aos_views/{mercator_views,school_views,hc_views,track_views}
+
+      - name: Configure environment variables
+        env:
+          # Pipeline configuration
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB || 'BLOB' }}
+          RESULTS_DIR: ${{ secrets.RESULTS_DIR || 'results' }}
+          BBOX_FILE: ${{ secrets.BBOX_FILE || 'bbox.parquet' }}
+          STORMS_FILE: ${{ secrets.STORMS_FILE || 'storms.json' }}
+          ROOT_DATA_DIR: ${{ secrets.ROOT_DATA_DIR || 'geodb' }}
+          VIEWS_DIR: ${{ secrets.VIEWS_DIR || 'aos_views' }}
+          
+          # Snowflake credentials
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          
+          # Azure Blob Storage (if using BLOB mode)
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          
+          # API tokens
+          GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
+          HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
+          GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY || '' }}
+          GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL || '' }}
+        run: |
+          echo "Environment configured"
+
+      - name: Initialize bounding box (if needed)
+        env:
+          # Re-declare env vars for this step
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB || 'BLOB' }}
+          RESULTS_DIR: ${{ secrets.RESULTS_DIR || 'results' }}
+          BBOX_FILE: ${{ secrets.BBOX_FILE || 'bbox.parquet' }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
+          HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
+          GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY || '' }}
+          GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL || '' }}
+        run: |
+          # Check if bounding box exists, create if not
+          python -c "
+          from data_store_utils import get_data_store
+          from config import config
+          import os
+          data_store = get_data_store()
+          bbox_path = os.path.join(config.RESULTS_DIR, config.BBOX_FILE)
+          if not data_store.file_exists(bbox_path):
+              print('Creating bounding box...')
+              from impact_analysis import save_bounding_box
+              countries = ['ATG','BLZ','NIC','DOM','DMA','GRD','MSR','KNA','LCA','VCT','AIA','VGB']
+              save_bounding_box(countries)
+              print('Bounding box created')
+          else:
+              print('Bounding box already exists')
+          "
+        continue-on-error: true
+
+      - name: Run pipeline
+        env:
+          # Re-declare all env vars for this step
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB || 'BLOB' }}
+          RESULTS_DIR: ${{ secrets.RESULTS_DIR || 'results' }}
+          BBOX_FILE: ${{ secrets.BBOX_FILE || 'bbox.parquet' }}
+          STORMS_FILE: ${{ secrets.STORMS_FILE || 'storms.json' }}
+          ROOT_DATA_DIR: ${{ secrets.ROOT_DATA_DIR || 'geodb' }}
+          VIEWS_DIR: ${{ secrets.VIEWS_DIR || 'aos_views' }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+          GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
+          HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
+          GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY || '' }}
+          GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL || '' }}
+        run: |
+          # Determine countries to process
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.countries }}" ]; then
+            COUNTRIES="${{ inputs.countries }}"
+          else
+            COUNTRIES="ATG JAM BLZ NIC DOM DMA GRD MSR KNA LCA VCT AIA VGB"
+          fi
+          
+          # Determine pipeline type
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TYPE="${{ inputs.pipeline_type }}"
+          else
+            TYPE="update"
+          fi
+          
+          # Run the pipeline
+          python main_pipeline.py \
+            --type "$TYPE" \
+            --hazard hurricane \
+            --zoom 14 \
+            --countries $COUNTRIES \
+            --log-level INFO
+
+      - name: Upload results to Azure Blob (if using LOCAL mode)
+        env:
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB || 'BLOB' }}
+          ACCOUNT_URL: ${{ secrets.ACCOUNT_URL }}
+          SAS_TOKEN: ${{ secrets.SAS_TOKEN }}
+        run: |
+          # Only upload if using LOCAL mode
+          if [ "$DATA_PIPELINE_DB" = "LOCAL" ]; then
+            echo "Uploading results to Azure Blob Storage..."
+            # Install Azure CLI
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+            
+            # Upload results directory
+            az storage blob upload-batch \
+              --account-url "$ACCOUNT_URL" \
+              --sas-token "$SAS_TOKEN" \
+              --destination results \
+              --source results \
+              --overwrite || echo "Failed to upload results directory"
+            
+            # Upload geodb directory
+            az storage blob upload-batch \
+              --account-url "$ACCOUNT_URL" \
+              --sas-token "$SAS_TOKEN" \
+              --destination geodb \
+              --source geodb \
+              --overwrite || echo "Failed to upload geodb directory"
+          else
+            echo "Skipping upload - using $DATA_PIPELINE_DB mode (results already in Azure)"
+          fi
+        continue-on-error: true
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs
+          path: |
+            main_pipeline.log
+            results/
+          retention-days: 7
+
