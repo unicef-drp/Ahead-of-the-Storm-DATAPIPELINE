@@ -15,6 +15,18 @@ on:
         description: 'Comma-separated country codes (e.g., ATG,BLZ,DOM). Leave empty for default.'
         required: false
         type: string
+      storm:
+        description: 'Specific storm name to process (e.g., JERRY)'
+        required: false
+        type: string
+      forecast_date:
+        description: 'Forecast date (YYYYMMDD or YYYY-MM-DD)'
+        required: false
+        type: string
+      forecast_run:
+        description: 'Forecast run time (HHMM or HH:MM)'
+        required: false
+        type: string
 
 jobs:
   run-pipeline:
@@ -154,14 +166,48 @@ jobs:
           else
             TYPE="update"
           fi
-          
-          # Run the pipeline
-          python main_pipeline.py \
-            --type "$TYPE" \
-            --hazard hurricane \
-            --zoom 14 \
-            --countries $COUNTRIES \
-            --log-level INFO
+
+          # If storm, forecast_date and forecast_run provided, run only that target directly
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.storm }}" ] && [ -n "${{ inputs.forecast_date }}" ] && [ -n "${{ inputs.forecast_run }}" ]; then
+            echo "Running targeted pipeline for storm=${{ inputs.storm }}, forecast_date=${{ inputs.forecast_date }}, forecast_run=${{ inputs.forecast_run }}"
+            python - << 'PYCODE'
+import os
+from main_pipeline import run_hurricane_pipeline
+import re
+
+storm = os.environ.get('INPUT_STORM') or "${{ inputs.storm }}"
+raw_date = os.environ.get('INPUT_FORECAST_DATE') or "${{ inputs.forecast_date }}"
+raw_run = os.environ.get('INPUT_FORECAST_RUN') or "${{ inputs.forecast_run }}"
+countries = (os.environ.get('INPUT_COUNTRIES') or "${{ inputs.countries }}" or "ATG JAM BLZ NIC DOM DMA GRD MSR KNA LCA VCT AIA VGB").split()
+
+# Normalize date/run to YYYYMMDD and HHMM
+date_digits = re.sub(r'\D', '', raw_date or '')
+run_digits = re.sub(r'\D', '', raw_run or '')
+if len(date_digits) != 8 or len(run_digits) not in (2,4):
+    raise SystemExit(f"Invalid forecast_date or forecast_run: date='{raw_date}', run='{raw_run}'")
+if len(run_digits) == 2:
+    run_digits = f"{run_digits}00"
+forecast_time = f"{date_digits}{run_digits}00"
+
+stats = run_hurricane_pipeline(
+    storm=storm,
+    forecast_time=forecast_time,
+    countries=countries,
+    skip_analysis=False,
+    log_level="INFO",
+    zoom=14,
+)
+print("Done. Success=", stats.analysis_success)
+PYCODE
+          else
+            echo "Running standard pipeline: type=$TYPE"
+            python main_pipeline.py \
+              --type "$TYPE" \
+              --hazard hurricane \
+              --zoom 14 \
+              --countries $COUNTRIES \
+              --log-level INFO
+          fi
 
       - name: Upload results to Azure Blob (if using LOCAL mode)
         env:
