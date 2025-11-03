@@ -1,4 +1,9 @@
-# Ahead of the Storm – Setup Guide
+# Ahead of the Storm – Data Processing Setup Guide
+
+## Related Repositories
+- **[Ahead-of-the-Storm](https://github.com/unicef-drp/Ahead-of-the-Storm)**: Dash web application for visualizing hurricane impact forecasts. The application displays interactive maps, probabilistic analysis, and impact reports based on pre-processed hurricane data
+- **[TC-ECMWF-Forecast-Pipeline](https://github.com/unicef-drp/TC-ECMWF-Forecast-Pipeline)**: Pipeline for processing ECMWF BUFR tropical cyclone and wind forecast data
+
 
 ## Prerequisites
 
