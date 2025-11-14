@@ -1,4 +1,4 @@
-# [NOT UPDATED YET] File Structure and Output Directories
+# File Structure and Output Directories
 
 This document lists all files produced and downloaded by the Ahead of the Storm pipeline, organized by directory structure.
 
@@ -35,8 +35,8 @@ The pipeline uses environment variables to configure base directories:
   - School locations (count per tile)
   - Health center locations (count per tile)
   - Relative Wealth Index (RWI)
-  - Administrative boundary IDs
-- **Created by:** `save_mercator_view()`
+  - Administrative boundary IDs (admin level 1)
+- **Created by:** `create_mercator_country_layer()` via `save_mercator_and_admin_views()`
 - **Note:** One file per country per zoom level
 
 ### 3. Base Admin Views (per country)
@@ -53,8 +53,9 @@ The pipeline uses environment variables to configure base directories:
   - Average RWI
   - Average SMOD class
   - Administrative names and geometries
-- **Created by:** `save_admin_view()`
-- **Note:** One file per country
+  - Admin boundary IDs
+- **Created by:** `create_admin_country_layer()` via `save_mercator_and_admin_views()`
+- **Note:** One file per country, created during initialize
 
 ### 4. Health Center Locations (per country, cached)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_health_centers.parquet`

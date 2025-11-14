@@ -58,20 +58,26 @@ python -c "from impact_analysis import save_bounding_box; countries = ['ATG','BL
 
 ## Step 2: Initialize Base Data (Required Only Once or After Adding Countries)
 
-This step creates the mercator tile views with demographic and infrastructure data for each country.
+This step creates the mercator tile views and admin level views with demographic and infrastructure data for each country.
 
 **Command:**
 ```bash
-python main_pipeline.py --type initialize
+python main_pipeline.py --type initialize --zoom 14 --rewrite 0
 ```
 
+**Parameters:**
+- `--zoom` (default: 14): Zoom level for mercator tiles
+- `--rewrite` (default: 0): Set to 1 to rewrite existing views, 0 to skip if they exist
+- `--countries`: List of country codes (default: Caribbean + Central America countries)
+
 **What it does:**
-- Creates mercator tiles for each country at zoom level 14
-- Downloads and aggregates demographic data (WorldPop population)
+- Creates mercator tiles for each country at specified zoom level
+- Creates admin level 1 views for each country
+- Downloads and aggregates demographic data (WorldPop population, school age, infants)
 - Downloads and aggregates infrastructure data (GHSL built surface, SMOD settlement)
 - Fetches school locations (via GIGA API)
-- Fetches health center locations (via HealthSites API)
-- Saves base views to `geodb/aos_views/mercator_views/`
+- Fetches health center locations (via HealthSites API) - cached after first fetch
+- Saves base views to `geodb/aos_views/mercator_views/` and `geodb/aos_views/admin_views/`
 
 **Note:** This process can take 30-60 minutes and downloads several GB of data. It only needs to be run once, or when you add new countries.
 
@@ -86,24 +92,43 @@ Once initialized, you can run the pipeline to process hurricane data from Snowfl
 
 **Command:**
 ```bash
-python main_pipeline.py
+python main_pipeline.py --type update --time_delta 9 --rewrite 0
 ```
+
+**Parameters:**
+- `--type` (default: update): Pipeline mode (initialize or update)
+- `--time_delta` (default: 9): Number of days in the past to consider storms for analysis
+- `--rewrite` (default: 0): Set to 1 to force reprocessing of existing storms, 0 to skip already processed
+- `--countries`: List of country codes to process
+- `--zoom` (default: 14): Zoom level for tiles
+- `--skip-analysis`: Skip analysis step (for testing)
 
 **What it does:**
 - Connects to Snowflake and retrieves available storm data
+- Filters storms by time delta (only processes storms within N days of today)
 - For each storm/forecast combination that intersects the bounding box:
   - Loads hurricane envelope data
-  - Creates impact views for schools, health centers, tiles, and tracks
+  - Creates impact views for schools, health centers, tiles, tracks, and admin levels
+  - Calculates Cumulative Climate Impact (CCI) indices
+  - Generates JSON impact reports
   - Saves views to `geodb/aos_views/hc_views/`, `geodb/aos_views/school_views/`, etc.
   - Records processed storms in `storms.json`
 
 **Process Flow:**
 1. Reads `storms.json` to track which storms have been processed
 2. Queries Snowflake for new storms
-3. For each storm not yet processed:
+3. Filters by time delta (only recent storms)
+4. For each storm not yet processed (or if `rewrite=1`):
    - Loads envelope data (wind impact areas at different thresholds)
    - Checks if envelopes intersect with region of interest
-   - Creates impact views for each country in the region
+   - Creates impact views for each country in the region:
+     - School impact views (probability per wind threshold)
+     - Health center impact views (probability per wind threshold)
+     - Tile impact views (expected impacts per tile)
+     - Admin level impact views (aggregated by admin level 1)
+     - CCI views (cumulative climate impact indices)
+     - Track views (severity metrics per ensemble member)
+   - Generates JSON impact reports
    - Marks storm as processed in `storms.json`
 
 Requirements:
@@ -190,14 +215,19 @@ python -c "from impact_analysis import save_bounding_box; save_bounding_box(['AT
 python main_pipeline.py --type initialize
 
 # 3. Process storms (run regularly to update with new storm data)
-python main_pipeline.py
+python main_pipeline.py --type update
 ```
 
 ## Data Storage
 
-- **Bounding box:** `project_results/climate/lacro_project/bbox.parquet`
-- **Base views:** `geodb/aos_views/mercator_views/`
-- **Impact views:** `geodb/aos_views/hc_views/`, `geodb/aos_views/school_views/`, etc.
-- **Processed storms:** `project_results/climate/lacro_project/storms.json`
-- **Raw data:** `geodb/bronze/` (downloaded automatically)
+- **Bounding box:** `{RESULTS_DIR}/{BBOX_FILE}` (e.g., `project_results/climate/lacro_project/bbox.parquet`)
+- **Base mercator views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/` (e.g., `geodb/aos_views/mercator_views/`)
+- **Base admin views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/` (e.g., `geodb/aos_views/admin_views/`)
+- **Impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/`, `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/`, etc.
+- **CCI views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/` and `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/` (with `_cci.csv` suffix)
+- **Impact reports:** `{RESULTS_DIR}/jsons/` (JSON files per country/storm/forecast)
+- **Processed storms:** `{RESULTS_DIR}/{STORMS_FILE}` (e.g., `project_results/climate/lacro_project/storms.json`)
+- **Raw data:** `{ROOT_DATA_DIR}/bronze/` (downloaded automatically)
+
+See `FILE_STRUCTURE.md` for detailed file structure and naming conventions.
 

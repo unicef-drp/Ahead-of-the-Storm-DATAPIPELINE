@@ -30,6 +30,52 @@ warnings.filterwarnings('ignore', message='pandas only supports SQLAlchemy conne
 # Import centralized configuration
 from config import config
 
+def get_snowflake_tracks(date, storm):
+    """
+    Get hurricane track data from Snowflake TC_TRACKS table for report generation
+    
+    Args:
+        date: Forecast date in YYYYMMDDHHMMSS format or datetime string
+        storm: Storm identifier (e.g., 'JERRY')
+    
+    Returns:
+        pandas.DataFrame: Hurricane track data with coordinates and wind speeds
+    """
+    # Convert date format if needed
+    if len(date) == 14:  # YYYYMMDDHHMMSS format
+        # Convert to datetime string format
+        dt = pd.to_datetime(date, format="%Y%m%d%H%M%S")
+        forecast_datetime = dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        forecast_datetime = date
+    
+    # Load Hurricane Tracks
+    try:
+        conn = get_snowflake_connection()
+        
+        print(f"Loading tracks for storm={storm}, forecast_time={forecast_datetime}")
+        
+        query = '''
+        SELECT 
+            ENSEMBLE_MEMBER,
+            VALID_TIME,
+            LEAD_TIME,
+            LATITUDE,
+            LONGITUDE,
+            WIND_SPEED_KNOTS,
+            PRESSURE_HPA
+        FROM TC_TRACKS
+        WHERE TRACK_ID = %s AND FORECAST_TIME = %s
+        ORDER BY ENSEMBLE_MEMBER, VALID_TIME
+        '''
+        
+        df_tracks = pd.read_sql(query, conn, params=[storm, forecast_datetime])
+        conn.close()
+        return df_tracks
+    except Exception as e:
+        print(f"Error loading tracks: {e}")
+        return pd.DataFrame()
+
 def get_snowflake_connection():
     """Create Snowflake connection from centralized configuration."""
     config.validate_snowflake_config()
@@ -283,7 +329,7 @@ def get_snowflake_data():
             COUNT(DISTINCT ENSEMBLE_MEMBER) as ENSEMBLE_COUNT
         FROM TC_TRACKS
         GROUP BY TRACK_ID, FORECAST_TIME
-        ORDER BY FORECAST_TIME DESC, TRACK_ID
+        ORDER BY FORECAST_TIME ASC, TRACK_ID
         '''
         
         df = pd.read_sql(query, conn)

@@ -21,7 +21,7 @@ import os
 import sys
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 
 # Add the project root to Python path so we can import components
@@ -45,7 +45,8 @@ from impact_analysis import (
     read_bounding_box,
     is_envelope_in_zone,
     create_views_from_envelopes_in_country,
-    save_mercator_views,
+    save_mercator_and_admin_views,
+    save_admin_views,
     save_bounding_box,
     save_json_storms,
     load_json_storms
@@ -236,12 +237,13 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
     
 ############ INIT ###############
 
-def initialize_pipeline(countries,zoom):
+def initialize_pipeline(countries,zoom,rewrite):
     """
     Initializes the data pipeline
     """
     stats = ImpactPipelineStats()
-    save_mercator_views(countries,zoom)
+    save_mercator_and_admin_views(countries,zoom,rewrite)
+    #save_admin_views(countries)
     save_bounding_box(countries)
     stats.analysis_success = True
 
@@ -249,7 +251,7 @@ def initialize_pipeline(countries,zoom):
 
 #################################
 
-def update_storms(countries, skip_analysis, log_level, zoom):
+def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta):
 
 
     d = load_json_storms()
@@ -260,29 +262,36 @@ def update_storms(countries, skip_analysis, log_level, zoom):
 
     for _,row in storms_df.iterrows():
         storm = row['TRACK_ID']
-        forecast_date = str(row['DATE'])
+        forecast_date = row['DATE']
         forecast_time = row['TIME']
 
-        date_str = forecast_date.replace('-', '')
-        time_str = forecast_time.replace(':', '')
-        forecast_datetime_str = f"{date_str}{time_str}00"
+        # Get today's date
+        today = datetime.today().date()
 
-        if storm not in d['storms'] or forecast_datetime_str not in d['storms'][storm]:
-            stats = run_hurricane_pipeline(
-                storm=storm,
-                forecast_time=forecast_datetime_str,
-                countries=countries,
-                skip_analysis=skip_analysis,
-                log_level=log_level,
-                zoom=zoom
-            )
-            if stats.analysis_success:
-                print(f"\nPipeline completed successfully for storm {storm} in {forecast_datetime_str}")
-                if storm not in d['storms']:
-                    d['storms'][storm] = []
-                d['storms'][storm].append(forecast_datetime_str)
-            else:
-                print(f"\nPipeline with errors for storm {storm} in {forecast_datetime_str}")
+        if (today - forecast_date).days < time_delta:
+
+            date_str = str(forecast_date).replace('-', '')
+            time_str = forecast_time.replace(':', '')
+            forecast_datetime_str = f"{date_str}{time_str}00"
+
+            if (storm not in d['storms'] or forecast_datetime_str not in d['storms'][storm]) or rewrite==1:
+                stats = run_hurricane_pipeline(
+                    storm=storm,
+                    forecast_time=forecast_datetime_str,
+                    countries=countries,
+                    skip_analysis=skip_analysis,
+                    log_level=log_level,
+                    zoom=zoom
+                )
+                if stats.analysis_success:
+                    print(f"\nPipeline completed successfully for storm {storm} in {forecast_datetime_str}")
+                    if storm not in d['storms']:
+                        d['storms'][storm] = []
+                    d['storms'][storm].append(forecast_datetime_str)
+                else:
+                    print(f"\nPipeline with errors for storm {storm} in {forecast_datetime_str}")
+        else:
+            print("Forecast date outside time delta")
 
     # this does not work yet
     save_json_storms(d)
@@ -304,7 +313,7 @@ def main():
     # parser.add_argument("--date", default="20251022120000", help="Forecast time (e.g., '2025-10-10 00:00:00')")
 
     parser.add_argument("--zoom", type=int, default=14, help="zoom level for tiles")
-    
+    parser.add_argument("--rewrite", type=int, default=0, help="Rewrite existing views (1=yes, 0=no)")
     # Optional arguments
     #["ATG","BLZ","NIC","DOM",'DMA','GRD','MSR','KNA','LCA','VCT','AIA','VGB']
     parser.add_argument("--countries", nargs="+", default=["ATG","JAM","BLZ","NIC","DOM",'DMA','GRD','MSR','KNA','LCA','VCT','AIA','VGB'],
@@ -314,6 +323,7 @@ def main():
     parser.add_argument("--log-level", default="INFO", 
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="Logging level")
+    parser.add_argument("--time_delta", type=int, default=9, help="How many days in the past we consider a storm for analysis")
     
     args = parser.parse_args()
 
@@ -323,14 +333,16 @@ def main():
     if args.hazard == "hurricane":
 
         if args.type=="initialize":
-            stats = initialize_pipeline(args.countries, args.zoom)
+            stats = initialize_pipeline(args.countries, args.zoom, args.rewrite)
         elif args.type=="update":
 
             stats = update_storms(
                 countries=args.countries,
                 skip_analysis=args.skip_analysis,
                 log_level=args.log_level,
-                zoom=args.zoom
+                zoom=args.zoom,
+                rewrite=args.rewrite,
+                time_delta=args.time_delta
             )
         else:
             print(f"Error:Type '{args.type}' not yet implemented")
