@@ -1,0 +1,1366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hurricane Impact Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f8f9fa;
+            padding: 20px;
+            color: #333;
+        }
+
+        .report-container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .report-header {
+            background: linear-gradient(135deg, #1CABE2 0%, #1594C7 100%);
+            color: white;
+            padding: 32px;
+            text-align: center;
+        }
+
+        .report-title {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }
+
+        .report-subtitle {
+            font-size: 16px;
+            opacity: 0.95;
+            font-weight: 400;
+        }
+
+        .report-body {
+            padding: 32px;
+        }
+
+        .section {
+            margin-bottom: 40px;
+        }
+
+        .section-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #1CABE2;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #1CABE2;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-bottom: 12px;
+            page-break-inside: avoid;
+        }
+
+        .info-item {
+            background: white;
+            padding: 12px 16px;
+            border-left: 4px solid #1CABE2;
+            border-top: 1px solid #e9ecef;
+            border-right: 1px solid #e9ecef;
+            border-bottom: 1px solid #e9ecef;
+            page-break-inside: avoid;
+        }
+
+        .info-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+
+        .info-value {
+            font-size: 14px;
+            font-weight: 700;
+            color: #333;
+        }
+
+        .key-findings {
+            background: white;
+            padding: 10px 14px;
+            margin-bottom: 16px;
+            border-left: 4px solid #1CABE2;
+            border-top: 1px solid #e9ecef;
+            border-right: 1px solid #e9ecef;
+            border-bottom: 1px solid #e9ecef;
+            page-break-inside: avoid;
+        }
+
+        .key-findings h3 {
+            color: #1CABE2;
+            font-size: 14px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        .key-findings ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            page-break-inside: avoid;
+        }
+
+        .key-findings li {
+            padding: 2px 0;
+            padding-left: 16px;
+            position: relative;
+            line-height: 1.3;
+            font-size: 12px;
+            page-break-inside: avoid;
+        }
+
+        .key-findings li:before {
+            content: '▸';
+            position: absolute;
+            left: 4px;
+            color: #1CABE2;
+            font-weight: bold;
+        }
+
+        .impact-stat {
+            text-align: center;
+            padding: 24px;
+            background: linear-gradient(135deg, #1CABE2 0%, #4FC3F7 100%);
+            color: white;
+            border-radius: 8px;
+            margin-bottom: 24px;
+        }
+
+        .impact-stat-number {
+            font-size: 48px;
+            font-weight: 900;
+            margin-bottom: 8px;
+        }
+
+        .impact-stat-label {
+            font-size: 16px;
+            font-weight: 600;
+            opacity: 0.95;
+        }
+
+        .facilities-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+            font-size: 12px;
+        }
+
+        .facilities-table th {
+            background: #1CABE2;
+            color: white;
+            padding: 4px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .facilities-table td {
+            padding: 4px;
+            border-bottom: 1px solid #e9ecef;
+            font-size: 12px;
+        }
+
+        .facilities-table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-high {
+            background: #dc3545;
+            color: white;
+            border: 1px solid #dc3545;
+        }
+
+        .status-medium {
+            background: #ffc107;
+            color: #000;
+            border: 1px solid #ffc107;
+        }
+
+        .status-low {
+            background: #28a745;
+            color: white;
+            border: 1px solid #28a745;
+        }
+
+        .map-placeholder {
+            width: 100%;
+            height: 300px;
+            background: linear-gradient(135deg, #e9ecef 0%, #dee2e6 100%);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #6c757d;
+            font-size: 16px;
+            font-weight: 500;
+            margin: 16px 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .map-overlay {
+            position: absolute;
+            top: 25%;
+            right: 20%;
+            width: 200px;
+            height: 150px;
+            background: radial-gradient(ellipse at center, 
+                rgba(28, 171, 226, 0.3) 0%,
+                rgba(28, 171, 226, 0.1) 40%,
+                transparent 100%);
+            border-radius: 50%;
+        }
+
+        .scenario-comparison {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin: 20px 0;
+        }
+
+        .scenario-card {
+            background: white;
+            border: 2px solid #e9ecef;
+            border-radius: 6px;
+            padding: 16px;
+            text-align: center;
+            transition: all 0.2s ease;
+        }
+
+        .scenario-card:hover {
+            border-color: #1CABE2;
+        }
+
+        .scenario-card.active {
+            border-color: #1CABE2;
+            background: #f8f9fa;
+        }
+
+        .scenario-title {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 8px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .scenario-number {
+            font-size: 24px;
+            font-weight: 700;
+            color: #333;
+            margin-bottom: 4px;
+        }
+
+        .scenario-prob {
+            font-size: 12px;
+            color: #999;
+        }
+        
+        .footer {
+            background-color: #fff3cd;
+            padding: 16px 32px;
+            text-align: left;
+            color: #856404;
+            font-size: 12px;
+            font-weight: 500;
+            border-top: 2px solid #ffc107;
+        }
+
+        .change-indicator {
+            display: inline-block;
+            margin-left: 4px;
+            padding: 1px 4px;
+            border-radius: 0;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-align: baseline;
+            line-height: 1.2;
+        }
+        
+        /* Small increases (light red) */
+        .change-increase-small {
+            background-color: #ffe0e0;
+            color: #8b0000;
+            border: none;
+        }
+        
+        /* Medium increases (medium red) */
+        .change-increase-medium {
+            background-color: #ffb3b3;
+            color: #660000;
+            border: none;
+        }
+        
+        /* Large increases (dark red) */
+        .change-increase-large {
+            background-color: #ff6666;
+            color: #330000;
+            border: none;
+        }
+        
+        /* Small decreases (light blue) */
+        .change-decrease-small {
+            background-color: #e0f0ff;
+            color: #003366;
+            border: none;
+        }
+        
+        /* Medium decreases (medium blue) */
+        .change-decrease-medium {
+            background-color: #b3d9ff;
+            color: #001a33;
+            border: none;
+        }
+        
+        /* Large decreases (dark blue) */
+        .change-decrease-large {
+            background-color: #66b3ff;
+            color: #000d1a;
+            border: none;
+        }
+        
+        /* Legacy classes for backwards compatibility - map to medium */
+        .change-increase {
+            background-color: #ffb3b3;
+            color: #660000;
+            border: none;
+        }
+        
+        .change-decrease {
+            background-color: #b3d9ff;
+            color: #001a33;
+            border: none;
+        }
+        
+        .back-button {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: #1CABE2;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(28, 171, 226, 0.3);
+            z-index: 1000;
+            transition: background 0.2s;
+        }
+        
+        .back-button:hover {
+            background: #1594C7;
+        }
+        
+        .print-button {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #1CABE2;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(28, 171, 226, 0.3);
+            z-index: 1000;
+            transition: background 0.2s;
+        }
+        
+        .print-button:hover {
+            background: #1594C7;
+        }
+        
+        .breadcrumb {
+            position: fixed;
+            top: 70px;
+            left: 20px;
+            background: rgba(28, 171, 226, 0.1);
+            color: #1CABE2;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+            z-index: 1000;
+            border: 1px solid rgba(28, 171, 226, 0.2);
+        }
+
+        /* Print Styles */
+        @media print {
+            body {
+                font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+                font-size: 12px;
+                line-height: 1.2;
+                padding: 0;
+                margin: 0;
+                color: #000;
+            }
+            
+            .report-container {
+                max-width: none;
+                margin: 0;
+                box-shadow: none;
+                background: white;
+            }
+            
+            .report-header {
+                padding: 12px;
+                page-break-inside: avoid;
+                page-break-after: avoid;
+                background: white !important;
+                color: #000 !important;
+                border-bottom: 1px solid #000;
+            }
+            
+            .report-title {
+                font-size: 18px;
+                color: #000 !important;
+                margin-bottom: 4px;
+            }
+            
+            .report-subtitle {
+                font-size: 12px;
+                color: #000 !important;
+            }
+            
+            .report-body {
+                padding: 12px;
+            }
+            
+            .section {
+                margin-bottom: 12px;
+            }
+            
+            /* Prevent page break after executive summary section */
+            .section:first-of-type {
+                page-break-after: avoid;
+                page-break-before: auto;
+                page-break-inside: avoid;
+            }
+            
+            /* Only prevent breaking inside sections for larger sections */
+            .section:not(:first-of-type) {
+                page-break-inside: avoid;
+            }
+            
+            /* Reduce spacing after key-findings in sections */
+            .section .key-findings {
+                margin-bottom: 4px;
+            }
+            
+            .section-title {
+                font-size: 14px;
+                margin-bottom: 8px;
+                color: #000 !important;
+                border-bottom: 1px solid #000;
+                padding-bottom: 3px;
+                page-break-after: avoid !important;
+            }
+            
+            .info-grid {
+                gap: 8px;
+                margin-bottom: 12px;
+                page-break-inside: avoid !important;
+                page-break-after: avoid !important;
+            }
+            
+            .info-item {
+                padding: 6px 8px;
+                background: white !important;
+                border: 1px solid #000 !important;
+                border-left: 2px solid #000 !important;
+                box-shadow: none !important;
+                page-break-inside: avoid !important;
+            }
+            
+            .info-label {
+                font-size: 11px;
+                color: #000 !important;
+            }
+            
+            .info-value {
+                font-size: 12px;
+                color: #000 !important;
+            }
+            
+            .impact-stat {
+                padding: 10px;
+                margin-bottom: 12px;
+                background: white !important;
+                color: #000 !important;
+                border: 1px solid #000;
+            }
+            
+            .impact-stat-number {
+                font-size: 32px;
+                color: #000 !important;
+            }
+            
+            .impact-stat-label {
+                font-size: 12px;
+                color: #000 !important;
+            }
+            
+            .scenario-comparison {
+                gap: 8px;
+                margin: 12px 0;
+            }
+            
+            .scenario-card {
+                padding: 8px;
+                background: white !important;
+                border: 1px solid #000 !important;
+            }
+            
+            .scenario-card.active {
+                background: white !important;
+                border: 2px solid #000 !important;
+            }
+            
+            .scenario-title {
+                font-size: 11px;
+                color: #000 !important;
+            }
+            
+            .scenario-number {
+                font-size: 16px;
+                color: #000 !important;
+            }
+            
+            .scenario-prob {
+                font-size: 8px;
+                color: #000 !important;
+            }
+            
+            .map-placeholder {
+                height: 120px;
+                margin: 6px 0;
+                background: white !important;
+                border: 1px solid #000;
+                color: #000 !important;
+                font-size: 11px;
+            }
+            
+            .map-overlay {
+                display: none;
+            }
+            
+            .facilities-table {
+                font-size: 10px;
+                border-collapse: collapse;
+            }
+            
+            .facilities-table th {
+                padding: 4px;
+                font-size: 10px;
+                background: white !important;
+                color: #000 !important;
+                border: 1px solid #000;
+            }
+            
+            .facilities-table td {
+                padding: 3px 4px;
+                font-size: 10px;
+                border: 1px solid #ccc;
+                color: #000 !important;
+            }
+            
+            .status-badge {
+                padding: 2px 4px;
+                font-size: 6px;
+                background: white !important;
+                color: #000 !important;
+                border: 1px solid #000;
+            }
+            
+            /* Maintain status badge colors for print */
+            .status-high {
+                background: #dc3545 !important;
+                color: white !important;
+                border: 1px solid #dc3545 !important;
+            }
+            
+            .status-medium {
+                background: #ffc107 !important;
+                color: #000 !important;
+                border: 1px solid #ffc107 !important;
+            }
+            
+            .status-low {
+                background: #28a745 !important;
+                color: white !important;
+                border: 1px solid #28a745 !important;
+            }
+            
+            .key-findings {
+                padding: 6px 10px;
+                margin-bottom: 4px;
+                background: white !important;
+                border: 1px solid #000 !important;
+                border-left: 2px solid #000 !important;
+                box-shadow: none !important;
+                page-break-inside: avoid !important;
+            }
+            
+            .key-findings h3 {
+                font-size: 12px;
+                margin-bottom: 4px;
+                color: #000 !important;
+            }
+            
+            .key-findings ul {
+                page-break-inside: avoid !important;
+            }
+            
+            .key-findings li {
+                padding: 1px 0;
+                padding-left: 12px;
+                font-size: 11px;
+                color: #000 !important;
+                line-height: 1.2;
+                page-break-inside: avoid !important;
+                page-break-after: avoid !important;
+            }
+            
+            /* Preserve change indicator colors in print */
+            .change-indicator {
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+                color-adjust: exact;
+            }
+            
+            .change-increase-small {
+                background-color: #ffe0e0 !important;
+                color: #8b0000 !important;
+            }
+            
+            .change-increase-medium {
+                background-color: #ffb3b3 !important;
+                color: #660000 !important;
+            }
+            
+            .change-increase-large {
+                background-color: #ff6666 !important;
+                color: #330000 !important;
+            }
+            
+            .change-decrease-small {
+                background-color: #e0f0ff !important;
+                color: #003366 !important;
+            }
+            
+            .change-decrease-medium {
+                background-color: #b3d9ff !important;
+                color: #001a33 !important;
+            }
+            
+            .change-decrease-large {
+                background-color: #66b3ff !important;
+                color: #000d1a !important;
+            }
+            
+            .back-button, .print-button, .breadcrumb {
+                display: none;
+            }
+            
+            .footer {
+                padding: 12px 24px;
+                font-size: 12px;
+                background-color: #fff3cd !important;
+                color: #856404 !important;
+                border-top: 2px solid #ffc107 !important;
+                font-weight: 500 !important;
+            }
+            
+            .footer-note {
+                margin-top: 6px;
+                font-size: 11px;
+                color: #856404 !important;
+                font-style: italic !important;
+                line-height: 1.3 !important;
+            }
+            
+            .change-indicator {
+                font-size: 8px !important;
+                padding: 1px 4px !important;
+                margin-left: 4px !important;
+            }
+            
+            .change-increase {
+                background-color: #f8d7da !important;
+                color: #721c24 !important;
+                border: 1px solid #f5c6cb !important;
+            }
+            
+            .change-decrease {
+                background-color: #d1ecf1 !important;
+                color: #0c5460 !important;
+                border: 1px solid #bee5eb !important;
+            }
+            
+            .change-no-change {
+                background-color: #d4edda !important;
+                color: #155724 !important;
+                border: 1px solid #c3e6cb !important;
+            }
+            
+            /* Remove ALL colors and backgrounds */
+            * {
+                background: white !important;
+                background-image: none !important;
+                background-color: white !important;
+            }
+            
+            /* Ensure ALL text is black */
+            * {
+                color: #000 !important;
+            }
+            
+            /* Maintain status badge colors for print */
+            .status-high {
+                background: #dc3545 !important;
+                color: white !important;
+                border: 1px solid #dc3545 !important;
+            }
+            
+            .status-medium {
+                background: #ffc107 !important;
+                color: #000 !important;
+                border: 1px solid #ffc107 !important;
+            }
+            
+            .status-low {
+                background: #28a745 !important;
+                color: white !important;
+                border: 1px solid #28a745 !important;
+            }
+            
+            /* Compact spacing for humanitarian report style */
+            h1, h2, h3, h4, h5, h6 {
+                margin: 3px 0;
+                padding: 0;
+            }
+            
+            p {
+                margin: 2px 0;
+            }
+            
+            ul, ol {
+                margin: 3px 0;
+                padding-left: 12px;
+            }
+        }
+    </style>
+    <script>
+        // Change indicator thresholds (absolute values)
+        // Population thresholds (higher, since population changes are typically larger)
+        const CHANGE_THRESHOLD_POP_SMALL = 100;
+        const CHANGE_THRESHOLD_POP_MEDIUM = 500;
+        // Large population changes are anything above CHANGE_THRESHOLD_POP_MEDIUM
+        
+        // Facility thresholds (lower, since facility changes are more significant)
+        const CHANGE_THRESHOLD_FAC_SMALL = 3;
+        const CHANGE_THRESHOLD_FAC_MEDIUM = 10;
+        // Large facility changes are anything above CHANGE_THRESHOLD_FAC_MEDIUM
+        
+        function printReport() {
+            window.print();
+        }
+        
+        function getChangeIndicatorClass(value) {
+            const absValue = Math.abs(parseInt(value) || 0);
+            if (absValue === 0) return ''; // No indicator for zero
+            const isIncrease = value > 0;
+            
+            if (absValue < CHANGE_THRESHOLD_SMALL) {
+                return isIncrease ? 'change-increase-small' : 'change-decrease-small';
+            } else if (absValue < CHANGE_THRESHOLD_MEDIUM) {
+                return isIncrease ? 'change-increase-medium' : 'change-decrease-medium';
+            } else {
+                return isIncrease ? 'change-increase-large' : 'change-decrease-large';
+            }
+        }
+        
+        // Initialize interactive elements
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add print button
+            const printButton = document.createElement('button');
+            printButton.className = 'print-button';
+            printButton.textContent = 'Print Report';
+            printButton.addEventListener('click', printReport);
+            document.body.appendChild(printButton);
+        });
+    </script>
+</head>
+<body>
+    <div class="report-container">
+        <div class="report-header">
+            <div class="report-title">Hurricane Impact Assessment</div>
+            <div class="report-subtitle">Hurricane {{storm}}</div>
+        </div>
+
+
+        <div class="report-body">
+            <!-- Executive Summary -->
+            <div class="section">
+                <h2 class="section-title">Executive Summary</h2>
+                
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Forecast Date</div>
+                        <div class="info-value">{{forecast_date}}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Expected Landfall</div>
+                        <div class="info-value">{{expected_landfall}}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Country</div>
+                        <div class="info-value">{{country}}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Storm Category</div>
+                        <div class="info-value">{{storm_category}}</div>
+                    </div>
+                </div>
+
+                <div class="key-findings">
+                    <h3>Key Findings</h3>
+                    <ul>
+                        <li><strong>{{expected_children}}</strong> are estimated to be directly affected (0&ndash;5: <strong>{{expected_infants}}</strong>; 5&ndash;15: <strong>{{expected_school_age}}</strong>).</li>
+                        <li><strong>{{expected_schools}} schools</strong> are in the direct impact zone.</li>
+                        <li><strong>{{expected_hcs}} health facilities</strong> are at risk.</li>
+                        <li><strong>Impact estimates {{children_change_direction}}</strong> by {{children_change}} children versus the previous forecast (<strong>{{perc_children_change}}%</strong>).</li>
+                    </ul>
+                </div>
+
+            </div>
+
+            <!-- Probabilistic Scenario -->
+            <div class="section">
+
+
+                <!-- Vulnerable Population Analysis -->
+                <h3 style="font-size: 16px; color: #333; margin: 40px 0 20px 0; border-bottom: 2px solid #1CABE2; padding-bottom: 6px; font-weight: 600;">Impacted Population (Cumulative)</h3>
+                
+                <!-- Population Change Indicator Legend -->
+                <div style="background: white; padding: 12px 16px; margin-bottom: 12px; border-left: 4px solid #1CABE2; border-top: 1px solid #e9ecef; border-right: 1px solid #e9ecef; border-bottom: 1px solid #e9ecef;">
+                    <div style="font-size: 12px; font-weight: 600; color: #333; margin-bottom: 8px;">Change Indicators (vs. previous forecast):</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div>
+                            <div style="font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 600;">Increases:</div>
+                            <div style="display: flex; flex-direction: column; gap: 3px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-small">+150</span>
+                                    <span style="font-size: 11px; color: #555;">Small (100-500)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-medium">+750</span>
+                                    <span style="font-size: 11px; color: #555;">Medium (500-1000)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-large">+1,200</span>
+                                    <span style="font-size: 11px; color: #555;">Large (> 1000)</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div style="font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 600;">Decreases:</div>
+                            <div style="display: flex; flex-direction: column; gap: 3px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-small">-150</span>
+                                    <span style="font-size: 11px; color: #555;">Small (100-500)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-medium">-750</span>
+                                    <span style="font-size: 11px; color: #555;">Medium (500-1000)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-large">-400</span>
+                                    <span style="font-size: 11px; color: #555;">Large (> 1000)</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white;">Wind Threshold</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Total</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Age 5-15</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Age 0-5</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">34kt - Tropical Storm</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_34}} {{change_children_34}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_34}} {{change_school_34}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_34}} {{change_infant_34}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">40kt - Strong Tropical Storm</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_40}} {{change_children_40}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_40}} {{change_school_40}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_40}} {{change_infant_40}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">50kt - Very Strong TS</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_50}} {{change_children_50}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_50}} {{change_school_50}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_50}} {{change_infant_50}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">64kt - Cat 1 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_64}} {{change_children_64}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_64}} {{change_school_64}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_64}} {{change_infant_64}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">83kt - Cat 2 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_83}} {{change_children_83}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_83}} {{change_school_83}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_83}} {{change_infant_83}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">96kt - Cat 3 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_96}} {{change_children_96}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_96}} {{change_school_96}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_96}} {{change_infant_96}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">113kt - Cat 4 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_113}} {{change_children_113}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_113}} {{change_school_113}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_113}} {{change_infant_113}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">137kt - Cat 5 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_children_137}} {{change_children_137}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_137}} {{change_school_137}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_137}} {{change_infant_137}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Total Population by Admin Unit</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; max-width: 120px;">Admin Unit</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">34kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">40kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">50kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">64kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">83kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">96kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">113kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">137kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white; border-left: 2px solid rgba(255,255,255,0.5);">CCI</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{rows_admins_pop_total}}
+                    </tbody>
+                    <tfoot>
+                        <tr style="background: #f8f9fa; font-weight: 700;">
+                            <td style="padding: 5px 4px; border-top: 2px solid #1CABE2;">Total</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_34}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_40}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_50}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_64}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_83}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_96}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_113}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_pop_137}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2; border-left: 2px solid #ccc;">{{expected_cci_pop}}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Age 5-15 Years by Admin Unit</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; max-width: 120px;">Admin Unit</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">34kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">40kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">50kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">64kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">83kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">96kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">113kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">137kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white; border-left: 2px solid rgba(255,255,255,0.5);">CCI</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{rows_admins_school}}
+                    </tbody>
+                    <tfoot>
+                        <tr style="background: #f8f9fa; font-weight: 700;">
+                            <td style="padding: 5px 4px; border-top: 2px solid #1CABE2;">Total</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_34}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_40}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_50}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_64}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_83}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_96}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_113}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_school_137}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2; border-left: 2px solid #ccc;">{{expected_cci_school}}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Age 0-5 Years by Admin Unit</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; max-width: 120px;">Admin Unit</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">34kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">40kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">50kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">64kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">83kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">96kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">113kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">137kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white; border-left: 2px solid rgba(255,255,255,0.5);">CCI</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{rows_admins_infant}}
+                    </tbody>
+                    <tfoot>
+                        <tr style="background: #f8f9fa; font-weight: 700;">
+                            <td style="padding: 5px 4px; border-top: 2px solid #1CABE2;">Total</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_34}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_40}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_50}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_64}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_83}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_96}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_113}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2;">{{expected_infant_137}}</td>
+                            <td style="text-align: center; padding: 5px 4px; border-top: 2px solid #1CABE2; border-left: 2px solid #ccc;">{{expected_cci_infant}}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <!-- Vulnerability Factors Breakdown -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Vulnerability Factors by Age Group</h4>
+                
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white;">Population Segment</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Poverty</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Severe Poverty</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Living in Urban Areas</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Living in Rural Areas</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">Total Population ({{expected_pop}})</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_pop_poverty}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_pop_severe}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_pop_urban}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_pop_rural}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">Age Group 5-15 Years ({{expected_school_age}})</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_poverty}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_severe}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_urban}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_school_rural}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">Age Group 0-5 Years ({{expected_infants}})</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_poverty}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_severe}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_urban}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_infant_rural}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                
+                <!-- Impacted Facilities -->
+                <h3 style="font-size: 16px; color: #333; margin: 40px 0 20px 0; border-bottom: 2px solid #1CABE2; padding-bottom: 6px; font-weight: 600;">Impacted Facilities (Cumulative)</h3>
+                
+                <!-- Facilities Change Indicator Legend -->
+                <div style="background: white; padding: 12px 16px; margin-bottom: 12px; border-left: 4px solid #1CABE2; border-top: 1px solid #e9ecef; border-right: 1px solid #e9ecef; border-bottom: 1px solid #e9ecef;">
+                    <div style="font-size: 12px; font-weight: 600; color: #333; margin-bottom: 8px;">Change Indicators (vs. previous forecast):</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                        <div>
+                            <div style="font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 600;">Increases:</div>
+                            <div style="display: flex; flex-direction: column; gap: 3px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-small">+2</span>
+                                    <span style="font-size: 11px; color: #555;">Small (3-10)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-medium">+7</span>
+                                    <span style="font-size: 11px; color: #555;">Medium (10-20)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-increase-large">+15</span>
+                                    <span style="font-size: 11px; color: #555;">Large (> 20)</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div style="font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 600;">Decreases:</div>
+                            <div style="display: flex; flex-direction: column; gap: 3px;">
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-small">-2</span>
+                                    <span style="font-size: 11px; color: #555;">Small (3-10)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-medium">-7</span>
+                                    <span style="font-size: 11px; color: #555;">Medium (10-20)</span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <span class="change-indicator change-decrease-large">-15</span>
+                                    <span style="font-size: 11px; color: #555;">Large (> 20)</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Per-threshold facilities breakdown -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Facilities by Wind Threshold</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white;">Wind Threshold</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Schools</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">Health Facilities</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">34kt - Tropical Storm</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_34}} {{change_schools_34}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_34}} {{change_hcs_34}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">40kt - Strong Tropical Storm</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_40}} {{change_schools_40}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_40}} {{change_hcs_40}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">50kt - Very Strong TS</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_50}} {{change_schools_50}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_50}} {{change_hcs_50}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">64kt - Cat 1 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_64}} {{change_schools_64}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_64}} {{change_hcs_64}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">83kt - Cat 2 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_83}} {{change_schools_83}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_83}} {{change_hcs_83}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">96kt - Cat 3 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_96}} {{change_schools_96}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_96}} {{change_hcs_96}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">113kt - Cat 4 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_113}} {{change_schools_113}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_113}} {{change_hcs_113}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-weight: 600; max-width: 120px; word-wrap: break-word;">137kt - Cat 5 Hurricane</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_schools_137}} {{change_schools_137}}</td>
+                            <td style="text-align: center; padding: 4px;">{{expected_hcs_137}} {{change_hcs_137}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <!-- Admin unit x threshold (facilities) - Schools -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Schools by Admin Unit and Threshold</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; max-width: 120px;">Admin Unit</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">34kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">40kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">50kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">64kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">83kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">96kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">113kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">137kt</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{rows_schools_winds}}
+                    </tbody>
+                </table>
+
+                <!-- Admin unit x threshold (facilities) - Health -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Health Facilities by Admin Unit and Threshold</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; max-width: 120px;">Admin Unit</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">34kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">40kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">50kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">64kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">83kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">96kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">113kt</th>
+                            <th style="text-align: center; padding: 4px; background: #1CABE2; color: white;">137kt</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {{rows_hcs_winds}}
+                    </tbody>
+                </table>
+
+                <!-- Most Impacted Schools -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Most At Risk Schools</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px; border-collapse: collapse;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">School Name</th>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">Education Level</th>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">Probability</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_name_1}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_edulevel_1}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_prob_1}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_name_2}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_edulevel_2}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_prob_2}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_name_3}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_edulevel_3}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_prob_3}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_name_4}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_edulevel_4}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_prob_4}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_name_5}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_edulevel_5}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{school_prob_5}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <img src="/assets/img/nic_forecast_example_facilities_img.png" alt="Forecast Facilities Map" style="width: 100%; height: auto; border-radius: 6px; margin: 16px 0;">
+
+                <!-- Most Impacted Health Facilities -->
+                <h4 style="font-size: 14px; color: #333; margin: 24px 0 12px 0; font-weight: 600;">Most At Risk Health Facilities</h4>
+                <table class="facilities-table" style="width: 100%; margin-bottom: 12px; font-size: 12px; border-collapse: collapse;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">Facility Name</th>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">Type</th>
+                            <th style="text-align: left; padding: 4px; background: #1CABE2; color: white; font-weight: 600; border: none;">Probability</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_name_1}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_type_1}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_prob_1}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_name_2}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_type_2}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_prob_2}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_name_3}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_type_3}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_prob_3}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_name_4}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_type_4}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_prob_4}}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_name_5}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_type_5}}</td>
+                            <td style="padding: 4px; font-size: 12px; border-bottom: 1px solid #e9ecef; border-top: none; border-left: none; border-right: none;">{{hc_prob_5}}</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <img src="/assets/img/nic_forecast_example_facilities_img.png" alt="Forecast Facilities Map" style="width: 100%; height: auto; border-radius: 6px; margin: 16px 0;">
+
+            </div>
+
+            <!-- Next Forecast Update -->
+            <div class="section">
+                <p style="line-height: 1.7; color: #555; font-size: 14px;">
+                    <strong>Next forecast update:</strong> {{next_forecast_date}} (6 hours)
+                </p>
+            </div>
+
+        <div class="footer">
+            Generated: {{report_date}}
+            <div class="footer-note">
+                This is an automated impact assessment based on forecast models and vulnerability data. 
+                Field validation and local knowledge should supplement this analysis for operational decision-making.
+            </div>
+        </div>
+    </div>
+</body>
+</html>
