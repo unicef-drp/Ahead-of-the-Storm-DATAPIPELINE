@@ -41,11 +41,11 @@ class Config:
     DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL')
     
     # Application Configuration
-    RESULTS_DIR = os.getenv('RESULTS_DIR')
-    BBOX_FILE = os.getenv('BBOX_FILE')
-    STORMS_FILE = os.getenv('STORMS_FILE')
-    VIEWS_DIR = os.getenv('VIEWS_DIR')
-    ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR')
+    RESULTS_DIR = os.getenv('RESULTS_DIR', 'project_results/climate/lacro_project')
+    BBOX_FILE = os.getenv('BBOX_FILE', 'bbox.parquet')
+    STORMS_FILE = os.getenv('STORMS_FILE', 'storms.json')
+    VIEWS_DIR = os.getenv('VIEWS_DIR', 'aos_views')
+    ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR', 'geodb')
     
     # Report Configuration (optional)
     REPORTS_JSON_DIR = os.getenv('REPORTS_JSON_DIR', 'jsons')  # Subdirectory for JSON reports under RESULTS_DIR
