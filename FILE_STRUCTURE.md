@@ -5,22 +5,16 @@ This document lists all files produced and downloaded by the Ahead of the Storm 
 ## Directory Structure Overview
 
 The pipeline uses environment variables to configure base directories:
-- `RESULTS_DIR` - Results and configuration files (default: `results`)
+- `RESULTS_DIR` - Results and configuration files (default: `project_results/climate/lacro_project`)
 - `ROOT_DATA_DIR` - Base data directory (default: `geodb`)
 - `VIEWS_DIR` - Subdirectory for views (default: `aos_views`)
-- `BBOX_FILE` - Bounding box filename (e.g., `bbox.parquet`)
-- `STORMS_FILE` - Processed storms tracking file (e.g., `storms.json`)
+- `STORMS_FILE` - Processed storms tracking file (default: `storms.json`)
 
 ---
 
 ## Files Produced During Initialize (`--type initialize`)
 
-### 1. Bounding Box File
-**Location:** `{RESULTS_DIR}/{BBOX_FILE}`
-- **Example:** `results/bbox.parquet` or `project_results/climate/lacro_project/bbox.parquet`
-- **Format:** Parquet (GeoDataFrame)
-- **Content:** Single polygon representing the padded bounding box for all countries
-- **Created by:** `save_bounding_box()`
+**Note:** The pipeline no longer requires a separate bounding box file. Country boundaries are checked directly with a 1500km buffer during processing.
 
 ### 2. Base Mercator Views (per country)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{zoom_level}.parquet`
@@ -57,9 +51,17 @@ The pipeline uses environment variables to configure base directories:
 - **Created by:** `create_admin_country_layer()` via `save_mercator_and_admin_views()`
 - **Note:** One file per country, created during initialize
 
-### 4. Health Center Locations (per country, cached)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_health_centers.parquet`
-- **Example:** `geodb/aos_views/hc_views/DOM_health_centers.parquet`
+### 4. School Locations (per country, cached)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_schools.parquet`
+- **Example:** `geodb/aos_views/school_views/DOM_schools.parquet`
+- **Format:** Parquet (GeoDataFrame)
+- **Content:** School locations fetched from GIGA School Location API
+- **Created by:** `save_school_locations()`
+- **Note:** Cached after first fetch to avoid repeated API calls
+
+### 5. Health Center Locations (per country, cached)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_hcs.parquet`
+- **Example:** `geodb/aos_views/hc_views/DOM_hcs.parquet`
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** Health center locations fetched from HealthSites API
 - **Created by:** `save_hc_locations()`
@@ -71,7 +73,7 @@ The pipeline uses environment variables to configure base directories:
 
 For each storm/forecast combination processed, the following files are created:
 
-### 5. School Impact Views (per country, per storm, per forecast, per wind threshold)
+### 6. School Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/school_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -79,7 +81,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_school_view()`
 - **Note:** Multiple files per storm (one per wind threshold: 34, 40, 50, 64, 83, 96, 113, 137)
 
-### 6. Health Center Impact Views (per country, per storm, per forecast, per wind threshold)
+### 7. Health Center Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/hc_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -87,7 +89,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_hc_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 7. Mercator Tile Impact Views (per country, per storm, per forecast, per wind threshold, per zoom)
+### 8. Mercator Tile Impact Views (per country, per storm, per forecast, per wind threshold, per zoom)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{wind_threshold}_{zoom_level}.csv`
 - **Example:** `geodb/aos_views/mercator_views/DOM_LORENZO_20251015120000_34_14.csv`
 - **Format:** CSV (DataFrame, no geometry)
@@ -104,11 +106,11 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_tiles_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 8. CCI (Cumulative Climate Impact) Tile Views (per country, per storm, per forecast, per zoom)
+### 9. CCI (Child Cyclone Index) Tile Views (per country, per storm, per forecast, per zoom)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{zoom_level}_cci.csv`
 - **Example:** `geodb/aos_views/mercator_views/DOM_LORENZO_20251015120000_14_cci.csv`
 - **Format:** CSV (DataFrame)
-- **Content:** Cumulative Climate Impact indices:
+- **Content:** Child Cyclone Index (CCI) values:
   - `CCI_children`
   - `E_CCI_children`
   - `CCI_school_age`
@@ -120,7 +122,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_cci_tiles()`
 - **Note:** One file per storm (aggregates all wind thresholds)
 
-### 9. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold)
+### 10. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_{wind_threshold}_admin1.csv`
 - **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_34_admin1.csv`
 - **Format:** CSV (DataFrame, no geometry)
@@ -138,15 +140,15 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_admin_tiles_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 10. CCI Admin Views (per country, per storm, per forecast)
+### 11. CCI Admin Views (per country, per storm, per forecast)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin1_cci.csv`
 - **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_admin1_cci.csv`
 - **Format:** CSV (DataFrame)
-- **Content:** Cumulative Climate Impact indices aggregated by admin level 1
+- **Content:** Child Cyclone Index (CCI) values aggregated by admin level 1
 - **Created by:** `save_cci_admin()`
 - **Note:** One file per storm
 
-### 11. Track Views (per country, per storm, per forecast, per wind threshold)
+### 12. Track Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/track_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -160,9 +162,9 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_tracks_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 12. JSON Impact Reports (per country, per storm, per forecast)
+### 13. JSON Impact Reports (per country, per storm, per forecast)
 **Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
-- **Example:** `results/jsons/DOM_LORENZO_20251015120000.json`
+- **Example:** `project_results/climate/lacro_project/jsons/DOM_LORENZO_20251015120000.json`
 - **Format:** JSON
 - **Content:** Comprehensive impact report data including:
   - Expected impacts by wind threshold
@@ -174,9 +176,9 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_json_report()`
 - **Note:** One file per country per storm per forecast
 
-### 13. Processed Storms Tracking File
+### 14. Processed Storms Tracking File
 **Location:** `{RESULTS_DIR}/{STORMS_FILE}`
-- **Example:** `results/storms.json` or `project_results/climate/lacro_project/storms.json`
+- **Example:** `project_results/climate/lacro_project/storms.json`
 - **Format:** JSON or Parquet (currently inconsistent - see bug in documentation review)
 - **Content:** Dictionary tracking which storm/forecast combinations have been processed
 - **Created by:** `save_json_storms()`
@@ -188,44 +190,45 @@ For each storm/forecast combination processed, the following files are created:
 
 These files are downloaded automatically by the GigaSpatial library and stored in the data store. The exact location depends on the data store configuration (LOCAL vs BLOB).
 
-### 14. WorldPop Population Data
+### 15. WorldPop Population Data
 **Location:** `{ROOT_DATA_DIR}/bronze/` (or equivalent in data store)
 - **Source:** WorldPop API
 - **Downloaded by:** `MercatorViewGenerator.map_wp_pop()`
 - **Note:** Downloaded on-demand during initialize, cached for reuse
 
-### 15. GHSL Built Surface Data
+### 16. GHSL Built Surface Data
 **Location:** `{ROOT_DATA_DIR}/bronze/` (or equivalent in data store)
 - **Source:** Global Human Settlement Layer (GHSL)
 - **Downloaded by:** `MercatorViewGenerator.map_built_s()`
 - **Note:** Downloaded on-demand during initialize, cached for reuse
 
-### 16. SMOD Settlement Classification Data
+### 17. SMOD Settlement Classification Data
 **Location:** `{ROOT_DATA_DIR}/bronze/` (or equivalent in data store)
 - **Source:** GHSL Settlement Model (SMOD)
 - **Downloaded by:** `MercatorViewGenerator.map_smod()`
 - **Note:** Downloaded on-demand during initialize, cached for reuse
 
-### 17. Relative Wealth Index (RWI) Data
+### 18. Relative Wealth Index (RWI) Data
 **Location:** `{ROOT_DATA_DIR}/bronze/` (or equivalent in data store)
 - **Source:** Facebook/Meta RWI dataset
 - **Downloaded by:** `RWIHandler.load_data()`
 - **Note:** Downloaded on-demand during initialize, cached for reuse
 
-### 18. School Locations
+### 19. School Locations
 **Source:** GIGA School Location API
 - **Fetched by:** `GigaSchoolLocationFetcher.fetch_locations()`
-- **Note:** Fetched via API, not cached to disk (fetched each time)
+- **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_schools.parquet`
+- **Note:** Cached after first fetch to avoid repeated API calls
 - **Requires:** `GIGA_SCHOOL_LOCATION_API_KEY` environment variable
 
-### 19. Health Center Locations
+### 20. Health Center Locations
 **Source:** HealthSites API
 - **Fetched by:** `HealthSitesFetcher.fetch_facilities()`
-- **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_health_centers.parquet`
+- **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_hcs.parquet`
 - **Note:** Cached after first fetch to avoid repeated API calls
 - **Requires:** `HEALTHSITES_API_KEY` environment variable
 
-### 20. Administrative Boundaries
+### 21. Administrative Boundaries
 **Source:** UNICEF GeoRepo (via GigaSpatial)
 - **Fetched by:** `AdminBoundaries.create()`
 - **Note:** Fetched via API, not cached to disk (fetched each time)
@@ -236,8 +239,7 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 ## Complete Directory Structure Example
 
 ```
-{RESULTS_DIR}/                          # e.g., results/ or project_results/climate/lacro_project/
-├── {BBOX_FILE}                         # bbox.parquet
+{RESULTS_DIR}/                          # e.g., project_results/climate/lacro_project/
 ├── {STORMS_FILE}                       # storms.json
 └── jsons/
     ├── {country}_{storm}_{date}.json   # Impact reports
@@ -255,9 +257,10 @@ These files are downloaded automatically by the GigaSpatial library and stored i
     │   ├── {country}_{storm}_{date}_{wind}_admin1.csv # Impact admin views
     │   └── {country}_{storm}_{date}_admin1_cci.csv    # CCI admin views
     ├── school_views/
+    │   ├── {country}_schools.parquet                    # Cached school locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # School impact views
     ├── hc_views/
-    │   ├── {country}_health_centers.parquet             # Cached health center locations
+    │   ├── {country}_hcs.parquet                        # Cached health center locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # Health center impact views
     └── track_views/
         └── {country}_{storm}_{date}_{wind}.parquet      # Track impact views
@@ -286,8 +289,9 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 ## Notes
 
 1. **Data Store Backend:** All files are written through the `data_store` abstraction, which can be:
-   - `LocalDataStore` - Files written to local filesystem
-   - `ADLSDataStore` - Files written to Azure Blob Storage
+   - `LocalDataStore` - Files written to local filesystem (`DATA_PIPELINE_DB=LOCAL`)
+   - `ADLSDataStore` - Files written to Azure Blob Storage (`DATA_PIPELINE_DB=BLOB`)
+   - `SnowflakeDataStore` - Files written to Snowflake internal stage (`DATA_PIPELINE_DB=SNOWFLAKE`)
    - Controlled by `DATA_PIPELINE_DB` environment variable
 
 2. **File Formats:**
@@ -296,5 +300,6 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 
 
 3. **Storage Location:**
-   - If using Azure Blob Storage, paths are relative to the blob container
-   - If using local storage, paths are relative to the project root or configured base directory
+   - If using Azure Blob Storage (`DATA_PIPELINE_DB=BLOB`), paths are relative to the blob container
+   - If using Snowflake stage (`DATA_PIPELINE_DB=SNOWFLAKE`), paths are relative to the stage (e.g., `@stage_name/geodb/...`)
+   - If using local storage (`DATA_PIPELINE_DB=LOCAL`), paths are relative to the project root or configured base directory
