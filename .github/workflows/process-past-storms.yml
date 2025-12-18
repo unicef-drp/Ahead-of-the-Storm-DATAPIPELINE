@@ -81,9 +81,14 @@ jobs:
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB }}
           SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+          RESULTS_DIR: ${{ secrets.RESULTS_DIR }}
+          ROOT_DATA_DIR: ${{ secrets.ROOT_DATA_DIR }}
+          VIEWS_DIR: ${{ secrets.VIEWS_DIR }}
+          STORMS_FILE: ${{ secrets.STORMS_FILE }}
           GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
           HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
-          GEOREPO_TOKEN: ${{ secrets.GEOREPO_TOKEN }}
+          GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY }}
+          GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL }}
         run: |
           # Process each date in the range
           START_DATE="${{ inputs.start_date }}"
