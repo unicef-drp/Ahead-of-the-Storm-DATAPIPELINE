@@ -21,17 +21,13 @@ Usage:
 
 import os
 import sys
-import argparse
+import logging
 import geopandas as gpd
 import pandas as pd
 import numpy as np
-from shapely.geometry import box
-from pyproj import CRS
-from shapely import union_all
-from shapely import wkt as shapely_wkt
 import math
 
-# Add the project root to Python path so we can import components
+# Add the project root to Python path so components can be imported
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -40,7 +36,6 @@ if project_root not in sys.path:
 from config import config
 
 # Import GigaSpatial components
-from gigaspatial.core.io import DataStore
 from gigaspatial.handlers import AdminBoundaries, RWIHandler
 from gigaspatial.processing import convert_to_geodataframe, buffer_geodataframe
 from gigaspatial.handlers import GigaSchoolLocationFetcher
@@ -51,6 +46,7 @@ from gigaspatial.core.io.writers import write_dataset
 
 # Import centralized data store utility
 from data_store_utils import get_data_store
+from country_utils import update_country_initialized
 
 # Import only Snowflake data retrieval functions
 from snowflake_utils import (
@@ -61,89 +57,171 @@ from snowflake_utils import (
 
 from reports import do_report, save_json_report
 
-##### Constants #####
-# oecs_countries = ['ATG','DMA','GRD','MSR','KNA','LCA','VCT','AIA','VGB']
-# countries = ['NIC','DOM','BLZ'] + oecs_countries
-#default_countries = ['NIC']
-data_cols = ['population', 'built_surface_m2', 'num_schools','school_age_population', 'infant_population','num_hcs','rwi','smod_class']
-sum_cols = ["E_school_age_population", "E_infant_population", "E_built_surface_m2","E_population","E_num_schools","E_num_hcs"]
-avg_cols = ["E_smod_class","E_rwi","probability"]
-sum_cols_admin = ["school_age_population", "infant_population", "built_surface_m2","population","num_schools","num_hcs"]
-avg_cols_admin = ["smod_class","rwi"]
-sum_cols_cci = ['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop','E_CCI_pop']
-#####################
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 
-##### Environment Variables #####
+# Data column definitions
+data_cols = ['population', 'built_surface_m2', 'num_schools', 'school_age_population', 
+             'infant_population', 'num_hcs', 'rwi', 'smod_class']
+sum_cols = ["E_school_age_population", "E_infant_population", "E_built_surface_m2", 
+            "E_population", "E_num_schools", "E_num_hcs"]
+avg_cols = ["E_smod_class", "E_rwi", "probability"]
+sum_cols_admin = ["school_age_population", "infant_population", "built_surface_m2", 
+                  "population", "num_schools", "num_hcs"]
+avg_cols_admin = ["smod_class", "rwi"]
+sum_cols_cci = ['CCI_children', 'E_CCI_children', 'CCI_school_age', 'E_CCI_school_age', 
+                'CCI_infants', 'E_CCI_infants', 'CCI_pop', 'E_CCI_pop']
+cci_cols = ['CCI_children', 'CCI_pop', 'CCI_school_age', 'CCI_infants', 
+            'E_CCI_children', 'E_CCI_pop', 'E_CCI_school_age', 'E_CCI_infants']
+
+# Configuration constants
+BUFFER_DISTANCE_METERS = 150  # Buffer distance for schools and health centers (meters)
+WORLDPOP_RESOLUTION_HIGH = 1000  # High resolution for WorldPop data (meters)
+WORLDPOP_RESOLUTION_LOW = 100  # Low resolution for WorldPop data (meters)
+SCHOOL_AGE_MIN = 5  # Minimum age for school-age population
+SCHOOL_AGE_MAX = 15  # Maximum age for school-age population
+INFANT_AGE_MIN = 0  # Minimum age for infant population
+INFANT_AGE_MAX = 4  # Maximum age for infant population
+CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 RESULTS_DIR = config.RESULTS_DIR
-BBOX_FILE = config.BBOX_FILE
 STORMS_FILE = config.STORMS_FILE
 VIEWS_DIR = config.VIEWS_DIR
 ROOT_DATA_DIR = config.ROOT_DATA_DIR
-#################################
+
+# =============================================================================
+# DATA STORE INITIALIZATION
+# =============================================================================
 
 # Initialize data store using centralized utility
+# Defaults to LOCAL if DATA_PIPELINE_DB is not set or is LOCAL
+# In production (SPCS), DATA_PIPELINE_DB will be SNOWFLAKE and credentials will be available
 data_store = get_data_store()
 
+# Initialize logger
+logger = logging.getLogger(__name__)
 
+
+
+# =============================================================================
+# DATA FETCHING AND CACHING FUNCTIONS
+# =============================================================================
+
+def fetch_health_centers(country, rewrite=0):
+    """
+    Fetch health center locations for a country, using cache if available.
+    
+    This function handles fetching health center data from HealthSites API,
+    with automatic caching to avoid redundant API calls. If cached data exists
+    and rewrite=0, the cached version is returned.
+    
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, fetch fresh data and update cache; if 0, use cache if available
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing health center locations with geometry.
+                         Returns empty GeoDataFrame if no data is available.
+    
+    Note:
+        Empty GeoDataFrames are returned with proper CRS (EPSG:4326) to ensure
+        compatibility with downstream processing.
+    """
+    if hc_exist(country) and rewrite == 0:
+        return load_hc_locations(country)
+    
+    try:
+        gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
+        if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
+            logger.warning(f"No health center data available for {country}, skipping...")
+            return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+        
+        gdf_hcs = gdf_hcs.set_crs(4326)
+        save_hc_locations(gdf_hcs, country)
+        return gdf_hcs
+    except Exception as e:
+        logger.error(f"Error fetching health centers for {country}: {str(e)}")
+        return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+
+def fetch_schools(country, rewrite=0):
+    """
+    Fetch school locations for a country from GIGA API, using cache if available.
+    
+    This function handles fetching school data from GIGA API, with automatic caching
+    to avoid redundant API calls. If cached data exists and rewrite=0, the cached
+    version is returned.
+    
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, fetch fresh data and update cache; if 0, use cache if available
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing school locations with geometry
+    
+    Note:
+        Handles legacy column name 'giga_id_school' by renaming to 'school_id_giga'.
+        Cached files are stored in the same directory as health center caches.
+    """
+    if school_exist(country) and rewrite == 0:
+        return load_school_locations(country)
+    
+    try:
+        gdf_schools = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
+        # Handle legacy API column name
+        if 'giga_id_school' in gdf_schools.columns:
+            gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
+        
+        # Save to cache
+        save_school_locations(gdf_schools, country)
+        return gdf_schools
+    except Exception as e:
+        logger.error(f"Error fetching schools for {country}: {str(e)}")
+        # Return empty GeoDataFrame with proper structure for downstream processing
+        return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
 
 # =============================================================================
 # GEOSPATIAL PROCESSING FUNCTIONS
 # =============================================================================
 
-def rectangle_bbox_padded(geom, padding_km=0, crs_in=4326, proj_mode="utm"):
-    """
-    Smallest axis-aligned rectangle in meters that contains `geom`, padded by `padding_km`,
-    returned as a lon/lat (EPSG:4326) polygon + its bounds tuple.
-
-    geom: shapely (Multi)Polygon/Polygon
-    padding_km: pad equally on all sides (km)
-    crs_in: EPSG of `geom` (default 4326)
-    proj_mode: "aeqd" (local Azimuthal Equidistant, good general choice) or "utm"
-    """
-    gs = gpd.GeoSeries([geom], crs=f"EPSG:{crs_in}")
-
-    # choose a local metric CRS
-    if proj_mode == "utm":
-        proj = gs.estimate_utm_crs()
-    else:  # AEQD centered on the geometry
-        c = gs.unary_union.centroid
-        proj = CRS.from_proj4(f"+proj=aeqd +lat_0={c.y} +lon_0={c.x} +datum=WGS84 +units=m +no_defs")
-
-    gm = gs.to_crs(proj).iloc[0]
-    minx, miny, maxx, maxy = gm.bounds
-    pad = float(padding_km) * 1000.0
-
-    rect_m = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
-    rect_ll = gpd.GeoSeries([rect_m], crs=proj).to_crs(crs_in).iloc[0]
-    return rect_ll
-
 def get_country_boundaries(countries):
     """
-    countries: list of iso3 codes for countries of interest
-    returns: list of admin 0 boundaries
+    Retrieve country boundary geometries for a list of countries.
+    
+    Args:
+        countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
+    
+    Returns:
+        list: List of Shapely geometry objects representing country boundaries (admin level 0)
+    
+    Raises:
+        Exception: If country boundaries cannot be retrieved for any country
     """
     country_boundaries = []
     for country in countries:
-        admin_boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
-        country_boundaries.append(admin_boundaries.to_geodataframe().geometry.iat[0])
+        try:
+            admin_boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
+            country_boundaries.append(admin_boundaries.to_geodataframe().geometry.iat[0])
+        except Exception as e:
+            logger.error(f"Error retrieving boundaries for {country}: {e}")
+            raise
     return country_boundaries
-
-def get_padded_bounding_box_for_countries(countries, padding_km=1000):
-    """
-    countries: list of iso3 codes for countries of interest
-    padding_km: padding to add on all sides (in kilometers)
-    returns: bbox_polygon_lonlat
-    """
-    country_boundaries = get_country_boundaries(countries)
-    gs = gpd.GeoSeries(country_boundaries, crs='EPSG:4326')
-    u = union_all(gs)
-    return rectangle_bbox_padded(u, padding_km)
 
 def is_envelope_in_zone(bbox, df_envelopes, geometry_column='geometry'):
     """
-    bbox: a polygon representing a bbox
-    df_envelopes: DataFrame or GeoDataframe with the envelopes of the tracks
-    returns: bool whether any of the envelopes intersects with bbox
+    Check if any hurricane envelope intersects with a given bounding box/zone.
+    
+    Args:
+        bbox: Shapely polygon representing the bounding box/zone to check
+        df_envelopes: DataFrame or GeoDataFrame containing hurricane envelope geometries
+        geometry_column: Name of the geometry column (default: 'geometry')
+    
+    Returns:
+        bool: True if any envelope intersects with the bbox, False otherwise
     """
     if df_envelopes.empty:
         return False
@@ -159,76 +237,84 @@ def is_envelope_in_zone(bbox, df_envelopes, geometry_column='geometry'):
     mask = gdf_envelopes.intersects(bbox)
     return bool(mask.any())
 
-def save_bounding_box(countries):
+def create_mercator_country_layer(country, zoom_level=15, rewrite=0):
     """
-    Save bounding box file so not to recalculate every time
+    Create mercator tile layer with demographic and infrastructure data for a country.
+    
+    This function generates a comprehensive mercator tile view containing:
+    - Population data (total, school-age, infants) from WorldPop
+    - Infrastructure data (built surface, SMOD settlement classification)
+    - School locations from GIGA API
+    - Health center locations from HealthSites API
+    - Relative Wealth Index (RWI) data
+    
+    Args:
+        country: ISO3 country code
+        zoom_level: Zoom level for mercator tiles (default: 15, typically 14 for analysis)
+        rewrite: If 1, replace existing health center cache; if 0, use cached if available
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame with mercator tiles containing all demographic and
+                         infrastructure data. Column 'zone_id' is renamed to 'tile_id'.
+    
+    Note:
+        Missing data (e.g., RWI, age-specific population) is handled gracefully with NaN values.
+        The function attempts multiple fallback strategies for age-specific population data.
     """
-    filename = os.path.join(RESULTS_DIR, BBOX_FILE)
-    if not data_store.file_exists(filename):
-        bbox = get_padded_bounding_box_for_countries(countries)
-        gbbox = gpd.GeoDataFrame(geometry=[bbox], crs='EPSG:4326')
-        write_dataset(gbbox, data_store, filename)
-
-def read_bounding_box():
-    """
-    Read bounding box file and return bbox geometry
-    """
-    # Use absolute path from project root
-    #project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    bbox_path = os.path.join(RESULTS_DIR, BBOX_FILE)
-    gbbox = read_dataset(data_store, bbox_path)
-    return gbbox.geometry.iat[0]
-
-def create_mercator_country_layer(country, zoom_level=15):
-    """
-    countries: list of iso3 codes of countries
-    zoom_level: int - zoom level for mercator tiles
-    returns a geodataframe with the mercator view
-    """
-    #### schools ####
-    gdf_schools = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
-    # seems API is returning old column name...
-    if 'giga_id_school' in gdf_schools.columns:
-        gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
-    #################
-        
-    #### health centers ####
-    if hc_exist(country):
-        gdf_hcs = load_hc_locations(country)
-    else:
-        try:
-            gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
-            if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
-                print(f"    No health center data available for {country}, skipping...")
-                # Create empty GeoDataFrame with proper geometry column for tracks processing
-                gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-            else:
-                gdf_hcs = gdf_hcs.set_crs(4326)
-                save_hc_locations(gdf_hcs, country)
-        except Exception as e:
-            print(f"Error fetching health centers for {country}: {str(e)}")
-            gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-    ########################
+    # Fetch schools and health centers using helper functions with caching
+    gdf_schools = fetch_schools(country, rewrite)
+    gdf_hcs = fetch_health_centers(country, rewrite)
 
     tiles_viewer = MercatorViewGenerator(source=country, zoom_level=zoom_level, data_store=data_store)
+    
+    # Map school-age population (with fallback strategies)
     try:
-        tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="school_age_population", school_age=True, project="age_structures", un_adjusted=False, sex='F_M')
-    except:
-        # this should be ready in the next release
-        print("No school age available")
+        tiles_viewer.map_wp_pop(
+            country=country, 
+            resolution=WORLDPOP_RESOLUTION_HIGH, 
+            output_column="school_age_population", 
+            school_age=True, 
+            project="age_structures", 
+            un_adjusted=False, 
+            sex='F_M'
+        )
+    except Exception:
+        # Fallback: try age range method
         try:
-            tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="school_age_population", predicate='centroid_within', school_age=False, project="age_structures", un_adjusted=False,min_age=5, max_age=15)
-        except:
-            print("No age ranges either")
+            tiles_viewer.map_wp_pop(
+                country=country, 
+                resolution=WORLDPOP_RESOLUTION_HIGH, 
+                output_column="school_age_population", 
+                predicate='centroid_within', 
+                school_age=False, 
+                project="age_structures", 
+                un_adjusted=False,
+                min_age=SCHOOL_AGE_MIN, 
+                max_age=SCHOOL_AGE_MAX
+            )
+        except Exception:
+            # Final fallback: set to NaN
+            logger.warning(f"No school-age population data available for {country}")
             school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
             tiles_viewer.add_variable_to_view(school_age, 'school_age_population')
 
+    # Map infant population
     try:
-        tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="infant_population", predicate='centroid_within', school_age=False, project="age_structures", un_adjusted=False,min_age=0, max_age=4)
-    except:
-        print("No infant age ranges")
-        school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
-        tiles_viewer.add_variable_to_view(school_age, 'infant_population')
+        tiles_viewer.map_wp_pop(
+            country=country, 
+            resolution=WORLDPOP_RESOLUTION_HIGH, 
+            output_column="infant_population", 
+            predicate='centroid_within', 
+            school_age=False, 
+            project="age_structures", 
+            un_adjusted=False,
+            min_age=INFANT_AGE_MIN, 
+            max_age=INFANT_AGE_MAX
+        )
+    except Exception:
+        logger.warning(f"No infant population data available for {country}")
+        infant_pop = {k: np.nan for k in tiles_viewer.view.index.unique()}
+        tiles_viewer.add_variable_to_view(infant_pop, 'infant_population')
 
     tiles_viewer.map_wp_pop(country=country, resolution=100)
     tiles_viewer.map_built_s()
@@ -261,45 +347,85 @@ def create_mercator_country_layer(country, zoom_level=15):
 
 
 def save_mercator_view(gdf, country, zoom_level):
-    """Save base mercator infrastructure view for country"""
+    """
+    Save base mercator infrastructure view for a country.
+    
+    Args:
+        gdf: GeoDataFrame containing mercator tile data
+        country: ISO3 country code
+        zoom_level: Zoom level for the tiles
+    """
     file_name = f"{country}_{zoom_level}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
 
-def admins_overlay(gdf_admins1,gdf_mercator):
+def admins_overlay(gdf_admins1, gdf_mercator):
+    """
+    Assign admin level 1 IDs to mercator tiles based on maximum intersection area.
+    
+    For each mercator tile, this function determines which admin level 1 boundary
+    it belongs to by finding the admin boundary with the largest intersection area.
+    This handles cases where tiles may intersect multiple admin boundaries.
+    
+    Args:
+        gdf_admins1: GeoDataFrame containing admin level 1 boundaries (must have 'id' column)
+        gdf_mercator: GeoDataFrame containing mercator tiles (must have 'tile_id' column)
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame with mercator tiles and assigned admin IDs
+    """
     small_gdf = gdf_mercator.copy()
     large_gdf = gdf_admins1.copy()
-    # Step 2: Overlay to get all intersections
+    
+    # Overlay to get all intersections
     intersections = gpd.overlay(small_gdf, large_gdf, how="intersection")
 
-    # Step 3: Compute intersection area
+    # Compute intersection area for each intersection
     intersections["intersection_area"] = intersections.geometry.area
 
-    # Step 4: For each small polygon, keep the row with max intersection area
+    # For each tile, keep the admin with maximum intersection area
     max_area_idx = intersections.groupby("tile_id")["intersection_area"].idxmax()
     assigned = intersections.loc[max_area_idx, ["tile_id", "id"]]
 
-    # Step 5: Merge back with original small_gdf to assign each small polygon
+    # Merge back with original tiles to assign admin IDs
     result = small_gdf.merge(assigned, on="tile_id", how="left")
 
-    # Step 6: Make sure it's a GeoDataFrame with correct geometry and CRS
+    # Ensure result is a GeoDataFrame with correct geometry and CRS
     return gpd.GeoDataFrame(result, geometry="geometry", crs=small_gdf.crs)
 
-def add_admin_ids(view,country,zoom_level,rewrite):
-    gdf_admins1 = AdminBoundaries.create(country_code=country,admin_level=1).to_geodataframe()
-
-    combined_view = admins_overlay(gdf_admins1,view)
-
+def add_admin_ids(view, country, zoom_level, rewrite):
+    """
+    Add admin level 1 IDs to a mercator tile view.
+    
+    Args:
+        view: GeoDataFrame containing mercator tiles
+        country: ISO3 country code
+        zoom_level: Zoom level (unused, kept for API compatibility)
+        rewrite: Rewrite flag (unused, kept for API compatibility)
+    
+    Returns:
+        tuple: (combined_view, gdf_admins1) where:
+            - combined_view: GeoDataFrame with tiles and admin IDs
+            - gdf_admins1: GeoDataFrame with admin level 1 boundaries
+    """
+    gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=1).to_geodataframe()
+    combined_view = admins_overlay(gdf_admins1, view)
     return combined_view, gdf_admins1
 
 def save_mercator_and_admin_views(countries,zoom_level,rewrite):
     """
-    Generates and saves all country mercator views and admin views
+    Generates and saves all country mercator views and admin views.
+    Automatically tracks initialization in Snowflake after successful completion.
     """
+    import logging
+    logger = logging.getLogger(__name__)
 
     for country in countries:
         file_name = f"{country}_{zoom_level}.parquet"
-        if not data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)):
-            view = create_mercator_country_layer(country, zoom_level)
+        file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
+        initialized = False
+        
+        if not data_store.file_exists(file_path):
+            view = create_mercator_country_layer(country, zoom_level, rewrite)
             combined_view, gdf_admins1 = add_admin_ids(view,country,zoom_level,rewrite)
             d = gdf_admins1.set_index('id')['name'].to_dict()
             d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
@@ -319,56 +445,45 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             admin_view = convert_to_geodataframe(admin_view)
             save_admin_view(admin_view,country)
             ############################
+            initialized = True
         elif rewrite:
-            view = load_mercator_view(country, zoom_level)
-            if 'id' not in view.columns:
-                combined_view, gdf_admins1 = add_admin_ids(view,country,zoom_level,rewrite)
-                d = gdf_admins1.set_index('id')['name'].to_dict()
-                d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
-                save_mercator_view(combined_view, country, zoom_level)
-                #### Aggregate by admin ####
+            # When rewrite=1, regenerate the entire mercator view from scratch
+            view = create_mercator_country_layer(country, zoom_level, rewrite)
+            combined_view, gdf_admins1 = add_admin_ids(view,country,zoom_level,rewrite)
+            d = gdf_admins1.set_index('id')['name'].to_dict()
+            d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
+            save_mercator_view(combined_view, country, zoom_level)
+            #### Aggregate by admin ####
             
-                # Define aggregation dictionary
-                agg_dict = {col: "sum" for col in sum_cols_admin}
-                agg_dict.update({col: "mean" for col in avg_cols_admin})
+            # Define aggregation dictionary
+            agg_dict = {col: "sum" for col in sum_cols_admin}
+            agg_dict.update({col: "mean" for col in avg_cols_admin})
 
-                # Group by large_id and aggregate
-                agg = combined_view.groupby("id").agg(agg_dict).reset_index()
-                admin_view = agg.rename(columns={'id':'tile_id'})
-                ### add names ###
-                admin_view['name'] = admin_view['tile_id'].map(d)
-                admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
-                admin_view = convert_to_geodataframe(admin_view)
-                save_admin_view(admin_view,country)
-                ############################
-            else:
-                gdf_admins1 = AdminBoundaries.create(country_code=country,admin_level=1).to_geodataframe()
-                d = gdf_admins1.set_index('id')['name'].to_dict()
-                d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
-                #### Aggregate by admin ####
-                combined_view = view
-                # Define aggregation dictionary
-                agg_dict = {col: "sum" for col in sum_cols_admin}
-                agg_dict.update({col: "mean" for col in avg_cols_admin})
-
-                # Group by large_id and aggregate
-                agg = combined_view.groupby("id").agg(agg_dict).reset_index()
-                admin_view = agg.rename(columns={'id':'tile_id'})
-                ### add names ###
-                admin_view['name'] = admin_view['tile_id'].map(d)
-                admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
-                admin_view = convert_to_geodataframe(admin_view)
-                save_admin_view(admin_view,country)
-                ############################
-
-def save_mercator_views(countries,zoom_level):
-    """
-    Generates and saves all country mercator views
-    """
-
-    for country in countries:
-        view = create_mercator_country_layer(country, zoom_level)
-        save_mercator_view(view, country, zoom_level)
+            # Group by large_id and aggregate
+            agg = combined_view.groupby("id").agg(agg_dict).reset_index()
+            admin_view = agg.rename(columns={'id':'tile_id'})
+            ### add names ###
+            admin_view['name'] = admin_view['tile_id'].map(d)
+            admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
+            admin_view = convert_to_geodataframe(admin_view)
+            save_admin_view(admin_view,country)
+            ############################
+            initialized = True
+        else:
+            # File already exists and rewrite=0
+            # This means it was initialized before, so ensure it's tracked
+            logger.info(f"File already exists for {country} at zoom {zoom_level}, ensuring tracking is up to date")
+            initialized = True  # Mark as initialized since file exists
+        
+        # Automatically track initialization in Snowflake
+        # Safe to call even if already tracked
+        if initialized:
+            try:
+                update_country_initialized(country, zoom_level)
+                logger.info(f"Tracked initialization for {country} at zoom level {zoom_level} in Snowflake")
+            except Exception as e:
+                logger.warning(f"Could not track initialization for {country} in Snowflake: {e}")
+                logger.warning("  (Initialization completed, but tracking failed)")
 
 def save_json_storms(d):
     """
@@ -413,7 +528,8 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
             try:
                 new_col = schools_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except:
+            except Exception as e:
+                logger.warning(f"Error mapping polygons for school view at {wind_th}kt: {e}")
                 probs = {k: 0.0 for k in schools_viewer.view.zone_id.unique()}
             schools_viewer.add_variable_to_view(probs, 'probability')
 
@@ -424,11 +540,20 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
 
 def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     """
-    gdf_hcs: a geodataframe with school data
-    gdf_envelopes: a geodataframe with envelopes
-    returns a dictionary of wind threshold - geodataframe with the corresponding health center view
+    Create health center impact views from hurricane envelopes.
+    
+    For each wind speed threshold, calculates the probability that each health center
+    will be affected by winds at or above that threshold.
+    
+    Args:
+        gdf_hcs: GeoDataFrame containing health center locations
+        gdf_envelopes: GeoDataFrame containing hurricane envelope geometries with wind_threshold column
+    
+    Returns:
+        dict: Dictionary mapping wind threshold (int) to GeoDataFrame with health center impact data.
+              Each GeoDataFrame contains 'probability' column indicating impact probability.
     """
-    gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=150)
+    gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
@@ -441,7 +566,8 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
             try:
                 new_col = hcs_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except:
+            except Exception as e:
+                logger.warning(f"Error mapping polygons for health center view at {wind_th}kt: {e}")
                 probs = {k: 0.0 for k in hcs_viewer.view.zone_id.unique()}
             hcs_viewer.add_variable_to_view(probs, 'probability')
 
@@ -451,7 +577,20 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     return wind_views
 
 def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
-    """Create mercator tile impact views from envelopes"""
+    """
+    Create mercator tile impact views from hurricane envelopes.
+    
+    For each wind speed threshold, calculates expected impacts (E_*) for each tile,
+    where expected impact = base value * probability of impact.
+    
+    Args:
+        gdf_tiles: GeoDataFrame containing mercator tiles with demographic/infrastructure data
+        gdf_envelopes: GeoDataFrame containing hurricane envelope geometries with wind_threshold column
+    
+    Returns:
+        dict: Dictionary mapping wind threshold (int) to DataFrame with tile impact data.
+              Each DataFrame contains probability and E_* columns for expected impacts.
+    """
     wind_views = {}
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
     for wind_th in wind_ths:
@@ -500,8 +639,19 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
                 df_view[f"E_{col}"] = df_view[col]*df_view['probability']
 
             df_view = df_view.drop(columns=data_cols)
-
-            #### Aggregate by admin ####
+            
+            # Admin IDs must be present in gdf_tiles (added during initialization or on load)
+            # df_view.index contains zone_id (which is tile_id)
+            if 'id' not in gdf_tiles.columns:
+                raise ValueError(
+                    "Mercator view missing admin IDs."
+                    "Admin IDs are added during initialization. "
+                    "Re-initialize the country or check the mercator view file."
+                )
+            # Create mapping from tile_id to admin id
+            id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
+            # Map zone_id (tile_id) to admin id
+            df_view['id'] = df_view.index.map(lambda x: id_mapping.get(x, x))
             
             # Define aggregation dictionary
             agg_dict = {col: "sum" for col in sum_cols}
@@ -512,10 +662,8 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             df_view = agg.rename(columns={'id':'zone_id'})
             ### add names ###
             df_view['name'] = df_view['zone_id'].map(d)
-            ############################
 
             wind_views[wind_th] = df_view
-
 
     return wind_views
 
@@ -543,7 +691,6 @@ def create_admin_view_from_envelopes(gdf_admin, gdf_envelopes):
             df_view = df_view.drop(columns=data_cols)
 
             wind_views[wind_th] = df_view
-
 
     return wind_views
 
@@ -584,12 +731,58 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
 
     return wind_views
 
+
 def save_school_view(gdf, country, storm, date, wind_th):
     """
-    Saves school view
+    Save school impact view for a specific storm, date, and wind threshold.
+    
+    Args:
+        gdf: GeoDataFrame containing school impact data
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        wind_th: Wind threshold in knots
     """
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+
+def save_school_locations(gdf, country):
+    """
+    Save school locations to cache.
+    
+    Args:
+        gdf: GeoDataFrame containing school locations
+        country: ISO3 country code
+    """
+    file_name = f"{country}_schools.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+
+def load_school_locations(country):
+    """
+    Load cached school locations.
+    
+    Args:
+        country: ISO3 country code
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing cached school locations
+    """
+    file_name = f"{country}_schools.parquet"
+    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+
+def school_exist(country):
+    """
+    Check if cached school locations exist for a country.
+    
+    Args:
+        country: ISO3 country code
+    
+    Returns:
+        bool: True if cached school data exists, False otherwise
+    """
+    file_name = f"{country}_schools.parquet"
+    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+
 
 def save_hc_view(gdf, country, storm, date, wind_th):
     """
@@ -600,73 +793,123 @@ def save_hc_view(gdf, country, storm, date, wind_th):
 
 def save_hc_locations(gdf, country):
     """
-    Saves health center locations
+    Save health center locations to cache.
+    
+    Args:
+        gdf: GeoDataFrame containing health center locations
+        country: ISO3 country code
     """
     file_name = f"{country}_health_centers.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
 def load_hc_locations(country):
     """
-    Loads health center locations
+    Load cached health center locations.
+    
+    Args:
+        country: ISO3 country code
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing cached health center locations
     """
     file_name = f"{country}_health_centers.parquet"
     return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
 def hc_exist(country):
+    """
+    Check if cached health center locations exist for a country.
+    
+    Args:
+        country: ISO3 country code
+    
+    Returns:
+        bool: True if cached health center data exists, False otherwise
+    """
     file_name = f"{country}_health_centers.parquet"
     return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
-def create_admin_country_layer(country):
-    """
-    countries: list of iso3 codes of countries
-    returns a geodataframe with the admin1 view
-    """
-    #### schools ####
-    gdf_schools = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
-    # seems API is returning old column name...
-    if 'giga_id_school' in gdf_schools.columns:
-        gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
-    #################
-        
-    #### health centers ####
-    if hc_exist(country):
-        gdf_hcs = load_hc_locations(country)
-    else:
-        try:
-            gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
-            if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
-                print(f"    No health center data available for {country}, skipping...")
-                # Create empty GeoDataFrame with proper geometry column for tracks processing
-                gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-            else:
-                gdf_hcs = gdf_hcs.set_crs(4326)
-                save_hc_locations(gdf_hcs, country)
-        except Exception as e:
-            print(f"Error fetching health centers for {country}: {str(e)}")
-            gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-    ########################
 
-    tiles_viewer = AdminBoundariesViewGenerator(country=country,admin_level=1,data_store=data_store)
+
+def create_admin_country_layer(country, rewrite=0):
+    """
+    Create admin level 1 layer with demographic and infrastructure data for a country.
+    
+    This function generates an admin-level view containing:
+    - Population data (total, school-age, infants) from WorldPop
+    - Infrastructure data (built surface, SMOD settlement classification)
+    - School locations from GIGA API
+    - Health center locations from HealthSites API
+    - Relative Wealth Index (RWI) data
+    
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, replace existing cache; if 0, use cached if available
+    
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame with admin level 1 boundaries containing all demographic and
+                         infrastructure data. Column 'zone_id' is renamed to 'tile_id'.
+    
+    Note:
+        Missing data (e.g., RWI, age-specific population) is handled gracefully with NaN values.
+        The function attempts multiple fallback strategies for age-specific population data.
+    """
+    # Fetch schools and health centers using helper functions with caching
+    gdf_schools = fetch_schools(country, rewrite)
+    gdf_hcs = fetch_health_centers(country, rewrite)
+
+    tiles_viewer = AdminBoundariesViewGenerator(country=country, admin_level=1, data_store=data_store)
+    
+    # Map school-age population (with fallback strategies)
     try:
-        tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="school_age_population", school_age=True, project="age_structures", un_adjusted=False, sex='F_M')
-    except:
-        # this should be ready in the next release
-        print("No school age available")
+        tiles_viewer.map_wp_pop(
+            country=country, 
+            resolution=WORLDPOP_RESOLUTION_HIGH, 
+            output_column="school_age_population", 
+            school_age=True, 
+            project="age_structures", 
+            un_adjusted=False, 
+            sex='F_M'
+        )
+    except Exception:
+        # Fallback: try age range method
         try:
-            tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="school_age_population", predicate='centroid_within', school_age=False, project="age_structures", un_adjusted=False,min_age=5, max_age=15)
-        except:
-            print("No age ranges either")
+            tiles_viewer.map_wp_pop(
+                country=country, 
+                resolution=WORLDPOP_RESOLUTION_HIGH, 
+                output_column="school_age_population", 
+                predicate='centroid_within', 
+                school_age=False, 
+                project="age_structures", 
+                un_adjusted=False,
+                min_age=SCHOOL_AGE_MIN, 
+                max_age=SCHOOL_AGE_MAX
+            )
+        except Exception:
+            # Final fallback: set to NaN
+            logger.warning(f"No school-age population data available for {country}")
             school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
             tiles_viewer.add_variable_to_view(school_age, 'school_age_population')
 
+    # Map infant population
     try:
-        tiles_viewer.map_wp_pop(country=country, resolution=1000, output_column="infant_population", predicate='centroid_within', school_age=False, project="age_structures", un_adjusted=False,min_age=0, max_age=4)
-    except:
-        print("No infant age ranges")
-        school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
-        tiles_viewer.add_variable_to_view(school_age, 'infant_population')
+        tiles_viewer.map_wp_pop(
+            country=country, 
+            resolution=WORLDPOP_RESOLUTION_HIGH, 
+            output_column="infant_population", 
+            predicate='centroid_within', 
+            school_age=False, 
+            project="age_structures", 
+            un_adjusted=False,
+            min_age=INFANT_AGE_MIN, 
+            max_age=INFANT_AGE_MAX
+        )
+    except Exception:
+        logger.warning(f"No infant population data available for {country}")
+        infant_pop = {k: np.nan for k in tiles_viewer.view.index.unique()}
+        tiles_viewer.add_variable_to_view(infant_pop, 'infant_population')
 
-    tiles_viewer.map_wp_pop(country=country, resolution=100)
+    # Map total population and infrastructure data
+    tiles_viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW)
     tiles_viewer.map_built_s()
     tiles_viewer.map_smod()
     
@@ -700,13 +943,17 @@ def save_admin_view(gdf, country):
     file_name = f"{country}_admin1.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
-def save_admin_views(countries):
+def save_admin_views(countries, rewrite=0):
     """
     Generates and saves all country admin1 views
+    
+    Args:
+        countries: List of country codes
+        rewrite: If 1, replace existing files; if 0, skip if exists
     """
 
     for country in countries:
-        view = create_admin_country_layer(country)
+        view = create_admin_country_layer(country, rewrite)
         save_admin_view(view, country)
 
 def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level):
@@ -718,7 +965,14 @@ def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level):
 
 def save_cci_tiles(gdf, country, storm, date, zoom_level):
     """
-    Saves CCI tiles views
+    Saves Child Cyclone Index (CCI) tile views to storage.
+    
+    Args:
+        gdf: GeoDataFrame containing CCI values per tile
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        zoom_level: Zoom level for tiles
     """
     file_name = f"{country}_{storm}_{date}_{zoom_level}_cci.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
@@ -732,7 +986,13 @@ def save_admin_tiles_view(gdf, country, storm, date, wind_th):
 
 def save_cci_admin(gdf, country, storm, date):
     """
-    Saves CCI admin views
+    Saves Child Cyclone Index (CCI) admin-level views to storage.
+    
+    Args:
+        gdf: GeoDataFrame containing CCI values aggregated by admin level
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
     """
     file_name = f"{country}_{storm}_{date}_admin1_cci.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
@@ -755,6 +1015,42 @@ def save_tracks_view(gdf, country, storm, date, wind_th):
 cci_cols = ['CCI_children','CCI_pop','CCI_school_age','CCI_infants','E_CCI_children','E_CCI_pop','E_CCI_school_age','E_CCI_infants']    
 
 def calculate_ccis(wind_tiles_views, gdf_tiles):
+    """
+    Calculate Child Cyclone Index (CCI) values for tiles.
+    
+    CCI is a weighted index that quantifies the potential impact of cyclone wind speeds
+    on different population demographics (children, school-age, infants, total population).
+    The index uses wind speed squared as weights to emphasize higher wind speeds.
+    
+    Args:
+        wind_tiles_views: Dictionary of wind threshold views (key: wind speed in kt, value: DataFrame)
+        gdf_tiles: GeoDataFrame containing tile data with population demographics and admin IDs
+    
+    Returns:
+        DataFrame: CCI tile view with columns:
+            - CCI_children: Child Cyclone Index for children (school-age + infants)
+            - E_CCI_children: Expected CCI for children
+            - CCI_school_age: CCI for school-age population
+            - E_CCI_school_age: Expected CCI for school-age population
+            - CCI_infants: CCI for infant population
+            - E_CCI_infants: Expected CCI for infants
+            - CCI_pop: CCI for total population
+            - E_CCI_pop: Expected CCI for total population
+    
+    Raises:
+        ValueError: If admin IDs are missing from gdf_tiles (required for aggregation)
+    
+    Note:
+        Requires admin IDs in gdf_tiles for proper admin-level aggregation.
+        Admin IDs should always be present (added during initialization or on load).
+    """
+    # Admin IDs must be present - fail fast if missing
+    if 'id' not in gdf_tiles.columns:
+        raise ValueError(
+            "Mercator view missing admin IDs."
+            "Admin IDs are added during initialization. "
+            "Re-initialize the country or check the mercator view file."
+        )
     d = gdf_tiles.set_index('tile_id')['id'].to_dict()
     winds = sorted(wind_tiles_views.keys())
     sorted_wind_views_indexed = []
@@ -771,7 +1067,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_children'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children']]
 
@@ -781,7 +1078,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_school_age_population'] + sorted_wind_views_indexed[i]['E_infant_population']) - (sorted_wind_views_indexed[i+1]['E_school_age_population'] + sorted_wind_views_indexed[i+1]['E_infant_population'])
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_school_age_population'] + sorted_wind_views_indexed[k-1]['E_infant_population'])
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_children'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children']]
 
@@ -791,7 +1089,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['school_age_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_school_age'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age']]
 
@@ -801,7 +1100,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_school_age_population']) - (sorted_wind_views_indexed[i+1]['E_school_age_population'])
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_school_age_population'])
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_school_age'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age']]
 
@@ -811,7 +1111,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_infants'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants']]
 
@@ -821,7 +1122,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_infant_population']) - (sorted_wind_views_indexed[i+1]['E_infant_population'])
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_infant_population'])
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_infants'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants']]
 
@@ -831,7 +1133,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (gdf_tiles_index['population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (gdf_tiles_index['population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_pop'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop']]
 
@@ -841,7 +1144,8 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_population']) - (sorted_wind_views_indexed[i+1]['E_population'])
     wind = winds[-1]
     cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_population'])
-    wcols = [cci_tiles_view[col]*math.pow(int(col),2)*math.pow(10,-6) for col in cci_tiles_view.columns if col not in cci_cols]
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
+             for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_pop'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop','E_CCI_pop']]
     cci_tiles_view = cci_tiles_view.reset_index()
@@ -856,19 +1160,34 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
 
 def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom):
     """
-    country: ios3 code of country
-    storm: storm name
-    date: date of the envelopes forecast
-    gdf_envelopes: geodataframe with the forecasted envelopes
-    **** Creates and saves the views
+    Create and save all impact views for a country from hurricane envelopes.
+    
+    This is the main orchestration function that processes a single country for a given
+    storm forecast. It creates and saves:
+    - School impact views (probability per wind threshold)
+    - Health center impact views (probability per wind threshold)
+    - Tile impact views (expected impacts per tile per wind threshold)
+    - Admin level impact views (aggregated by admin level 1)
+    - Child Cyclone Index (CCI) views (both tile and admin level)
+    - Track views (severity metrics per ensemble member)
+    - JSON impact report
+    
+    Args:
+        country: ISO3 country code
+        storm: Storm name (e.g., 'FUNG-WONG')
+        date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
+        gdf_envelopes: GeoDataFrame containing hurricane envelope geometries
+        zoom: Zoom level for mercator tiles
+    
+    Note:
+        Base data (mercator tiles, admin views) are loaded if available, or created
+        on-the-fly if missing. Admin IDs are automatically added if missing.
     """
     print(f"  Processing {country}...")
     
     # Schools
     print(f"    Processing schools...")
-    gdf_schools = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
-    if 'giga_id_school' in gdf_schools.columns:
-        gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
+    gdf_schools = fetch_schools(country, rewrite=0)
     
     wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes)
     for wind_th in wind_school_views:
@@ -877,29 +1196,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
 
     # Health centers
     print(f"    Processing health centers...")
-    if hc_exist(country):
-        gdf_hcs = load_hc_locations(country)
-        wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes)
-        for wind_th in wind_hc_views:
-            save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
-    else:
-        try:
-            gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
-            if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
-                print(f"    No health center data available for {country}, skipping...")
-                # Create empty GeoDataFrame with proper geometry column for tracks processing
-                gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-                wind_hc_views = {}
-            else:
-                gdf_hcs = gdf_hcs.set_crs(4326)
-                save_hc_locations(gdf_hcs, country)
-                wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes)
-                for wind_th in wind_hc_views:
-                    save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
-        except Exception as e:
-            print(f"Error fetching health centers for {country}: {str(e)}")
-            gdf_hcs = gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-            wind_hc_views = {}
+    gdf_hcs = fetch_health_centers(country, rewrite=0)
+    wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes)
+    for wind_th in wind_hc_views:
+        save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
     print(f"    Created {len(wind_hc_views)} health center views")
 
     # Tiles
@@ -907,9 +1207,15 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     try:
         gdf_tiles = load_mercator_view(country, zoom)
         print(f"    Loaded existing mercator tiles: {len(gdf_tiles)} tiles")
+        # Ensure admin IDs are present (in case file was created without them)
+        if 'id' not in gdf_tiles.columns:
+            print(f"    Warning: Mercator view missing admin IDs, adding them...")
+            gdf_tiles, _ = add_admin_ids(gdf_tiles, country, zoom, rewrite=0)
+            save_mercator_view(gdf_tiles, country, zoom)
     except:
         print(f"    Creating base mercator tiles for {country}...")
-        gdf_tiles = create_mercator_country_layer(country)
+        view = create_mercator_country_layer(country, zoom, rewrite=0)
+        gdf_tiles, _ = add_admin_ids(view, country, zoom, rewrite=0)
         save_mercator_view(gdf_tiles, country, zoom)
         print(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
     
@@ -930,7 +1236,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         print(f"    Loaded existing admin: {len(gdf_admin)} tiles")
     except:
         print(f"    Creating base admin for {country}...")
-        gdf_admin = create_admin_country_layer(country)
+        gdf_admin = create_admin_country_layer(country, rewrite=0)
         save_admin_view(gdf_admin, country)
         print(f"    Created and saved base admin tiles: {len(gdf_admin)} tiles")
     

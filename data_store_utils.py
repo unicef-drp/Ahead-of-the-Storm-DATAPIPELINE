@@ -2,50 +2,33 @@
 """
 Data Store Utilities Module
 
-This module provides centralized data store management utilities for the Ahead of the Storm application.
+This module provides centralized data store management utilities for the Impact Analysis Pipeline.
 It consolidates data store initialization logic and provides a single source of truth for data store configuration.
 
+The module supports three storage backends:
+- LOCAL: Local filesystem storage (default)
+- BLOB: Azure Blob Storage (requires ACCOUNT_URL and SAS_TOKEN)
+- SNOWFLAKE: Snowflake internal stage (requires SNOWFLAKE_STAGE_NAME)
+
+Storage backend is configured via the DATA_PIPELINE_DB environment variable.
+
 Key Components:
-- ADLSDataStoreRO class for read-only Azure Blob Storage access
 - Centralized data store initialization based on environment variables
+- Automatic validation of required configuration for each storage backend
 - Consistent data store configuration across the application
 
 Usage:
     from data_store_utils import get_data_store
-    data_store = get_data_store()
+    data_store = get_data_store()  # Returns LocalDataStore, ADLSDataStore, or SnowflakeDataStore
 """
-
-import os
-from azure.storage.blob import BlobServiceClient
 
 # Import GigaSpatial components
 from gigaspatial.core.io.adls_data_store import ADLSDataStore
 from gigaspatial.core.io.local_data_store import LocalDataStore
-from gigaspatial.config import config
+from gigaspatial.core.io.snowflake_data_store import SnowflakeDataStore
 
 # Import centralized configuration
 from config import config as app_config
-
-class ADLSDataStoreRO(ADLSDataStore):
-    """
-    Read-only Azure Data Lake Storage Data Store
-    
-    This class provides read-only access to Azure Blob Storage using SAS tokens.
-    It's used when you need read-only access to data without write permissions.
-    """
-    
-    def __init__(self, account_url: str, sas_token: str, container: str = config.ADLS_CONTAINER_NAME):
-        """
-        Initialize read-only ADLS data store
-        
-        Args:
-            account_url: Azure Storage account URL
-            sas_token: SAS token for authentication
-            container: Container name (defaults to config.ADLS_CONTAINER_NAME)
-        """
-        self.blob_service_client = BlobServiceClient(account_url=account_url, credential=sas_token)
-        self.container_client = self.blob_service_client.get_container_client(container=container)
-        self.container = container
 
 def get_data_store():
     """
@@ -56,8 +39,20 @@ def get_data_store():
     """
     data_pipeline_db = app_config.DATA_PIPELINE_DB
     
-    if data_pipeline_db == 'BLOB' or data_pipeline_db == "RO_BLOB":
+    if data_pipeline_db == 'BLOB':
+        app_config.validate_azure_config()
         return ADLSDataStore()
+    elif data_pipeline_db == 'SNOWFLAKE':
+        app_config.validate_snowflake_storage_config()
+        return SnowflakeDataStore(
+            account=app_config.SNOWFLAKE_ACCOUNT,
+            user=app_config.SNOWFLAKE_USER,
+            password=app_config.SNOWFLAKE_PASSWORD,
+            warehouse=app_config.SNOWFLAKE_WAREHOUSE,
+            database=app_config.SNOWFLAKE_DATABASE,
+            schema=app_config.SNOWFLAKE_SCHEMA,
+            stage_name=app_config.SNOWFLAKE_STAGE_NAME
+        )
     elif data_pipeline_db == 'LOCAL':
         return LocalDataStore()
     else:
