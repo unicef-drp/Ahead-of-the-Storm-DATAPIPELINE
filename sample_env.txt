@@ -1,12 +1,12 @@
 # Copy this file to .env and fill in credentials as needed
-# cp example_env.txt .env
+# cp sample_env.txt .env
 
 # ---------------------------
 # Pipeline storage backend
 # ---------------------------
 # LOCAL: use local filesystem (default)
 # BLOB: Azure Blob Storage (read/write)
-# RO_BLOB: Azure Blob Storage (read-only)
+# SNOWFLAKE: Snowflake internal stage (read/write)
 export DATA_PIPELINE_DB=LOCAL
 
 # ---------------------------
@@ -21,8 +21,14 @@ export STORMS_FILE=storms.json
 export ROOT_DATA_DIR=geodb
 export VIEWS_DIR=aos_views
 
+# Report files (optional - defaults shown)
+# JSON reports subdirectory under RESULTS_DIR (default: jsons)
+# export REPORTS_JSON_DIR=jsons
+# HTML template path (default: impact-report-template.html in project root)
+# export REPORT_TEMPLATE_PATH=impact-report-template.html
+
 # ---------------------------
-# Snowflake (required for data)
+# Snowflake (required for data retrieval)
 # ---------------------------
 export SNOWFLAKE_ACCOUNT=your_account
 export SNOWFLAKE_USER=your_user
@@ -32,7 +38,15 @@ export SNOWFLAKE_DATABASE=your_database
 export SNOWFLAKE_SCHEMA=your_schema
 
 # ---------------------------
-# Azure Blob Storage (only if DATA_PIPELINE_DB=BLOB or RO_BLOB)
+# Snowflake Stage (only if DATA_PIPELINE_DB=SNOWFLAKE)
+# ---------------------------
+# Name of the Snowflake stage to use for file storage
+# The stage must exist in your Snowflake database/schema
+# Example: CREATE STAGE my_stage;
+# export SNOWFLAKE_STAGE_NAME=my_stage
+
+# ---------------------------
+# Azure Blob Storage (only if DATA_PIPELINE_DB=BLOB)
 # ---------------------------
 # ACCOUNT_URL example: https://<account_name>.blob.core.windows.net
 # SAS_TOKEN should start with ?sv=...
@@ -40,21 +54,14 @@ export SNOWFLAKE_SCHEMA=your_schema
 # export SAS_TOKEN=
 
 # ---------------------------
-# API tokens
+# API tokens (for data fetching)
 # ---------------------------
 # REQUIRED for school locations via GIGA API
-# Obtain from GIGA and set to enable school fetching
 export GIGA_SCHOOL_LOCATION_API_KEY=
 
 # REQUIRED for HealthSites facility fetching
-# Obtain from HealthSites/OpenStreetMap ecosystem as configured by your org
 export HEALTHSITES_API_KEY=
 
-# Optional: Mapbox token if used elsewhere
-# export MAPBOX_TOKEN=
-
-# GeoRepo token (preferred/required depending on your access policy)
-# If your organization requires authenticated access to GeoRepo, set this
-# export GEOREPO_TOKEN=
-
-# Note: Admin boundaries are usually public via GigaSpatial handlers if not restricted
+# Optional: GeoRepo API credentials (for admin boundaries)
+# export GEOREPO_API_KEY=
+# export GEOREPO_USER_EMAIL=

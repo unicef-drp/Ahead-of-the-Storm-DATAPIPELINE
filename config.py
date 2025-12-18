@@ -2,7 +2,7 @@
 """
 Configuration Module
 
-This module provides centralized configuration management for the Ahead of the Storm application.
+This module provides centralized configuration management.
 It handles environment variable loading and provides a single source of truth for configuration.
 
 Key Components:
@@ -33,6 +33,7 @@ class Config:
     SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE')
     SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE')
     SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA')
+    SNOWFLAKE_STAGE_NAME = os.getenv('SNOWFLAKE_STAGE_NAME')
     
     # Azure Blob Storage Configuration
     ACCOUNT_URL = os.getenv('ACCOUNT_URL')
@@ -46,8 +47,9 @@ class Config:
     VIEWS_DIR = os.getenv('VIEWS_DIR')
     ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR')
     
-    # Mapbox Configuration
-    MAPBOX_TOKEN = os.getenv('MAPBOX_TOKEN')
+    # Report Configuration (optional)
+    REPORTS_JSON_DIR = os.getenv('REPORTS_JSON_DIR', 'jsons')  # Subdirectory for JSON reports under RESULTS_DIR
+    REPORT_TEMPLATE_PATH = os.getenv('REPORT_TEMPLATE_PATH', 'impact-report-template.html')  # HTML template path
     
     @classmethod
     def validate_snowflake_config(cls):
@@ -66,13 +68,38 @@ class Config:
             raise ValueError(f"Missing Snowflake environment variables: {', '.join(missing)}")
     
     @classmethod
+    def validate_snowflake_storage_config(cls):
+        """Validate that all required Snowflake storage configuration is present (for DATA_PIPELINE_DB=SNOWFLAKE)"""
+        required_vars = [
+            'SNOWFLAKE_ACCOUNT',
+            'SNOWFLAKE_USER', 
+            'SNOWFLAKE_PASSWORD',
+            'SNOWFLAKE_WAREHOUSE',
+            'SNOWFLAKE_DATABASE',
+            'SNOWFLAKE_SCHEMA',
+            'SNOWFLAKE_STAGE_NAME'
+        ]
+        
+        missing = [var for var in required_vars if not getattr(cls, var)]
+        if missing:
+            raise ValueError(f"Missing Snowflake storage environment variables: {', '.join(missing)}")
+    
+    @classmethod
     def validate_azure_config(cls):
         """Validate that all required Azure configuration is present"""
-        if cls.DATA_PIPELINE_DB in ['BLOB', 'RO_BLOB']:
+        if cls.DATA_PIPELINE_DB == 'BLOB':
             required_vars = ['ACCOUNT_URL', 'SAS_TOKEN']
             missing = [var for var in required_vars if not getattr(cls, var)]
             if missing:
                 raise ValueError(f"Missing Azure environment variables: {', '.join(missing)}")
+    
+    @classmethod
+    def validate_storage_config(cls):
+        """Validate storage configuration based on DATA_PIPELINE_DB setting"""
+        if cls.DATA_PIPELINE_DB == 'BLOB':
+            cls.validate_azure_config()
+        elif cls.DATA_PIPELINE_DB == 'SNOWFLAKE':
+            cls.validate_snowflake_storage_config()
 
 # Create a global config instance
 config = Config()

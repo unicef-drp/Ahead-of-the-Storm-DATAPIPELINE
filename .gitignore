@@ -25,3 +25,5 @@ __pycache__/
 
 geodb/
 project_results/
+gigaspatial/
+test_files/
