@@ -1,0 +1,44 @@
+# Python environment and cache
+../.venv/
+.env
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files
+*.tif
+*.geojson
+*.json
+*.xml
+*.csv
+*.zip
+*.nc
+*.kmz
+*.bin
+*.html
+*.bufr4
+*.grib2
+*.idx
+*.parquet
+
+# Metadata and log files
+*.aux.xml
+*.log
+.DS_Store
+.idea/
+
+# Data directories
+geodb/
+project_results/
+test_files/
+
+# Documentation
+*.md
+
+# Utility scripts
+country_utils.py
+verify_tables.py
+impact-report-template.html
+sample_env.txt
