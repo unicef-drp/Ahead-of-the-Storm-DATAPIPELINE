@@ -1,0 +1,104 @@
+name: Initialize New Country
+
+on:
+  workflow_dispatch:
+    inputs:
+      country_code:
+        description: 'ISO3 country code (e.g., TWN, DOM, VNM)'
+        required: true
+        type: string
+      country_name:
+        description: 'Full country name (e.g., Taiwan)'
+        required: true
+        type: string
+      zoom_level:
+        description: 'Zoom level for mercator tiles'
+        required: false
+        default: '14'
+        type: string
+      rewrite:
+        description: 'Rewrite existing data (1=yes, 0=no)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+
+jobs:
+  initialize-country:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Add country to Snowflake table
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB }}
+          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+        run: |
+          python -c "
+          from country_utils import add_country_to_snowflake
+          add_country_to_snowflake(
+              '${{ inputs.country_code }}',
+              '${{ inputs.country_name }}',
+              ${{ inputs.zoom_level }},
+              'Added via GitHub Actions'
+          )
+          "
+      
+      - name: Initialize country data
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB }}
+          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+          GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
+          HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
+          GEOREPO_TOKEN: ${{ secrets.GEOREPO_TOKEN }}
+        run: |
+          python main_pipeline.py \
+            --type initialize \
+            --countries ${{ inputs.country_code }} \
+            --zoom ${{ inputs.zoom_level }} \
+            --rewrite ${{ inputs.rewrite }}
+      
+      - name: Verify initialization tracking
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        run: |
+          python -c "
+          from country_utils import get_initialized_zoom_levels
+          zoom_levels = get_initialized_zoom_levels('${{ inputs.country_code }}')
+          if ${{ inputs.zoom_level }} in zoom_levels:
+              print('✓ Initialization automatically tracked in Snowflake')
+          else:
+              print('⚠ Initialization may not have been tracked - check logs above')
+          "
+

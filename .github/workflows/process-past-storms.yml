@@ -1,0 +1,128 @@
+name: Process Past Storms
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        type: string
+      end_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: true
+        type: string
+      countries:
+        description: 'Comma-separated country codes (e.g., TWN,DOM,VNM). Leave empty to use all active countries from Snowflake.'
+        required: false
+        default: ''
+        type: string
+      storm:
+        description: 'Specific storm name (optional, e.g., FUNG-WONG)'
+        required: false
+        default: ''
+        type: string
+      rewrite:
+        description: 'Rewrite existing data (1=yes, 0=no)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
+
+jobs:
+  process-past-storms:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Get countries list
+        id: get_countries
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        run: |
+          if [ -z "${{ inputs.countries }}" ]; then
+            COUNTRIES=$(python -c "
+            from country_utils import get_active_countries_from_snowflake
+            countries = get_active_countries_from_snowflake()
+            print(' '.join(countries))
+            ")
+            echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
+          else
+            # Convert comma-separated to space-separated
+            COUNTRIES=$(echo "${{ inputs.countries }}" | tr ',' ' ')
+            echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Process storms for date range
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB }}
+          SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+          GIGA_SCHOOL_LOCATION_API_KEY: ${{ secrets.GIGA_SCHOOL_LOCATION_API_KEY }}
+          HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
+          GEOREPO_TOKEN: ${{ secrets.GEOREPO_TOKEN }}
+        run: |
+          # Process each date in the range
+          START_DATE="${{ inputs.start_date }}"
+          END_DATE="${{ inputs.end_date }}"
+          
+          python -c "
+          from datetime import datetime, timedelta
+          from country_utils import get_active_countries_from_snowflake
+          import subprocess
+          import sys
+          
+          start = datetime.strptime('${{ inputs.start_date }}', '%Y-%m-%d')
+          end = datetime.strptime('${{ inputs.end_date }}', '%Y-%m-%d')
+          
+          countries = '${{ steps.get_countries.outputs.countries }}'.split()
+          if not countries:
+              countries = get_active_countries_from_snowflake()
+          
+          current = start
+          while current <= end:
+              date_str = current.strftime('%Y-%m-%d')
+              print(f'Processing date: {date_str}')
+              
+              cmd = [
+                  'python', 'main_pipeline.py',
+                  '--type', 'update',
+                  '--countries'] + countries + [
+                  '--date', date_str,
+                  '--rewrite', '${{ inputs.rewrite }}'
+              ]
+              
+              if '${{ inputs.storm }}':
+                  cmd.extend(['--storm', '${{ inputs.storm }}'])
+              
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              print(result.stdout)
+              if result.returncode != 0:
+                  print(f'Error processing {date_str}:', result.stderr, file=sys.stderr)
+              
+              current += timedelta(days=1)
+          "
+
