@@ -16,7 +16,7 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
 1. **Snowflake CLI** installed and configured
    ```bash
    pip install snowflake-cli-labs
-   snow connection add <your-connection-name>
+   snow connection add <connection-name>
    ```
 
 2. **Docker** installed and running
@@ -35,20 +35,54 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
      INSTANCE_FAMILY = CPU_X64_M;
    ```
 
-5. **Image Repository** created in Snowflake
+5. **Network Security Configuration**
+   
+   The pipeline requires network connectivity to external APIs (GeoRepo, GADM, geoBoundaries/HDX). Configure network rules and external access integration:
+   
+   ```sql
+   USE ROLE ACCOUNTADMIN;
+   
+   -- Create network rule for egress access (allows outbound HTTP/HTTPS)
+   CREATE OR REPLACE NETWORK RULE impact_analysis_egress_access
+     MODE = EGRESS
+     TYPE = HOST_PORT
+     VALUE_LIST = ('0.0.0.0:80', '0.0.0.0:443');
+   
+   -- Create external access integration
+   CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION impact_analysis_egress_access_integration
+     ALLOWED_NETWORK_RULES = (impact_analysis_egress_access)
+     ENABLED = true;
+   ```
+   
+   **Note:** The network rule allows outbound HTTP (port 80) and HTTPS (port 443) to any destination (0.0.0.0). This is required for accessing external APIs:
+   - GeoRepo (UNICEF administrative boundaries API)
+   - GADM (Global Administrative Areas)
+   - HDX/geoBoundaries (Humanitarian Data Exchange)
+   - Other geospatial data sources
+
+6. **Image Repository** created in Snowflake
    ```sql
    CREATE OR REPLACE IMAGE REPOSITORY SERVICES;
    ```
-   This should be run in the database and schema where you plan to deploy your SPCS service.
+   This should be run in the database and schema where the SPCS service will be deployed.
 
-6. **Snowflake Tables** must exist:
+7. **Snowflake Tables** must exist:
    - `TC_TRACKS` - Hurricane track data
    - `TC_ENVELOPES_COMBINED` - Hurricane envelope data
 
-7. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
+8. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
+   
+   The stage must be created in the same database and schema where the pipeline is running:
+   
    ```sql
-   CREATE OR REPLACE STAGE impact_analysis_stage;
+  -- Create the stage (replace AOTS_ANALYSIS with the stage name from SNOWFLAKE_STAGE_NAME env var)
+   CREATE OR REPLACE STAGE AOTS_ANALYSIS;
+   
+   -- Grant usage on the stage to the role that will run the pipeline
+   GRANT USAGE ON STAGE AOTS_ANALYSIS TO ROLE <role_name>;
    ```
+   
+   **Important:** The stage name must match the value of `SNOWFLAKE_STAGE_NAME` environment variable exactly (case-sensitive).
 
 ## Building the Docker Image
 
@@ -74,7 +108,7 @@ This will:
 snow spcs image-registry url --connection default
 ```
 
-This will output something like: `orgname-account.registry.snowflakecomputing.com`
+This outputs something like: `orgname-account.registry.snowflakecomputing.com`
 
 ### Step 2: Tag the Image
 
@@ -92,11 +126,11 @@ docker tag impact-analysis-pipeline:latest \
 ```
 
 Where:
-- `orgname-account` = your registry URL (from `snow spcs image-registry url`)
-- `mydatabase` = your database name (lowercase)
-- `myschema` = your schema name (lowercase)
-- `myservice` = your service name (lowercase)
-- `impact-analysis-pipeline` = your image name
+- `orgname-account` = registry URL (from `snow spcs image-registry url`)
+- `mydatabase` = database name (lowercase)
+- `myschema` = schema name (lowercase)
+- `myservice` = service name (lowercase)
+- `impact-analysis-pipeline` = image name
 - `latest` = tag/version
 
 ## Pushing to Snowflake Registry
@@ -107,7 +141,7 @@ Where:
 snow spcs image-registry login --connection default
 ```
 
-This automatically logs Docker into your Snowflake image registry.
+This automatically logs Docker into the Snowflake image registry.
 
 ### Step 2: Push the Image
 
@@ -118,6 +152,8 @@ docker push orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/
 ## Running the Pipeline
 
 ### Option 1: Running Locally (for Testing)
+
+Test the container locally with Snowflake stage before deploying to SPCS:
 
 ```bash
 docker run --rm \
@@ -133,6 +169,8 @@ docker run --rm \
   --type initialize --countries TWN --zoom 14
 ```
 
+**Note:** This uses password authentication to connect to Snowflake. The container runs locally but writes to Snowflake stage, allowing testing of the full pipeline before deploying to SPCS.
+
 ### Option 2: Running in SPCS (Production)
 
 Execute the pipeline as a SPCS job using `EXECUTE JOB SERVICE`:
@@ -142,6 +180,7 @@ EXECUTE JOB SERVICE
    IN COMPUTE POOL impact_analysis_pool
    NAME = impact_analysis_job
    ASYNC = TRUE
+   EXTERNAL_ACCESS_INTEGRATIONS = (IMPACT_ANALYSIS_EGRESS_ACCESS_INTEGRATION)
    FROM SPECIFICATION $$
    spec:
      containers:
@@ -157,6 +196,11 @@ EXECUTE JOB SERVICE
           SNOWFLAKE_SCHEMA: your_schema
           SNOWFLAKE_WAREHOUSE: your_warehouse
           
+          # SPCS internal network (optional, but recommended for SPCS)
+          # These are automatically provided by SPCS but can be explicitly set
+          # SNOWFLAKE_HOST: <internal-host>
+          # SNOWFLAKE_PORT: <internal-port>
+          
           # Storage configuration
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
@@ -164,6 +208,9 @@ EXECUTE JOB SERVICE
           # Pipeline parameters
           ZOOM_LEVEL: "14"
           REWRITE: "0"
+          
+          # Optional: SSL/certificate handling (set to true if experiencing certificate issues)
+          # SNOWFLAKE_INSECURE_MODE: false
        args:
          - "--type"
          - "update"
@@ -174,18 +221,20 @@ EXECUTE JOB SERVICE
    $$;
 ```
 
-### Option 3: Running as a Scheduled Job
+### Option 3: Running as a Scheduled Job (Automatic Processing)
 
-Create a scheduled job that runs the pipeline periodically:
+Create a scheduled job that automatically processes the latest storms:
 
 ```sql
-CREATE OR REPLACE JOB impact_analysis_scheduled_job
-  SCHEDULE = 'USING CRON 0 */6 * * * UTC'  -- Every 6 hours
+CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
+  SCHEDULE = 'USING CRON 0 */6 * * * UTC'  -- Every 6 hours at minute 0
+  COMMENT = 'Automatically process latest storms for all active countries'
   AS
   EXECUTE JOB SERVICE
     IN COMPUTE POOL impact_analysis_pool
-    NAME = impact_analysis_job
+    NAME = impact_analysis_latest_storms
     ASYNC = TRUE
+    EXTERNAL_ACCESS_INTEGRATIONS = (IMPACT_ANALYSIS_EGRESS_ACCESS_INTEGRATION)
     FROM SPECIFICATION $$
     spec:
       containers:
@@ -199,25 +248,59 @@ CREATE OR REPLACE JOB impact_analysis_scheduled_job
           SNOWFLAKE_WAREHOUSE: your_warehouse
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
+          ZOOM_LEVEL: "14"
+          REWRITE: "0"
+          # API Keys (required for data fetching)
+          GIGA_SCHOOL_LOCATION_API_KEY: <your_giga_api_key>
+          HEALTHSITES_API_KEY: <your_healthsites_api_key>
+          GEOREPO_API_KEY: <your_georepo_api_key>
+          GEOREPO_USER_EMAIL: <your_georepo_email>
         args:
           - "--type"
           - "update"
-          - "--countries"
-          - "TWN"
           - "--time_delta"
           - "9"
+          # No --countries specified: will use all active countries from Snowflake PIPELINE_COUNTRIES table
     $$;
 ```
+
+**Key Points:**
+- `--time_delta 9` processes storms from the last 9 days
+- No `--countries` specified: automatically uses all active countries from the `PIPELINE_COUNTRIES` table
+- Runs automatically on the schedule (every 6 hours in this example)
+
+**Schedule Examples:**
+- `'USING CRON 0 */6 * * * UTC'` - Every 6 hours
+- `'USING CRON 0 */12 * * * UTC'` - Every 12 hours  
+- `'USING CRON 0 0 * * * UTC'` - Daily at midnight UTC
+- `'USING CRON 0 0,6,12,18 * * * UTC'` - 4 times per day (00:00, 06:00, 12:00, 18:00 UTC)
+- `'USING CRON 0 0 * * 1 UTC'` - Weekly on Mondays at midnight UTC
+
 
 ## Environment Variables
 
 ### Required (SPCS Mode)
 
 - `SPCS_RUN`: Set to `true` when running in SPCS (enables OAuth authentication)
-- `SNOWFLAKE_ACCOUNT`: Your Snowflake account identifier
+- `SNOWFLAKE_ACCOUNT`: Snowflake account identifier
 - `SNOWFLAKE_DATABASE`: Database name
 - `SNOWFLAKE_SCHEMA`: Schema name
-- `SNOWFLAKE_WAREHOUSE`: Warehouse name (for non-SPCS connections)
+- `SNOWFLAKE_WAREHOUSE`: Warehouse name
+
+### API Keys (Required for Data Fetching)
+
+- `GIGA_SCHOOL_LOCATION_API_KEY`: Required for fetching school locations via GIGA API
+- `HEALTHSITES_API_KEY`: Required for fetching health center locations via HealthSites API
+- `GEOREPO_API_KEY`: Optional but preferred for fetching administrative boundaries (GeoRepo API)
+- `GEOREPO_USER_EMAIL`: Optional, required if using `GEOREPO_API_KEY`
+
+**Note:** These API keys must be provided as environment variables in the SPCS job specification. Without them, the pipeline will fall back to alternative data sources (e.g., GADM instead of GeoRepo) or skip data fetching (e.g., schools/health centers).
+
+### Optional (SPCS Mode)
+
+- `SNOWFLAKE_HOST`: SPCS internal network host (optional, usually auto-provided by SPCS)
+- `SNOWFLAKE_PORT`: SPCS internal network port (optional, usually auto-provided by SPCS)
+- `SNOWFLAKE_INSECURE_MODE`: Set to `true` to disable SSL certificate validation (default: `false`, only use if experiencing certificate issues)
 
 ### Required (if using Snowflake storage)
 
@@ -251,6 +334,7 @@ EXECUTE JOB SERVICE
    IN COMPUTE POOL impact_analysis_pool
    NAME = impact_analysis_init
    ASYNC = TRUE
+   EXTERNAL_ACCESS_INTEGRATIONS = (IMPACT_ANALYSIS_EGRESS_ACCESS_INTEGRATION)
    FROM SPECIFICATION $$
    spec:
      containers:
@@ -262,6 +346,9 @@ EXECUTE JOB SERVICE
           SNOWFLAKE_DATABASE: your_database
           SNOWFLAKE_SCHEMA: your_schema
           SNOWFLAKE_WAREHOUSE: your_warehouse
+          # SPCS internal network (optional, but recommended for SPCS)
+          # SNOWFLAKE_HOST: <internal-host>
+          # SNOWFLAKE_PORT: <internal-port>
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
        args:
@@ -283,6 +370,7 @@ EXECUTE JOB SERVICE
    IN COMPUTE POOL impact_analysis_pool
    NAME = impact_analysis_update
    ASYNC = TRUE
+   EXTERNAL_ACCESS_INTEGRATIONS = (IMPACT_ANALYSIS_EGRESS_ACCESS_INTEGRATION)
    FROM SPECIFICATION $$
    spec:
      containers:
@@ -294,6 +382,9 @@ EXECUTE JOB SERVICE
           SNOWFLAKE_DATABASE: your_database
           SNOWFLAKE_SCHEMA: your_schema
           SNOWFLAKE_WAREHOUSE: your_warehouse
+          # SPCS internal network (optional, but recommended for SPCS)
+          # SNOWFLAKE_HOST: <internal-host>
+          # SNOWFLAKE_PORT: <internal-port>
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
        args:
@@ -308,23 +399,11 @@ EXECUTE JOB SERVICE
    $$;
 ```
 
-## Monitoring and Logs
-
-SPCS jobs provide logs and monitoring through Snowflake:
-
-```sql
--- View job status
-SHOW JOBS;
-
--- View job logs
-SELECT SYSTEM$GET_JOB_LOGS('impact_analysis_job');
-```
-
 ## Troubleshooting
 
 ### Image Build Fails
 
-- Ensure you're using `--platform=linux/amd64` flag
+- Ensure the `--platform=linux/amd64` flag is used
 - Check that all required files are present in the repository root
 
 ### Container Fails to Start
@@ -337,7 +416,10 @@ SELECT SYSTEM$GET_JOB_LOGS('impact_analysis_job');
 
 - In SPCS mode, ensure `SPCS_RUN=true` is set
 - The OAuth token is automatically provided by SPCS at `/snowflake/session/token`
+- Verify the token file exists: check that `/snowflake/session/token` is accessible
+- If using SPCS internal network, ensure `SNOWFLAKE_HOST` and `SNOWFLAKE_PORT` are set (if required by the SPCS setup)
 - For local testing, use `SNOWFLAKE_USER` and `SNOWFLAKE_PASSWORD`
+- If experiencing SSL/certificate errors, try setting `SNOWFLAKE_INSECURE_MODE=true` (use with caution)
 
 ### Missing Data
 

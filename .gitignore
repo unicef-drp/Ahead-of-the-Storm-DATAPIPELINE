@@ -27,3 +27,4 @@ geodb/
 project_results/
 gigaspatial/
 test_files/
+test_spcs_job.sql

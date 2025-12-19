@@ -70,15 +70,22 @@ class Config:
     @classmethod
     def validate_snowflake_storage_config(cls):
         """Validate that all required Snowflake storage configuration is present (for DATA_PIPELINE_DB=SNOWFLAKE)"""
+        import os
+        # Check if running in SPCS mode
+        spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
+        
+        # Base required variables (always needed)
         required_vars = [
             'SNOWFLAKE_ACCOUNT',
-            'SNOWFLAKE_USER', 
-            'SNOWFLAKE_PASSWORD',
             'SNOWFLAKE_WAREHOUSE',
             'SNOWFLAKE_DATABASE',
             'SNOWFLAKE_SCHEMA',
             'SNOWFLAKE_STAGE_NAME'
         ]
+        
+        # User/password only required in non-SPCS mode
+        if not spcs_run:
+            required_vars.extend(['SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD'])
         
         missing = [var for var in required_vars if not getattr(cls, var)]
         if missing:

@@ -124,14 +124,36 @@ def get_snowflake_connection():
     Raises:
         ValueError: If authentication fails or required config is missing
     """
-    config.validate_snowflake_config()
-    
-    # Check for SPCS OAuth authentication
+    # Check for SPCS OAuth authentication first (before validation)
     spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
     
     if spcs_run:
+        # Pre-validate token file existence for better error messages
+        token_path = os.getenv('SPCS_TOKEN_PATH', SPCS_TOKEN_PATH_DEFAULT)
+        if not os.path.exists(token_path):
+            raise ValueError(
+                f"SPCS token file not found at {token_path}. "
+                f"Ensure SPCS_RUN=true and the container is running in Snowflake Container Services."
+            )
+        if not os.path.isfile(token_path):
+            raise ValueError(
+                f"SPCS token path is not a file: {token_path}. "
+                f"Expected a file path, but got a directory or invalid path."
+            )
+        # SNOWFLAKE_USER not required in SPCS mode (OAuth handles identity)
+        # Only validate account, warehouse, database, schema
+        if not config.SNOWFLAKE_ACCOUNT:
+            raise ValueError("SNOWFLAKE_ACCOUNT is required for SPCS authentication")
+        if not config.SNOWFLAKE_WAREHOUSE:
+            raise ValueError("SNOWFLAKE_WAREHOUSE is required")
+        if not config.SNOWFLAKE_DATABASE:
+            raise ValueError("SNOWFLAKE_DATABASE is required")
+        if not config.SNOWFLAKE_SCHEMA:
+            raise ValueError("SNOWFLAKE_SCHEMA is required")
         return _get_spcs_connection()
     else:
+        # Non-SPCS mode: validate all config including user/password
+        config.validate_snowflake_config()
         return _get_password_connection()
 
 def _get_spcs_connection():
@@ -142,7 +164,7 @@ def _get_spcs_connection():
         snowflake.connector.SnowflakeConnection: Active Snowflake connection
     
     Raises:
-        ValueError: If OAuth token cannot be loaded
+        ValueError: If OAuth token cannot be loaded or connection fails
     """
     logger.info("Connecting to Snowflake with SPCS OAuth authentication...")
     token_path = os.getenv('SPCS_TOKEN_PATH', SPCS_TOKEN_PATH_DEFAULT)
@@ -150,6 +172,9 @@ def _get_spcs_connection():
     try:
         with open(token_path, 'r') as f:
             token = f.read().strip()
+        
+        if not token:
+            raise ValueError(f"OAuth token file is empty at {token_path}")
         
         # SPCS requires specific connection parameters for internal network
         # Reference: https://medium.com/snowflake/connecting-to-snowflake-from-snowpark-container-services-cfc3a133480e
@@ -166,16 +191,53 @@ def _get_spcs_connection():
             'client_session_keep_alive': True
         }
         
-        # Remove None values
+        # Add connection options for SSL/OCSP handling
+        # This helps avoid certificate validation issues with S3 stage uploads
+        conn_params['ocsp_fail_open'] = True
+        
+        # Check if we should use insecure mode (for certificate issues)
+        use_insecure = os.getenv('SNOWFLAKE_INSECURE_MODE', 'false').lower() == 'true'
+        if use_insecure:
+            logger.warning("Using insecure_mode - SSL certificate validation is disabled")
+            conn_params['insecure_mode'] = True
+        
+        # Disable OCSP checks entirely via session parameters
+        conn_params['session_parameters'] = {
+            'OCSP_FAIL_OPEN': 'true'
+        }
+        
+        # Remove None values (host and port are optional)
         conn_params = {k: v for k, v in conn_params.items() if v is not None}
         
         logger.info(f"✓ Loaded OAuth token from {token_path}")
         if conn_params.get('host') and conn_params.get('port'):
             logger.info(f"✓ Using SPCS internal network: {conn_params['host']}:{conn_params['port']}")
+        else:
+            logger.info("✓ Using default Snowflake connection endpoint")
         
-        return snowflake.connector.connect(**conn_params)
+        # Attempt connection
+        try:
+            conn = snowflake.connector.connect(**conn_params)
+            logger.info("✓ Connected to Snowflake successfully")
+            return conn
+        except Exception as conn_error:
+            logger.error(f"Failed to connect to Snowflake: {str(conn_error)}")
+            logger.error(f"Connection parameters used: account={config.SNOWFLAKE_ACCOUNT}, "
+                        f"warehouse={config.SNOWFLAKE_WAREHOUSE}, "
+                        f"database={config.SNOWFLAKE_DATABASE}, "
+                        f"schema={config.SNOWFLAKE_SCHEMA}")
+            if conn_params.get('host') and conn_params.get('port'):
+                logger.error(f"SPCS internal network: {conn_params['host']}:{conn_params['port']}")
+            raise ValueError(f"Failed to connect to Snowflake: {str(conn_error)}")
+            
     except FileNotFoundError:
-        raise ValueError(f"OAuth token file not found at {token_path}")
+        raise ValueError(
+            f"OAuth token file not found at {token_path}. "
+            f"Ensure SPCS_RUN=true and the container is running in Snowflake Container Services."
+        )
+    except ValueError:
+        # Re-raise ValueError as-is (already has good error message)
+        raise
     except Exception as e:
         raise ValueError(f"Failed to load OAuth token from {token_path}: {str(e)}")
 
@@ -192,14 +254,36 @@ def _get_password_connection():
     if not config.SNOWFLAKE_USER or not config.SNOWFLAKE_PASSWORD:
         raise ValueError("SNOWFLAKE_USER and SNOWFLAKE_PASSWORD are required for non-SPCS authentication")
     
-    return snowflake.connector.connect(
-        account=config.SNOWFLAKE_ACCOUNT,
-        user=config.SNOWFLAKE_USER,
-        password=config.SNOWFLAKE_PASSWORD,
-        warehouse=config.SNOWFLAKE_WAREHOUSE,
-        database=config.SNOWFLAKE_DATABASE,
-        schema=config.SNOWFLAKE_SCHEMA
-    )
+    conn_params = {
+        'account': config.SNOWFLAKE_ACCOUNT,
+        'user': config.SNOWFLAKE_USER,
+        'password': config.SNOWFLAKE_PASSWORD,
+        'warehouse': config.SNOWFLAKE_WAREHOUSE,
+        'database': config.SNOWFLAKE_DATABASE,
+        'schema': config.SNOWFLAKE_SCHEMA
+    }
+    
+    # Add connection options for SSL/OCSP handling
+    conn_params['ocsp_fail_open'] = True
+    
+    # Check if we should use insecure mode (for certificate issues)
+    use_insecure = os.getenv('SNOWFLAKE_INSECURE_MODE', 'false').lower() == 'true'
+    if use_insecure:
+        logger.warning("Using insecure_mode - SSL certificate validation is disabled")
+        conn_params['insecure_mode'] = True
+    
+    # Disable OCSP checks entirely via session parameters
+    conn_params['session_parameters'] = {
+        'OCSP_FAIL_OPEN': 'true'
+    }
+    
+    try:
+        conn = snowflake.connector.connect(**conn_params)
+        logger.info("✓ Connected to Snowflake successfully")
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to Snowflake: {str(e)}")
+        raise
 
 # =============================================================================
 # TRACK DATA RETRIEVAL
