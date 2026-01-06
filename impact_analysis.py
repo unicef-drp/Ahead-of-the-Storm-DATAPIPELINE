@@ -106,6 +106,16 @@ data_store = get_data_store()
 # Initialize logger
 logger = logging.getLogger(__name__)
 
+# Log which storage backend is being used
+storage_backend = config.DATA_PIPELINE_DB
+logger.info(f"Storage Backend: {storage_backend}")
+if storage_backend == 'SNOWFLAKE':
+    logger.info(f"Snowflake Stage: {config.SNOWFLAKE_STAGE_NAME}")
+elif storage_backend == 'BLOB':
+    logger.info(f"Azure Blob Storage: {config.ACCOUNT_URL}")
+else:
+    logger.info(f"Local Storage: {ROOT_DATA_DIR}/{VIEWS_DIR}/")
+
 
 
 # =============================================================================
