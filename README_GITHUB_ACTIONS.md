@@ -103,24 +103,42 @@ Rewrite: 0
 
 **Workflow:** `.github/workflows/update-country-map-config.yml`
 
-**Purpose:** Update the map configuration (center coordinates and view zoom) for an existing country.
+**Purpose:** Update the map configuration (center coordinates and/or view zoom) for an existing country.
 
 **How to use:**
 1. Go to **Actions** tab in GitHub
 2. Select **"Update Country Map Config"** workflow
 3. Click **"Run workflow"**
 4. Fill in the form:
-   - **Country Code**: ISO3 code (e.g., `TWN`, `DOM`, `VNM`)
-   - **Center Lat**: Latitude for map center (e.g., `23.50`)
-   - **Center Lon**: Longitude for map center (e.g., `121.00`)
-   - **View Zoom**: Zoom level for visualization map (e.g., `8`)
+   - **Country Code**: ISO3 code (e.g., `TWN`, `DOM`, `VNM`) - **Required**
+   - **Center Lat**: Latitude for map center (e.g., `23.50`) - **Optional**
+   - **Center Lon**: Longitude for map center (e.g., `121.00`) - **Optional**
+   - **View Zoom**: Zoom level for visualization map (e.g., `8`) - **Optional**
 5. Click **"Run workflow"**
 
 **What it does:**
-1. Updates `CENTER_LAT`, `CENTER_LON`, and `VIEW_ZOOM` in `PIPELINE_COUNTRIES` table
+1. Updates only the fields you provide (leaves others unchanged)
 2. Verifies the update was successful
 
-**Example:**
+**Examples:**
+
+Update only the view zoom:
+```
+Country Code: TWN
+Center Lat: (leave empty)
+Center Lon: (leave empty)
+View Zoom: 9
+```
+
+Update only coordinates:
+```
+Country Code: TWN
+Center Lat: 23.50
+Center Lon: 121.00
+View Zoom: (leave empty)
+```
+
+Update all fields:
 ```
 Country Code: TWN
 Center Lat: 23.50
@@ -128,7 +146,10 @@ Center Lon: 121.00
 View Zoom: 8
 ```
 
-**Note:** This workflow only updates map configuration. The country must already exist in the `PIPELINE_COUNTRIES` table.
+**Note:** 
+- At least one field (center_lat, center_lon, or view_zoom) must be provided
+- Fields left empty will not be updated (existing values preserved)
+- The country must already exist in the `PIPELINE_COUNTRIES` table
 
 ### 4. Process Past Storms
 

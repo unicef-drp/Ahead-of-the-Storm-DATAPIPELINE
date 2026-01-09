@@ -8,16 +8,16 @@ on:
         required: true
         type: string
       center_lat:
-        description: 'Latitude for map center (e.g., 18.74)'
-        required: true
+        description: 'Latitude for map center (e.g., 18.74). Leave empty to skip updating this field.'
+        required: false
         type: string
       center_lon:
-        description: 'Longitude for map center (e.g., -70.16)'
-        required: true
+        description: 'Longitude for map center (e.g., -70.16). Leave empty to skip updating this field.'
+        required: false
         type: string
       view_zoom:
-        description: 'Zoom level for visualization map (e.g., 8)'
-        required: true
+        description: 'Zoom level for visualization map (e.g., 8). Leave empty to skip updating this field.'
+        required: false
         type: string
 
 jobs:
@@ -49,11 +49,35 @@ jobs:
         run: |
           python -c "
           from country_utils import update_country_map_config
+          
+          # Parse inputs (empty string means None/not provided)
+          # Use len() check to handle empty strings correctly
+          center_lat_str = '${{ inputs.center_lat }}'
+          center_lon_str = '${{ inputs.center_lon }}'
+          view_zoom_str = '${{ inputs.view_zoom }}'
+          
+          center_lat = None
+          center_lon = None
+          view_zoom = None
+          
+          # Convert to float/int if provided (non-empty string)
+          if len(center_lat_str.strip()) > 0:
+              center_lat = float(center_lat_str)
+          if len(center_lon_str.strip()) > 0:
+              center_lon = float(center_lon_str)
+          if len(view_zoom_str.strip()) > 0:
+              view_zoom = int(view_zoom_str)
+          
+          # Check that at least one field is provided
+          if not any([center_lat is not None, center_lon is not None, view_zoom is not None]):
+              print('✗ Error: At least one field (center_lat, center_lon, or view_zoom) must be provided')
+              exit(1)
+          
           success = update_country_map_config(
               '${{ inputs.country_code }}',
-              ${{ inputs.center_lat }},
-              ${{ inputs.center_lon }},
-              ${{ inputs.view_zoom }}
+              center_lat,
+              center_lon,
+              view_zoom
           )
           if success:
               print('✓ Map configuration updated successfully')

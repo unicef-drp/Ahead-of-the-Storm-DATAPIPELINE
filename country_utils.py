@@ -383,19 +383,27 @@ def get_countries_needing_zoom_level(country_code, zoom_level):
             except:
                 pass
 
-def update_country_map_config(country_code, center_lat, center_lon, view_zoom):
+def update_country_map_config(country_code, center_lat=None, center_lon=None, view_zoom=None):
     """
-    Update the map configuration (center coordinates and view zoom) for a country.
+    Update the map configuration (center coordinates and/or view zoom) for a country.
+    Only updates fields that are provided (not None).
     
     Args:
         country_code: ISO3 country code
-        center_lat: Latitude for map center
-        center_lon: Longitude for map center
-        view_zoom: Zoom level for visualization map
+        center_lat: Optional latitude for map center (None to skip update)
+        center_lon: Optional longitude for map center (None to skip update)
+        view_zoom: Optional zoom level for visualization map (None to skip update)
     
     Returns:
         bool: True if successful, False otherwise
+    
+    Raises:
+        ValueError: If all parameters are None (nothing to update)
     """
+    # Validate that at least one field is provided
+    if center_lat is None and center_lon is None and view_zoom is None:
+        raise ValueError("At least one of center_lat, center_lon, or view_zoom must be provided")
+    
     conn = None
     cursor = None
     try:
@@ -408,17 +416,46 @@ def update_country_map_config(country_code, center_lat, center_lon, view_zoom):
             logger.warning(f"Country {country_code} not found in table")
             return False
         
-        # Update map configuration
-        cursor.execute("""
+        # Build UPDATE query dynamically based on provided parameters
+        update_fields = []
+        update_values = []
+        
+        if center_lat is not None:
+            update_fields.append("CENTER_LAT = %s")
+            update_values.append(center_lat)
+        
+        if center_lon is not None:
+            update_fields.append("CENTER_LON = %s")
+            update_values.append(center_lon)
+        
+        if view_zoom is not None:
+            update_fields.append("VIEW_ZOOM = %s")
+            update_values.append(view_zoom)
+        
+        # Add country_code for WHERE clause
+        update_values.append(country_code)
+        
+        # Execute update
+        update_query = f"""
             UPDATE PIPELINE_COUNTRIES
-            SET CENTER_LAT = %s,
-                CENTER_LON = %s,
-                VIEW_ZOOM = %s
+            SET {', '.join(update_fields)}
             WHERE COUNTRY_CODE = %s
-        """, (center_lat, center_lon, view_zoom, country_code))
+        """
+        
+        cursor.execute(update_query, tuple(update_values))
         
         conn.commit()
-        logger.info(f"Updated map configuration for {country_code}: center=[{center_lat}, {center_lon}], view_zoom={view_zoom}")
+        
+        # Build log message
+        updated_fields = []
+        if center_lat is not None:
+            updated_fields.append(f"center_lat={center_lat}")
+        if center_lon is not None:
+            updated_fields.append(f"center_lon={center_lon}")
+        if view_zoom is not None:
+            updated_fields.append(f"view_zoom={view_zoom}")
+        
+        logger.info(f"Updated map configuration for {country_code}: {', '.join(updated_fields)}")
         return True
     except Exception as e:
         logger.error(f"Error updating map configuration for {country_code}: {e}")
