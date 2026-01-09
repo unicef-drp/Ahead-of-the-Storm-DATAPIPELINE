@@ -12,9 +12,21 @@ on:
         required: true
         type: string
       zoom_level:
-        description: 'Zoom level for mercator tiles'
+        description: 'Zoom level for mercator tiles (analysis zoom)'
         required: false
         default: '14'
+        type: string
+      center_lat:
+        description: 'Latitude for map center (e.g., 18.74)'
+        required: true
+        type: string
+      center_lon:
+        description: 'Longitude for map center (e.g., -70.16)'
+        required: true
+        type: string
+      view_zoom:
+        description: 'Zoom level for visualization map (e.g., 8)'
+        required: true
         type: string
       rewrite:
         description: 'Rewrite existing data (1=yes, 0=no)'
@@ -60,6 +72,9 @@ jobs:
               '${{ inputs.country_code }}',
               '${{ inputs.country_name }}',
               ${{ inputs.zoom_level }},
+              ${{ inputs.center_lat }},
+              ${{ inputs.center_lon }},
+              ${{ inputs.view_zoom }},
               'Added via GitHub Actions'
           )
           "

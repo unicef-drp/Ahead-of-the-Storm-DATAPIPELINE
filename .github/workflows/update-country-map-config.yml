@@ -1,0 +1,95 @@
+name: Update Country Map Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      country_code:
+        description: 'ISO3 country code (e.g., TWN, DOM, VNM)'
+        required: true
+        type: string
+      center_lat:
+        description: 'Latitude for map center (e.g., 18.74)'
+        required: true
+        type: string
+      center_lon:
+        description: 'Longitude for map center (e.g., -70.16)'
+        required: true
+        type: string
+      view_zoom:
+        description: 'Zoom level for visualization map (e.g., 8)'
+        required: true
+        type: string
+
+jobs:
+  update-map-config:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Update country map configuration
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        run: |
+          python -c "
+          from country_utils import update_country_map_config
+          success = update_country_map_config(
+              '${{ inputs.country_code }}',
+              ${{ inputs.center_lat }},
+              ${{ inputs.center_lon }},
+              ${{ inputs.view_zoom }}
+          )
+          if success:
+              print('✓ Map configuration updated successfully')
+          else:
+              print('✗ Failed to update map configuration')
+              exit(1)
+          "
+      
+      - name: Verify update
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        run: |
+          python -c "
+          from snowflake_utils import get_snowflake_connection
+          import pandas as pd
+          
+          conn = get_snowflake_connection()
+          query = '''
+              SELECT COUNTRY_CODE, COUNTRY_NAME, CENTER_LAT, CENTER_LON, VIEW_ZOOM
+              FROM PIPELINE_COUNTRIES
+              WHERE COUNTRY_CODE = '${{ inputs.country_code }}'
+          '''
+          df = pd.read_sql(query, conn)
+          conn.close()
+          
+          if len(df) > 0:
+              row = df.iloc[0]
+              print(f'Country: {row[\"COUNTRY_CODE\"]} ({row[\"COUNTRY_NAME\"]})')
+              print(f'Center: [{row[\"CENTER_LAT\"]}, {row[\"CENTER_LON\"]}]')
+              print(f'View Zoom: {row[\"VIEW_ZOOM\"]}')
+          else:
+              print('⚠ Country not found in table')
+              exit(1)
+          "

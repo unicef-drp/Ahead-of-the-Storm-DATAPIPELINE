@@ -74,12 +74,15 @@ This will set Vietnam to inactive, so it won't be processed by the pipeline.
 4. Fill in the form:
    - **Country Code**: ISO3 code (e.g., `TWN`, `DOM`, `VNM`)
    - **Country Name**: Full name (e.g., `Taiwan`)
-   - **Zoom Level**: Default is `14`
+   - **Zoom Level**: Default is `14` (for analysis tiles)
+   - **Center Lat**: Latitude for map center (e.g., `23.50`)
+   - **Center Lon**: Longitude for map center (e.g., `121.00`)
+   - **View Zoom**: Zoom level for visualization map (e.g., `8`)
    - **Rewrite**: `0` to skip existing, `1` to overwrite
 5. Click **"Run workflow"**
 
 **What it does:**
-1. Adds country to `PIPELINE_COUNTRIES` table in Snowflake
+1. Adds country to `PIPELINE_COUNTRIES` table in Snowflake (with map configuration)
 2. Runs initialization pipeline for the country
 3. Updates `LAST_INITIALIZED` timestamp
 
@@ -88,10 +91,46 @@ This will set Vietnam to inactive, so it won't be processed by the pipeline.
 Country Code: TWN
 Country Name: Taiwan
 Zoom Level: 14
+Center Lat: 23.50
+Center Lon: 121.00
+View Zoom: 8
 Rewrite: 0
 ```
 
-### 3. Process Past Storms
+### 3. Update Country Map Config
+
+[![Update Country Map Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml)
+
+**Workflow:** `.github/workflows/update-country-map-config.yml`
+
+**Purpose:** Update the map configuration (center coordinates and view zoom) for an existing country.
+
+**How to use:**
+1. Go to **Actions** tab in GitHub
+2. Select **"Update Country Map Config"** workflow
+3. Click **"Run workflow"**
+4. Fill in the form:
+   - **Country Code**: ISO3 code (e.g., `TWN`, `DOM`, `VNM`)
+   - **Center Lat**: Latitude for map center (e.g., `23.50`)
+   - **Center Lon**: Longitude for map center (e.g., `121.00`)
+   - **View Zoom**: Zoom level for visualization map (e.g., `8`)
+5. Click **"Run workflow"**
+
+**What it does:**
+1. Updates `CENTER_LAT`, `CENTER_LON`, and `VIEW_ZOOM` in `PIPELINE_COUNTRIES` table
+2. Verifies the update was successful
+
+**Example:**
+```
+Country Code: TWN
+Center Lat: 23.50
+Center Lon: 121.00
+View Zoom: 8
+```
+
+**Note:** This workflow only updates map configuration. The country must already exist in the `PIPELINE_COUNTRIES` table.
+
+### 4. Process Past Storms
 
 [![Process Past Storms](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml)
 
@@ -142,7 +181,10 @@ Countries are stored in the `PIPELINE_COUNTRIES` table:
 | `ACTIVE` | Whether country is active (boolean) |
 | `ADDED_DATE` | When country was added |
 | `LAST_INITIALIZED` | Last initialization timestamp |
-| `ZOOM_LEVEL` | Zoom level for tiles |
+| `ZOOM_LEVEL` | Zoom level for analysis tiles (usually 14) |
+| `CENTER_LAT` | Latitude for visualization map center |
+| `CENTER_LON` | Longitude for visualization map center |
+| `VIEW_ZOOM` | Zoom level for visualization map (different from analysis ZOOM_LEVEL) |
 | `NOTES` | Optional notes |
 
 ### Viewing Countries
@@ -162,12 +204,14 @@ WHERE ACTIVE = TRUE
 ### Adding Countries Manually
 
 ```sql
--- Add a new country
-INSERT INTO PIPELINE_COUNTRIES (COUNTRY_CODE, COUNTRY_NAME, ZOOM_LEVEL)
-VALUES ('PHL', 'Philippines', 14);
+-- Add a new country with map configuration
+INSERT INTO PIPELINE_COUNTRIES (COUNTRY_CODE, COUNTRY_NAME, ZOOM_LEVEL, CENTER_LAT, CENTER_LON, VIEW_ZOOM)
+VALUES ('PHL', 'Philippines', 14, 12.88, 121.77, 6);
 
 -- Then initialize via GitHub Actions or manually
 ```
+
+**Note:** Map configuration (`CENTER_LAT`, `CENTER_LON`, `VIEW_ZOOM`) is required for visualization. Use the "Update Country Map Config" workflow to update these values if needed.
 
 ### Activating/Deactivating Countries
 

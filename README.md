@@ -13,7 +13,10 @@
 ### 2. Initialize New Country (currently not working, waiting for giga-spatial PR to be merged)
 [![Initialize New Country](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml)
 
-### 3. Process Past Storms
+### 3. Update Country Map Config
+[![Update Country Map Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml)
+
+### 4. Process Past Storms
 [![Process Past Storms](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml)
 
 ---
@@ -240,10 +243,13 @@ The pipeline uses a Snowflake-based country management system to track which cou
 **PIPELINE_COUNTRIES** - Stores country information:
 - `COUNTRY_CODE` (VARCHAR(3)): ISO3 country code (e.g., 'TWN')
 - `COUNTRY_NAME` (VARCHAR(100)): Full country name
-- `ZOOM_LEVEL` (INTEGER): Default zoom level (usually 14)
+- `ZOOM_LEVEL` (INTEGER): Default zoom level for analysis tiles (usually 14)
 - `ACTIVE` (BOOLEAN): Whether the country is active
 - `LAST_INITIALIZED` (TIMESTAMP_NTZ): Last initialization timestamp
 - `ADDED_DATE` (TIMESTAMP_NTZ): When country was added
+- `CENTER_LAT` (FLOAT): Latitude for visualization map center
+- `CENTER_LON` (FLOAT): Longitude for visualization map center
+- `VIEW_ZOOM` (INTEGER): Zoom level for visualization map (different from analysis ZOOM_LEVEL)
 - `NOTES` (VARCHAR(500)): Optional notes
 
 **PIPELINE_COUNTRY_ZOOM_LEVELS** - Tracks initialization per zoom level:
@@ -264,8 +270,10 @@ python main_pipeline.py --type initialize --countries TWN --zoom 14 --rewrite 0
 1. Go to GitHub repository → Actions tab
 2. Select "Initialize New Country" workflow
 3. Click "Run workflow"
-4. Fill in: Country Code, Country Name, Zoom Level, Rewrite
+4. Fill in: Country Code, Country Name, Zoom Level, Center Lat, Center Lon, View Zoom, Rewrite
 5. Click "Run workflow"
+
+**Note:** Map configuration (center coordinates and view zoom) is required for visualization. Use the "Update Country Map Config" workflow to update these values for existing countries.
 
 **Option 3: Activate/Deactivate Countries**
 ```bash

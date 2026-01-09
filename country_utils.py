@@ -62,7 +62,7 @@ def get_all_countries_from_snowflake(include_inactive=False):
         logger.error(f"Error retrieving countries from Snowflake: {e}")
         return pd.DataFrame()
 
-def add_country_to_snowflake(country_code, country_name, zoom_level=14, notes=None):
+def add_country_to_snowflake(country_code, country_name, zoom_level=14, center_lat=None, center_lon=None, view_zoom=None, notes=None):
     """
     Add a new country to the Snowflake PIPELINE_COUNTRIES table.
     
@@ -70,6 +70,9 @@ def add_country_to_snowflake(country_code, country_name, zoom_level=14, notes=No
         country_code: ISO3 country code (e.g., 'TWN')
         country_name: Full country name (e.g., 'Taiwan')
         zoom_level: Zoom level for mercator tiles (default: 14)
+        center_lat: Latitude for map center (required for visualization)
+        center_lon: Longitude for map center (required for visualization)
+        view_zoom: Zoom level for visualization map (required for visualization)
         notes: Optional notes about the country
     
     Returns:
@@ -89,9 +92,10 @@ def add_country_to_snowflake(country_code, country_name, zoom_level=14, notes=No
         
         # Insert new country
         cursor.execute("""
-            INSERT INTO PIPELINE_COUNTRIES (COUNTRY_CODE, COUNTRY_NAME, ZOOM_LEVEL, NOTES, ACTIVE)
-            VALUES (%s, %s, %s, %s, TRUE)
-        """, (country_code, country_name, zoom_level, notes))
+            INSERT INTO PIPELINE_COUNTRIES 
+                (COUNTRY_CODE, COUNTRY_NAME, ZOOM_LEVEL, CENTER_LAT, CENTER_LON, VIEW_ZOOM, NOTES, ACTIVE)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+        """, (country_code, country_name, zoom_level, center_lat, center_lon, view_zoom, notes))
         
         conn.commit()
         logger.info(f"Successfully added country {country_code} ({country_name}) to Snowflake table")
@@ -379,3 +383,59 @@ def get_countries_needing_zoom_level(country_code, zoom_level):
             except:
                 pass
 
+def update_country_map_config(country_code, center_lat, center_lon, view_zoom):
+    """
+    Update the map configuration (center coordinates and view zoom) for a country.
+    
+    Args:
+        country_code: ISO3 country code
+        center_lat: Latitude for map center
+        center_lon: Longitude for map center
+        view_zoom: Zoom level for visualization map
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_snowflake_connection()
+        cursor = conn.cursor()
+        
+        # Check if country exists
+        cursor.execute("SELECT COUNTRY_CODE FROM PIPELINE_COUNTRIES WHERE COUNTRY_CODE = %s", (country_code,))
+        if not cursor.fetchone():
+            logger.warning(f"Country {country_code} not found in table")
+            return False
+        
+        # Update map configuration
+        cursor.execute("""
+            UPDATE PIPELINE_COUNTRIES
+            SET CENTER_LAT = %s,
+                CENTER_LON = %s,
+                VIEW_ZOOM = %s
+            WHERE COUNTRY_CODE = %s
+        """, (center_lat, center_lon, view_zoom, country_code))
+        
+        conn.commit()
+        logger.info(f"Updated map configuration for {country_code}: center=[{center_lat}, {center_lon}], view_zoom={view_zoom}")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating map configuration for {country_code}: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        return False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
