@@ -218,7 +218,9 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         }
         
     except Exception as e:
+        import traceback
         logger.error(f"Error during impact analysis: {str(e)}")
+        logger.error(traceback.format_exc())
         return {"success": False, "error": str(e)}
 
 # =============================================================================

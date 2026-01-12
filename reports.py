@@ -474,7 +474,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_hcs_winds[f"{wind}"] = 0
             else:
                 # Filter admin view for this admin ID and sum values
-                admin_view = wind_admin_views[wind][wind_admin_views[wind].zone_id == admin_id]
+                admin_view = wind_admin_views[wind][wind_admin_views[wind]['tile_id'] == admin_id]
                 d_rows_admins_pop_total[f"{wind}"] = int(admin_view['E_population'].sum())
                 d_rows_admins_school[f"{wind}"] = int(admin_view['E_school_age_population'].sum())
                 d_rows_admins_infant[f"{wind}"] = int(admin_view['E_infant_population'].sum())
@@ -500,7 +500,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_infant[f"change_{wind}"] = d_rows_admins_infant[f"{wind}"] - prev_infant
         
         # Calculate CCI values for this admin
-        admin_cci = cci_admin_view[cci_admin_view.zone_id == admin_id]
+        admin_cci = cci_admin_view[cci_admin_view['tile_id'] == admin_id]
         d_rows_admins_pop_total["cci"] = int(admin_cci['E_CCI_pop'].sum())
         d_rows_admins_school["cci"] = int(admin_cci['E_CCI_school_age'].sum())
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())

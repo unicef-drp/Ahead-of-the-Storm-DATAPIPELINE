@@ -540,7 +540,7 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
                 logger.warning(f"Error mapping polygons for school view at {wind_th}kt: {e}")
-                probs = {k: 0.0 for k in schools_viewer.view.zone_id.unique()}
+                probs = {k: 0.0 for k in schools_viewer.view['zone_id'].unique()}
             schools_viewer.add_variable_to_view(probs, 'probability')
 
             gdf_view = schools_viewer.to_geodataframe()
@@ -578,7 +578,7 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
                 logger.warning(f"Error mapping polygons for health center view at {wind_th}kt: {e}")
-                probs = {k: 0.0 for k in hcs_viewer.view.zone_id.unique()}
+                probs = {k: 0.0 for k in hcs_viewer.view['zone_id'].unique()}
             hcs_viewer.add_variable_to_view(probs, 'probability')
 
             gdf_view = hcs_viewer.to_geodataframe()
@@ -613,7 +613,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except:
-                probs = {k: 0.0 for k in tiles_viewer.view.zone_id.unique()}
+                probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
             df_view = tiles_viewer.to_dataframe()
@@ -621,6 +621,24 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
                 df_view[f"E_{col}"] = df_view[col]*df_view['probability']
 
             df_view = df_view.drop(columns=data_cols)
+            
+            # Reset index to make zone_id a column (needed for calculate_ccis)
+            # Check if 'zone_id' already exists as a column
+            if 'zone_id' in df_view.columns:
+                # Already have zone_id column, don't reset index
+                pass
+            else:
+                # Reset index and ensure the resulting column is named 'zone_id'
+                if df_view.index.name:
+                    # Index has a name, reset and rename if needed
+                    df_view = df_view.reset_index()
+                    # Rename the first column (the index) to 'zone_id' if it's not already
+                    first_col = df_view.columns[0]
+                    if first_col != 'zone_id':
+                        df_view = df_view.rename(columns={first_col: 'zone_id'})
+                else:
+                    # Index has no name, explicitly name it 'zone_id'
+                    df_view = df_view.reset_index(names=['zone_id'])
 
             wind_views[wind_th] = df_view
 
@@ -641,7 +659,7 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except:
-                probs = {k: 0.0 for k in tiles_viewer.view.zone_id.unique()}
+                probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
             df_view = tiles_viewer.to_dataframe()
@@ -651,27 +669,60 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             df_view = df_view.drop(columns=data_cols)
             
             # Admin IDs must be present in gdf_tiles (added during initialization or on load)
-            # df_view.index contains zone_id (which is tile_id)
             if 'id' not in gdf_tiles.columns:
                 raise ValueError(
                     "Mercator view missing admin IDs."
                     "Admin IDs are added during initialization. "
                     "Re-initialize the country or check the mercator view file."
                 )
-            # Create mapping from tile_id to admin id
-            id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
-            # Map zone_id (tile_id) to admin id
-            df_view['id'] = df_view.index.map(lambda x: id_mapping.get(x, x))
+            
+            # Check if 'id' column is already present in df_view (from to_dataframe())
+            # If not, we need to reset index and map from zone_id to id
+            if 'id' not in df_view.columns:
+                # Reset index to get zone_id as a column
+                if 'zone_id' in df_view.columns:
+                    # Already have zone_id column, don't reset index
+                    pass
+                else:
+                    # Reset index and ensure the resulting column is named 'zone_id'
+                    if df_view.index.name:
+                        df_view = df_view.reset_index()
+                        first_col = df_view.columns[0]
+                        if first_col != 'zone_id':
+                            df_view = df_view.rename(columns={first_col: 'zone_id'})
+                    else:
+                        df_view = df_view.reset_index(names=['zone_id'])
+                
+                # Map zone_id (tile_id) to admin id
+                id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
+                df_view['id'] = df_view['zone_id'].map(lambda x: id_mapping.get(x, x))
+                # Drop zone_id column since we don't need it after mapping to admin IDs
+                df_view = df_view.drop(columns=['zone_id'], errors='ignore')
+            else:
+                # If 'id' is already present, make sure zone_id is dropped if it exists
+                df_view = df_view.drop(columns=['zone_id'], errors='ignore')
+            
+            # Group by admin id and aggregate (this creates admin-level data, not tile-level)
+            # This should result in one row per admin region, not one row per tile
             
             # Define aggregation dictionary
             agg_dict = {col: "sum" for col in sum_cols}
             agg_dict.update({col: "mean" for col in avg_cols})
 
-            # Group by large_id and aggregate
+            # Group by admin id and aggregate (this creates admin-level data, not tile-level)
+            # This should result in one row per admin region, not one row per tile
             agg = df_view.groupby("id").agg(agg_dict).reset_index()
-            df_view = agg.rename(columns={'id':'zone_id'})
+            
+            # Rename 'id' to 'tile_id' to match base admin parquet structure
+            # Note: In base admin parquet, admin IDs are stored in 'tile_id' column
+            # (despite the name, it contains admin region IDs, not tile IDs)
+            df_view = agg.rename(columns={'id':'tile_id'})
+            
+            # Ensure zone_id is not present (shouldn't be, but be safe)
+            df_view = df_view.drop(columns=['zone_id'], errors='ignore')
+            
             ### add names ###
-            df_view['name'] = df_view['zone_id'].map(d)
+            df_view['name'] = df_view['tile_id'].map(d)
 
             wind_views[wind_th] = df_view
 
@@ -691,7 +742,7 @@ def create_admin_view_from_envelopes(gdf_admin, gdf_envelopes):
                 new_col = admin_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except:
-                probs = {k: 0.0 for k in admin_viewer.view.zone_id.unique()}
+                probs = {k: 0.0 for k in admin_viewer.view['zone_id'].unique()}
             admin_viewer.add_variable_to_view(probs, 'probability')
 
             df_view = admin_viewer.to_dataframe()
@@ -1159,6 +1210,10 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     cci_tiles_view['E_CCI_pop'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop','E_CCI_pop']]
     cci_tiles_view = cci_tiles_view.reset_index()
+    
+    # Ensure the index column is named 'zone_id'
+    if cci_tiles_view.columns[0] != 'zone_id':
+        cci_tiles_view = cci_tiles_view.rename(columns={cci_tiles_view.columns[0]: 'zone_id'})
 
     cci_tiles_view['id'] = cci_tiles_view['zone_id'].map(d)
     
@@ -1259,11 +1314,15 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # Define aggregation dictionary
     agg_dict = {col: "sum" for col in sum_cols_cci}
 
-    # Group by large_id and aggregate
+    # Group by admin id and aggregate (creates admin-level CCI data)
     agg = cci_tiles_view.groupby("id").agg(agg_dict).reset_index()
-    cci_admin_view = agg.rename(columns={'id':'zone_id'})
+    # Rename 'id' to 'tile_id' to match base admin parquet structure
+    # Note: In base admin parquet, admin IDs are stored in 'tile_id' column
+    cci_admin_view = agg.rename(columns={'id':'tile_id'})
     ### add names ###
-    #df_view['name'] = df_view['zone_id'].map(d)
+    # Add admin names if needed (currently commented out, but structure is ready)
+    #d_admin = gdf_admin.set_index('tile_id')['name'].to_dict()
+    #cci_admin_view['name'] = cci_admin_view['tile_id'].map(d_admin)
     save_cci_admin(cci_admin_view, country, storm, date)
     #######
 
