@@ -176,18 +176,58 @@ def fetch_schools(country, rewrite=0):
     Note:
         Handles legacy column name 'giga_id_school' by renaming to 'school_id_giga'.
         Cached files are stored in the same directory as health center caches.
+        Always returns a GeoDataFrame, even if empty or if API fails.
     """
     if school_exist(country) and rewrite == 0:
-        return load_school_locations(country)
+        gdf_schools = load_school_locations(country)
+        # Validate that loaded data is a GeoDataFrame
+        if not isinstance(gdf_schools, gpd.GeoDataFrame):
+            logger.warning(f"Cached school data for {country} is not a GeoDataFrame, converting or returning empty GeoDataFrame")
+            if isinstance(gdf_schools, pd.DataFrame) and not gdf_schools.empty:
+                # Try to convert if it has geometry column
+                if 'geometry' in gdf_schools.columns:
+                    gdf_schools = gpd.GeoDataFrame(gdf_schools, geometry='geometry', crs='EPSG:4326')
+                else:
+                    logger.error(f"Cached school data for {country} has no geometry column, returning empty GeoDataFrame")
+                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+            else:
+                return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+        return gdf_schools
     
     try:
-        gdf_schools = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
+        result = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
+        
+        # Validate that result is a GeoDataFrame
+        # GigaSchoolLocationFetcher may return pd.DataFrame on API failure
+        if not isinstance(result, gpd.GeoDataFrame):
+            if isinstance(result, pd.DataFrame):
+                if result.empty:
+                    logger.warning(f"No school data available for {country} from API")
+                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+                # Try to convert if it has geometry column
+                if 'geometry' in result.columns:
+                    result = gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326')
+                else:
+                    logger.error(f"School data for {country} has no geometry column, returning empty GeoDataFrame")
+                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+            else:
+                logger.error(f"Unexpected return type from GigaSchoolLocationFetcher for {country}: {type(result)}")
+                return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+        
+        gdf_schools = result
+        
         # Handle legacy API column name
         if 'giga_id_school' in gdf_schools.columns:
             gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
         
-        # Save to cache
-        save_school_locations(gdf_schools, country)
+        # Ensure CRS is set
+        if gdf_schools.crs is None:
+            gdf_schools.set_crs('EPSG:4326', inplace=True)
+        
+        # Save to cache only if not empty
+        if not gdf_schools.empty:
+            save_school_locations(gdf_schools, country)
+        
         return gdf_schools
     except Exception as e:
         logger.error(f"Error fetching schools for {country}: {str(e)}")
@@ -525,6 +565,21 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     gdf_envelopes: a geodataframe with envelopes
     returns a dictionary of wind threshold - geodataframe with the corresponding school view
     """
+    # Validate input is a GeoDataFrame
+    if not isinstance(gdf_schools, gpd.GeoDataFrame):
+        logger.error(f"gdf_schools must be a GeoDataFrame, got {type(gdf_schools)}. Returning empty views.")
+        return {}
+    
+    # Handle empty GeoDataFrame gracefully
+    if gdf_schools.empty:
+        logger.warning("School GeoDataFrame is empty, returning empty views")
+        return {}
+    
+    # Ensure geometry column exists
+    if 'geometry' not in gdf_schools.columns or gdf_schools.geometry.isna().all():
+        logger.error("School GeoDataFrame has no valid geometry column. Returning empty views.")
+        return {}
+    
     gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=150)
     wind_views = {}
 
