@@ -224,8 +224,10 @@ def fetch_schools(country, rewrite=0):
         if gdf_schools.crs is None:
             gdf_schools.set_crs('EPSG:4326', inplace=True)
         
-        # Save to cache only if not empty
-        if not gdf_schools.empty:
+        # Save to cache
+        # If rewrite=1, always save (even if empty) to overwrite corrupted files
+        # If rewrite=0 and empty, don't save (avoid overwriting good data with empty)
+        if rewrite == 1 or not gdf_schools.empty:
             save_school_locations(gdf_schools, country)
         
         return gdf_schools
