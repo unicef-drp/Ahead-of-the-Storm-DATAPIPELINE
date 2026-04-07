@@ -52,7 +52,8 @@ from country_utils import update_country_initialized
 from snowflake_utils import (
     get_envelopes_from_snowflake,
     convert_envelopes_to_geodataframe,
-    get_snowflake_tracks
+    get_snowflake_tracks,
+    get_snowflake_connection
 )
 
 from reports import do_report, save_json_report
@@ -386,8 +387,8 @@ def create_mercator_country_layer(country, zoom_level=15, rewrite=0):
         rwi_df = handler.load_data(country, ensure_available=True)
         rwi_gdf = convert_to_geodataframe(rwi_df)
         rwi = tiles_viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
-    except:
-        print("Relative Wealth Index will be empty")
+    except Exception as e:
+        logger.warning(f"Relative Wealth Index will be empty: {e}")
         rwi = {k: np.nan for k in tiles_viewer.view.index.unique()}
     
     tiles_viewer.add_variable_to_view(rwi, 'rwi')
@@ -463,14 +464,39 @@ def add_admin_ids(view, country, zoom_level, rewrite):
     combined_view = admins_overlay(gdf_admins1, view)
     return combined_view, gdf_admins1
 
+def write_country_boundary(country: str):
+    """
+    Fetch admin level 0 boundary from GeoRepo and write it to
+    PIPELINE_COUNTRIES.COUNTRY_BOUNDARY in Snowflake.
+    Called automatically during --type initialize for each new country.
+    """
+    try:
+        boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
+        gdf = boundaries.to_geodataframe()
+        if gdf.empty or gdf.geometry.iloc[0] is None:
+            logger.warning(f"{country}: GeoRepo returned no boundary — COUNTRY_BOUNDARY not updated")
+            return
+        wkt = gdf.geometry.iloc[0].wkt
+        conn = get_snowflake_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE AOTS.TC_ECMWF.PIPELINE_COUNTRIES
+            SET COUNTRY_BOUNDARY = TRY_TO_GEOGRAPHY(%(wkt)s)
+            WHERE COUNTRY_CODE = %(iso)s
+        """, {"wkt": wkt, "iso": country})
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"{country}: COUNTRY_BOUNDARY written to Snowflake")
+    except Exception as e:
+        logger.warning(f"{country}: Could not write COUNTRY_BOUNDARY to Snowflake: {e}")
+
+
 def save_mercator_and_admin_views(countries,zoom_level,rewrite):
     """
     Generates and saves all country mercator views and admin views.
     Automatically tracks initialization in Snowflake after successful completion.
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
     for country in countries:
         file_name = f"{country}_{zoom_level}.parquet"
         file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
@@ -527,8 +553,8 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             logger.info(f"File already exists for {country} at zoom {zoom_level}, ensuring tracking is up to date")
             initialized = True  # Mark as initialized since file exists
         
-        # Automatically track initialization in Snowflake
-        # Safe to call even if already tracked
+        # Automatically track initialization and write boundary to Snowflake
+        # Both are safe to call even if already tracked / already populated
         if initialized:
             try:
                 update_country_initialized(country, zoom_level)
@@ -536,6 +562,7 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             except Exception as e:
                 logger.warning(f"Could not track initialization for {country} in Snowflake: {e}")
                 logger.warning("  (Initialization completed, but tracking failed)")
+            write_country_boundary(country)
 
 def save_json_storms(d):
     """
@@ -669,7 +696,8 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
             try:
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except:
+            except Exception as e:
+                logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
@@ -715,7 +743,8 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             try:
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except:
+            except Exception as e:
+                logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
@@ -798,7 +827,8 @@ def create_admin_view_from_envelopes(gdf_admin, gdf_envelopes):
             try:
                 new_col = admin_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except:
+            except Exception as e:
+                logger.warning(f"map_polygons failed for admin wind threshold, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in admin_viewer.view['zone_id'].unique()}
             admin_viewer.add_variable_to_view(probs, 'probability')
 
@@ -836,7 +866,8 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
             tracks_viewer.add_variable_to_view(overlays['school_age_population'], "severity_school_age_population")
             tracks_viewer.add_variable_to_view(overlays['infant_population'], "severity_infant_population")
             tracks_viewer.add_variable_to_view(overlays['built_surface_m2'], "severity_built_surface_m2")
-        except:
+        except Exception as e:
+            logger.warning(f"Track severity overlay failed, defaulting to zeros: {e}")
             zeros = {k: 0 for k in gdf_envelopes_wth[index_column].unique()}
             tracks_viewer.add_variable_to_view(zeros, "severity_population")
             tracks_viewer.add_variable_to_view(zeros, "severity_school_age_population")
@@ -1045,8 +1076,8 @@ def create_admin_country_layer(country, rewrite=0):
         rwi_df = handler.load_data(country, ensure_available=True)
         rwi_gdf = convert_to_geodataframe(rwi_df)
         rwi = tiles_viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
-    except:
-        print("Relative Wealth Index will be empty")
+    except Exception as e:
+        logger.warning(f"Relative Wealth Index will be empty: {e}")
         rwi = {k: np.nan for k in tiles_viewer.view.index.unique()}
     
     tiles_viewer.add_variable_to_view(rwi, 'rwi')
@@ -1305,46 +1336,46 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         Base data (mercator tiles, admin views) are loaded if available, or created
         on-the-fly if missing. Admin IDs are automatically added if missing.
     """
-    print(f"  Processing {country}...")
-    
+    logger.info(f"  Processing {country}...")
+
     # Schools
-    print(f"    Processing schools...")
+    logger.info(f"    Processing schools...")
     gdf_schools = fetch_schools(country, rewrite=0)
-    
+
     wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes)
     for wind_th in wind_school_views:
         save_school_view(wind_school_views[wind_th], country, storm, date, wind_th)
-    print(f"    Created {len(wind_school_views)} school views")
+    logger.info(f"    Created {len(wind_school_views)} school views")
 
     # Health centers
-    print(f"    Processing health centers...")
+    logger.info(f"    Processing health centers...")
     gdf_hcs = fetch_health_centers(country, rewrite=0)
     wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes)
     for wind_th in wind_hc_views:
         save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
-    print(f"    Created {len(wind_hc_views)} health center views")
+    logger.info(f"    Created {len(wind_hc_views)} health center views")
 
     # Tiles
-    print(f"    Processing tiles...")
+    logger.info(f"    Processing tiles...")
     try:
         gdf_tiles = load_mercator_view(country, zoom)
-        print(f"    Loaded existing mercator tiles: {len(gdf_tiles)} tiles")
+        logger.info(f"    Loaded existing mercator tiles: {len(gdf_tiles)} tiles")
         # Ensure admin IDs are present (in case file was created without them)
         if 'id' not in gdf_tiles.columns:
-            print(f"    Warning: Mercator view missing admin IDs, adding them...")
+            logger.warning(f"    Mercator view missing admin IDs, adding them...")
             gdf_tiles, _ = add_admin_ids(gdf_tiles, country, zoom, rewrite=0)
             save_mercator_view(gdf_tiles, country, zoom)
-    except:
-        print(f"    Creating base mercator tiles for {country}...")
+    except Exception as e:
+        logger.info(f"    Creating base mercator tiles for {country}... ({e})")
         view = create_mercator_country_layer(country, zoom, rewrite=0)
         gdf_tiles, _ = add_admin_ids(view, country, zoom, rewrite=0)
         save_mercator_view(gdf_tiles, country, zoom)
-        print(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
-    
+        logger.info(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
+
     wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes)
     for wind_th in wind_tiles_views:
         save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom)
-    print(f"    Created {len(wind_tiles_views)} tile views")
+    logger.info(f"    Created {len(wind_tiles_views)} tile views")
 
     ### cci for tiles
     cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
@@ -1352,20 +1383,20 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     #######
 
     # Admins
-    print(f"    Processing admins...")
+    logger.info(f"    Processing admins...")
     try:
         gdf_admin = load_admin_view(country)
-        print(f"    Loaded existing admin: {len(gdf_admin)} tiles")
-    except:
-        print(f"    Creating base admin for {country}...")
+        logger.info(f"    Loaded existing admin: {len(gdf_admin)} tiles")
+    except Exception as e:
+        logger.info(f"    Creating base admin for {country}... ({e})")
         gdf_admin = create_admin_country_layer(country, rewrite=0)
         save_admin_view(gdf_admin, country)
-        print(f"    Created and saved base admin tiles: {len(gdf_admin)} tiles")
-    
+        logger.info(f"    Created and saved base admin tiles: {len(gdf_admin)} tiles")
+
     wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes)
     for wind_th in wind_admin_views:
         save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th)
-    print(f"    Created {len(wind_admin_views)} admin views")
+    logger.info(f"    Created {len(wind_admin_views)} admin views")
 
     ### cci for admin
     # Define aggregation dictionary
@@ -1384,11 +1415,11 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     #######
 
     # Tracks
-    print(f"    Processing tracks...")
+    logger.info(f"    Processing tracks...")
     wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member')
     for wind_th in wind_tracks_views:
         save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th)
-    print(f"    Created {len(wind_tracks_views)} track views")
+    logger.info(f"    Created {len(wind_tracks_views)} track views")
 
     df_tracks = get_snowflake_tracks(date, storm)
     gdf_tracks = convert_to_geodataframe(df_tracks)
@@ -1411,13 +1442,13 @@ def load_envelopes_from_snowflake(storm, date):
         df_envelopes = get_envelopes_from_snowflake(storm, forecast_time)
         
         if df_envelopes.empty:
-            print(f"Error: No envelope data found in Snowflake for {storm} at {forecast_time}")
+            logger.error(f"No envelope data found in Snowflake for {storm} at {forecast_time}")
             return pd.DataFrame()
-        
+
         # Convert to GeoDataFrame
         gdf_envelopes = convert_envelopes_to_geodataframe(df_envelopes)
         return gdf_envelopes
-        
+
     except Exception as e:
-        print(f"Error loading envelopes from Snowflake: {str(e)}")
+        logger.error(f"Error loading envelopes from Snowflake: {str(e)}")
         return pd.DataFrame()

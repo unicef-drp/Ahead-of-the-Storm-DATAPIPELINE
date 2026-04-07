@@ -42,7 +42,6 @@ class Config:
     
     # Application Configuration
     RESULTS_DIR = os.getenv('RESULTS_DIR', 'project_results/climate/lacro_project')
-    BBOX_FILE = os.getenv('BBOX_FILE', 'bbox.parquet')
     STORMS_FILE = os.getenv('STORMS_FILE', 'storms.json')
     VIEWS_DIR = os.getenv('VIEWS_DIR', 'aos_views')
     ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR', 'geodb')

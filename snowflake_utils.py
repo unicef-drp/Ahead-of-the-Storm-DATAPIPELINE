@@ -587,6 +587,35 @@ def get_envelope_data_snowflake(track_id: str, forecast_time: str) -> pd.DataFra
     
     return df
 
+def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 1_500_000) -> list:
+    """
+    Returns ISO codes of countries whose boundary is within buffer_m metres of the
+    combined storm envelope for the given track_id and forecast_time.
+    Returns an empty list if COUNTRY_BOUNDARY is not populated (graceful fallback).
+    """
+    forecast_datetime = _normalize_forecast_time(forecast_time)
+    sql = """
+        SELECT p.COUNTRY_CODE
+        FROM AOTS.TC_ECMWF.PIPELINE_COUNTRIES p
+        WHERE p.COUNTRY_BOUNDARY IS NOT NULL
+          AND ST_DWITHIN(
+              p.COUNTRY_BOUNDARY,
+              (SELECT ST_UNION_AGG(e.ENVELOPE_REGION)
+               FROM AOTS.TC_ECMWF.TC_ENVELOPES_COMBINED e
+               WHERE e.TRACK_ID = %(track_id)s
+                 AND e.FORECAST_TIME = %(forecast_time)s),
+              %(buffer_m)s
+          )
+    """
+    try:
+        cursor.execute(sql, {"track_id": track_id, "forecast_time": forecast_datetime, "buffer_m": buffer_m})
+        rows = cursor.fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        logger.warning(f"SQL country pre-filter failed, will fall back to Python: {e}")
+        return []
+
+
 def get_snowflake_data() -> pd.DataFrame:
     """
     Get hurricane metadata directly from Snowflake.

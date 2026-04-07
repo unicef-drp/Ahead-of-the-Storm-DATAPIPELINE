@@ -71,7 +71,8 @@ from impact_analysis import (
 # Import gigaspatial for buffering
 from gigaspatial.processing import buffer_geodataframe
 
-from snowflake_utils import get_snowflake_data
+import json
+from snowflake_utils import get_snowflake_data, get_snowflake_connection, get_countries_in_range
 from country_utils import get_active_countries_from_snowflake
 
 # =============================================================================
@@ -145,55 +146,68 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
         
-        # Check each country separately to only process affected countries
-        logger.info("Checking which countries are affected (1500km buffer per country)...")
-        country_boundaries = get_country_boundaries(countries)
-        
-        # Determine which countries are actually affected by the storm
+        # --- SQL pre-filter: ask Snowflake which countries are within 1500km ---
         affected_countries = []
-        for i, country in enumerate(countries):
-            country_boundary = country_boundaries[i]
-            country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
-            
-            # Apply 1500km buffer to this country
-            country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
-            country_buffered_geom = country_buffered.geometry.iloc[0]
-            
-            # Handle dateline crossing and fix invalid geometry
-            bounds = country_buffered_geom.bounds
-            
-            # Check for invalid bounds (inf values indicate wrapping issues)
-            if any(not (isinstance(b, (int, float)) and -1000 < b < 1000) for b in bounds):
-                logger.debug(f"Buffer geometry for {country} has invalid bounds, attempting to fix...")
-                try:
-                    country_buffered_geom = country_buffered_geom.buffer(0)
-                    bounds = country_buffered_geom.bounds
-                except:
-                    logger.debug(f"Could not fix buffer geometry for {country}, using original boundary")
-                    country_buffered_geom = country_boundary
-            
-            # Check if geometry is valid
-            if not country_buffered_geom.is_valid:
-                from shapely.validation import make_valid
-                try:
-                    country_buffered_geom = make_valid(country_buffered_geom)
-                except:
+        sql_prefilter_used = False
+        try:
+            conn_prefilter = get_snowflake_connection()
+            cursor_prefilter = conn_prefilter.cursor()
+            sql_countries = get_countries_in_range(cursor_prefilter, storm, date)
+            cursor_prefilter.close()
+            conn_prefilter.close()
+            # Only use SQL result if it returned something AND all returned codes are
+            # in the countries list we were asked to process
+            if sql_countries:
+                affected_countries = [c for c in sql_countries if c in countries]
+                sql_prefilter_used = True
+                logger.info(f"SQL pre-filter returned {len(affected_countries)} affected country/countries: {', '.join(affected_countries)}")
+            else:
+                logger.info("SQL pre-filter returned no results — falling back to Python buffer check")
+        except Exception as e:
+            logger.warning(f"SQL pre-filter failed ({e}) — falling back to Python buffer check")
+
+        # --- Python fallback: 1500km buffer per country (original logic) ---
+        if not sql_prefilter_used:
+            logger.info("Checking which countries are affected (1500km buffer per country)...")
+            country_boundaries = get_country_boundaries(countries)
+
+            for i, country in enumerate(countries):
+                country_boundary = country_boundaries[i]
+                country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
+
+                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
+                country_buffered_geom = country_buffered.geometry.iloc[0]
+
+                bounds = country_buffered_geom.bounds
+                if any(not (isinstance(b, (int, float)) and -1000 < b < 1000) for b in bounds):
+                    logger.debug(f"Buffer geometry for {country} has invalid bounds, attempting to fix...")
                     try:
                         country_buffered_geom = country_buffered_geom.buffer(0)
-                    except:
-                        logger.debug(f"Could not create valid buffered geometry for {country}, using unbuffered")
+                        bounds = country_buffered_geom.bounds
+                    except Exception:
+                        logger.debug(f"Could not fix buffer geometry for {country}, using original boundary")
                         country_buffered_geom = country_boundary
-            
-            # Check if envelopes intersect this country's buffered zone
-            if is_envelope_in_zone(country_buffered_geom, gdf_envelopes):
-                affected_countries.append(country)
-                bounds = country_buffered_geom.bounds
-                if bounds[2] - bounds[0] > 180:
-                    logger.info(f"  {country}: Affected (buffer crosses dateline)")
+
+                if not country_buffered_geom.is_valid:
+                    from shapely.validation import make_valid
+                    try:
+                        country_buffered_geom = make_valid(country_buffered_geom)
+                    except Exception:
+                        try:
+                            country_buffered_geom = country_buffered_geom.buffer(0)
+                        except Exception:
+                            logger.debug(f"Could not create valid buffered geometry for {country}, using unbuffered")
+                            country_buffered_geom = country_boundary
+
+                if is_envelope_in_zone(country_buffered_geom, gdf_envelopes):
+                    affected_countries.append(country)
+                    bounds = country_buffered_geom.bounds
+                    if bounds[2] - bounds[0] > 180:
+                        logger.info(f"  {country}: Affected (buffer crosses dateline)")
+                    else:
+                        logger.info(f"  {country}: Affected")
                 else:
-                    logger.info(f"  {country}: Affected")
-            else:
-                logger.info(f"  {country}: Not affected (skipping)")
+                    logger.info(f"  {country}: Not affected (skipping)")
         
         if not affected_countries:
             logger.error("Envelopes do not intersect with any of the specified countries (within 1500km buffer)")
@@ -236,6 +250,7 @@ class ImpactPipelineStats:
         self.analysis_success = False
         self.countries_processed = 0
         self.views_created = 0
+        self.affected_countries = []
         self.errors = []
     
     def log_summary(self, logger):
@@ -319,6 +334,7 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
                 stats.analysis_success = True
                 stats.countries_processed = analysis_result["countries_processed"]
                 stats.views_created = analysis_result["total_views_created"]
+                stats.affected_countries = analysis_result["affected_countries"]
                 logger.info(f"Impact analysis completed successfully")
                 logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
                 logger.info(f"   Countries processed: {stats.countries_processed}")
@@ -377,6 +393,29 @@ def initialize_pipeline(countries, zoom, rewrite):
     return stats
 
 # =============================================================================
+# COMPLETION SIGNAL
+# =============================================================================
+
+def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_written: int):
+    """
+    Insert a completion record into TC_PIPELINE_COMPLETE_LOG.
+    This triggers the stream-based refresh of *_MAT tables in Snowflake.
+    Only called on successful runs.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_COMPLETE_LOG
+            (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS)
+        VALUES (PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS')
+    """, (
+        json.dumps(storm_ids),
+        json.dumps(countries),
+        files_written
+    ))
+    conn.commit()
+    cur.close()
+
+# =============================================================================
 # UPDATE FUNCTIONS
 # =============================================================================
 
@@ -433,7 +472,10 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
 
     # Track if we processed any storms
     storms_processed = False
-    
+    completed_storm_ids = []
+    completed_countries = set()
+    total_files_written = 0
+
     for _,row in storms_df.iterrows():
         storm = row['TRACK_ID']
         forecast_date = row['DATE']
@@ -465,6 +507,9 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                     if storm not in d['storms']:
                         d['storms'][storm] = []
                     d['storms'][storm].append(forecast_datetime_str)
+                    completed_storm_ids.append(storm)
+                    completed_countries.update(stats.affected_countries)
+                    total_files_written += stats.views_created
                 else:
                     print(f"\nPipeline with errors for storm {storm} in {forecast_datetime_str}")
             else:
@@ -472,7 +517,7 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                 logger.info(f"Storm {storm} at {forecast_datetime_str} already processed (use --rewrite 1 to reprocess)")
         else:
             print("Forecast date outside time delta")
-    
+
     # If no storms were processed (all were already processed), mark as success
     if not storms_processed:
         logger.info("All matching storms were already processed (use --rewrite 1 to reprocess)")
@@ -483,6 +528,21 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         save_json_storms(d)
     except Exception as e:
         logger.warning(f"Could not save storms tracking file: {e}")
+
+    # Signal completion to Snowflake so *_MAT tables refresh via stream trigger
+    if completed_storm_ids:
+        try:
+            conn = get_snowflake_connection()
+            signal_pipeline_complete(
+                conn=conn,
+                storm_ids=completed_storm_ids,
+                countries=list(completed_countries),
+                files_written=total_files_written
+            )
+            conn.close()
+            logger.info(f"Signalled pipeline completion to Snowflake for storms: {completed_storm_ids}")
+        except Exception as e:
+            logger.warning(f"Could not write completion signal to Snowflake: {e}")
 
     return stats
 

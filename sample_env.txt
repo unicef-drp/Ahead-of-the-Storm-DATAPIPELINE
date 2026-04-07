@@ -12,9 +12,8 @@ export DATA_PIPELINE_DB=LOCAL
 # ---------------------------
 # Output locations
 # ---------------------------
-# Bounding box and storms registry
+# Storms registry
 export RESULTS_DIR=results
-export BBOX_FILE=bbox.parquet
 export STORMS_FILE=storms.json
 
 # Base and impact views

@@ -10,7 +10,7 @@
 ### 1. Manage Country Status
 [![Manage Country Status](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/manage-country-status.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/manage-country-status.yml)
 
-### 2. Initialize New Country (currently not working, waiting for giga-spatial PR to be merged)
+### 2. Initialize New Country
 [![Initialize New Country](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml)
 
 ### 3. Update Country Map Config
@@ -26,7 +26,7 @@
 1. **Python 3.11+** installed
 2. **Virtual environment** activated (`.venv`)
 3. **Environment variables** configured in `.env` file
-   - Start from the provided example: `cp example_env.txt .env`
+   - Start from the provided example: `cp sample_env.txt .env`
    - Edit values to match the environment (Snowflake, optional Azure)
 
 ### Environment setup (recommended)
