@@ -22,6 +22,8 @@ __pycache__/
 .DS_Store
 .idea/
 *.share
+.claude/
+CLAUDE.md
 
 geodb/
 project_results/
@@ -29,3 +31,7 @@ gigaspatial/
 test_files/
 test_spcs_job.sql
 logs_54484061307/
+download_tracks.py
+snowflake/data_sharing/
+download_tc_tracks.py
+geosight/
