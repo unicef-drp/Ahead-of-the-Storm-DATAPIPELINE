@@ -1091,8 +1091,8 @@ def patch_country_layer(country, zoom_level, columns):
             viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
             try:
                 viewer.map_built_s()
-                built = viewer.view['built_surface_m2'].rename_axis('tile_id')
-                gdf['built_surface_m2'] = gdf['tile_id'].map(built.to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['built_surface_m2']
+                gdf['built_surface_m2'] = gdf['tile_id'].map(v.to_dict())
             except Exception as e:
                 logger.warning(f"{country}: GHSL built surface still unavailable during patch: {e}")
         logger.info(f"{country}: Patched built_surface_m2")
@@ -1105,8 +1105,8 @@ def patch_country_layer(country, zoom_level, columns):
             viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
             try:
                 viewer.map_smod()
-                smod = viewer.view['smod_class'].rename_axis('tile_id')
-                gdf['smod_class'] = gdf['tile_id'].map(smod.to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['smod_class']
+                gdf['smod_class'] = gdf['tile_id'].map(v.to_dict())
             except Exception as e:
                 logger.warning(f"{country}: GHSL SMOD still unavailable during patch: {e}")
         # Always re-derive L1 when L2 is patched
@@ -1147,24 +1147,28 @@ def patch_country_layer(country, zoom_level, columns):
                 viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
                                   output_column='school_age_population', school_age=True,
                                   project='age_structures', un_adjusted=False, sex='F_M')
-                gdf['school_age_population'] = gdf['tile_id'].map(viewer.view['school_age_population'].to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['school_age_population']
+                gdf['school_age_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched school_age_population")
             if 'infant_population' in pop_cols_requested:
                 viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
                                   output_column='infant_population', predicate='centroid_within',
                                   school_age=False, project='age_structures', un_adjusted=False,
                                   min_age=INFANT_AGE_MIN, max_age=INFANT_AGE_MAX)
-                gdf['infant_population'] = gdf['tile_id'].map(viewer.view['infant_population'].to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['infant_population']
+                gdf['infant_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched infant_population")
             if 'under_18_population' in pop_cols_requested:
                 viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW,
                                   output_column='under_18_population', under_18=True,
                                   project='age_structures', un_adjusted=False)
-                gdf['under_18_population'] = gdf['tile_id'].map(viewer.view['under_18_population'].to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['under_18_population']
+                gdf['under_18_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched under_18_population")
             if 'population' in pop_cols_requested:
                 viewer.map_wp_pop(country=country, resolution=100)
-                gdf['population'] = gdf['tile_id'].map(viewer.view['population'].to_dict())
+                v = viewer.to_geodataframe().set_index('zone_id')['population']
+                gdf['population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched population")
 
     if 'schools' in columns:
