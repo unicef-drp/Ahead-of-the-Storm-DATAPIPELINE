@@ -7,7 +7,7 @@ This guide explains how to deploy the Hurricane Impact Analysis Pipeline to Snow
 The Impact Analysis Pipeline processes hurricane forecast data from Snowflake tables and generates impact views and reports. When deployed to SPCS, it:
 
 - Reads hurricane track and envelope data from Snowflake tables (`TC_TRACKS`, `TC_ENVELOPES_COMBINED`)
-- Processes geospatial impact analysis (schools, health centers, population)
+- Processes geospatial impact analysis (schools, health centers, shelters, WASH, population)
 - Generates impact views and reports
 - Writes results to Snowflake internal stage
 
@@ -319,13 +319,14 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
 
 The pipeline accepts command-line arguments:
 
-- `--type`: Pipeline mode (`initialize` or `update`)
+- `--type`: Pipeline mode (`initialize`, `update`, or `patch`)
 - `--countries`: Space-separated list of country codes (e.g., `TWN DOM VNM`)
 - `--zoom`: Zoom level for tiles (default: `14`)
 - `--rewrite`: Set to `1` to force reprocessing (default: `0`)
 - `--time_delta`: Number of days in the past to consider storms (default: `9`)
 - `--date`: Process only storms on a specific date (YYYY-MM-DD format)
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
+- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi num_shelters`)
 
 ## Example: Initialize Pipeline for Taiwan
 
