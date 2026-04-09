@@ -19,6 +19,9 @@
 ### 4. Process Past Storms
 [![Process Past Storms](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml)
 
+### 5. Patch Country Columns
+[![Patch Country Columns](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml)
+
 ---
 
 ## Prerequisites
@@ -198,6 +201,8 @@ python main_pipeline.py --type patch --countries PNG --columns num_shelters num_
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Custom CSVs in `geodb/custom/` take priority over raster/API re-processing in patch mode too
 - Raises an error if no base mercator parquet exists for the country (must initialize first)
+
+**Via GitHub Actions:** Use the **"Patch Country Columns"** workflow (`.github/workflows/patch-columns.yml`) to patch columns without a local setup. See `README_GITHUB_ACTIONS.md` for details.
 
 ---
 

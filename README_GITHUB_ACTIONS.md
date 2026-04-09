@@ -7,6 +7,7 @@ This document explains how to use GitHub Actions to manage countries and trigger
 GitHub Actions workflows allow you to:
 - **Add new countries** and automatically initialize them
 - **Process past storms** for historical analysis
+- **Patch specific columns** in existing country data without full re-initialization
 - **Trigger pipeline runs** without manual command-line execution
 
 ## Prerequisites
@@ -188,6 +189,65 @@ Rewrite: 0
 ```
 
 This will process all storms from November 1-10, 2025 for Taiwan and Dominican Republic.
+
+### 5. Patch Country Columns
+
+[![Patch Country Columns](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml)
+
+**Workflow:** `.github/workflows/patch-columns.yml`
+
+**Purpose:** Backfill specific columns in existing country mercator parquets without full re-initialization. Use this when a data source becomes available after a country was first initialized (e.g. new WorldPop dataset, custom shelter registry, RWI data now available for a country).
+
+**How to use:**
+1. Go to **Actions** tab in GitHub
+2. Select **"Patch Country Columns"** workflow
+3. Click **"Run workflow"**
+4. Fill in the form:
+   - **Countries**: Comma-separated (e.g., `PNG,FJI`) or leave empty for all active countries
+   - **Columns**: Space-separated column names to patch (required — see supported columns below)
+   - **Zoom Level**: Must match the existing mercator parquet (default: `14`)
+5. Click **"Run workflow"**
+
+**Supported columns:**
+
+| Column | Source |
+|--------|--------|
+| `population` | WorldPop (total, 1km) |
+| `school_age_population` | WorldPop (ages 5–15, 100m) |
+| `infant_population` | WorldPop (ages 0–4, 100m) |
+| `under_18_population` | WorldPop (ages 0–17, 100m) |
+| `built_surface_m2` | GHSL built surface |
+| `smod_class` | GHSL SMOD L2 settlement class |
+| `smod_class_l1` | Derived from `smod_class` (always updated together) |
+| `rwi` | HDX Relative Wealth Index |
+| `num_schools` | GIGA school location API |
+| `num_hcs` | HealthSites API |
+| `num_shelters` | OSM Overpass / custom CSV |
+| `num_wash` | OSM Overpass / custom CSV |
+
+**Notes:**
+- Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
+- Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
+- The country must already be initialized (base mercator parquet must exist)
+- Population columns can be patched individually — useful when a new WorldPop dataset is released
+
+**Examples:**
+```
+# Backfill shelter and WASH counts after adding custom data files
+Countries: PNG
+Columns: num_shelters num_wash
+Zoom Level: 14
+
+# Update wealth and settlement data for all active countries
+Countries: (leave empty)
+Columns: rwi smod_class
+Zoom Level: 14
+
+# Update population from a new WorldPop dataset
+Countries: TWN,DOM
+Columns: population school_age_population infant_population under_18_population
+Zoom Level: 14
+```
 
 ## Country Management
 

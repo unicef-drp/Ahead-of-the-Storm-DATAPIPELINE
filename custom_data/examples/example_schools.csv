@@ -1,0 +1,6 @@
+id,latitude,longitude,education_level,school_name,school_data_source
+PNG-GOV-001,-9.4438,147.1803,Primary,Waigani Primary School,ministry_of_education
+PNG-GOV-002,-9.4521,147.1925,Secondary,Port Moresby Secondary School,ministry_of_education
+PNG-GOV-003,-9.4102,147.1541,Pre-Primary,Konedobu Kindergarten,ministry_of_education
+PNG-GOV-004,-9.4887,147.2201,Post-Secondary,PNG University of Technology Annex,ministry_of_education
+PNG-GOV-005,-9.4655,147.1732,Unknown,Badili Community School,ministry_of_education

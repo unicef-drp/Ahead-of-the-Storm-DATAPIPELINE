@@ -9,7 +9,6 @@ __pycache__/
 *.json
 *.xml
 *.csv
-!custom_data/*.csv
 *.zip
 *.nc
 *.kmz
@@ -25,6 +24,9 @@ __pycache__/
 *.share
 .claude/
 CLAUDE.md
+
+!custom_data/examples/*.csv
+!custom_data/templates/*.csv
 
 geodb/
 project_results/
