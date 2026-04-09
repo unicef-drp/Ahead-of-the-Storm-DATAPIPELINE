@@ -947,11 +947,23 @@ def save_mercator_view(gdf, country, zoom_level):
 
 def admins_overlay(gdf_admins1, gdf_mercator):
     """
-    Assign admin level 1 IDs to mercator tiles based on maximum intersection area.
+    Assign admin level 1 IDs to mercator tiles.
 
-    For each mercator tile, finds the admin level 1 boundary with the largest
-    intersection area and assigns its 'id' to the tile. Tiles that don't intersect
-    any admin boundary (e.g. ocean tiles) get NaN for 'id'.
+    Three-step assignment, applied in order:
+
+    1. Centroid-within: each tile is assigned to the admin region that contains its
+       centroid (projected to equal-area CRS for accuracy). Handles most tiles.
+
+    2. Area-overlap fallback: for tiles whose centroid falls outside every admin
+       boundary (straddles a border), assign to the admin with the largest
+       intersection area (equal-area CRS).
+
+    3. Nearest-neighbour fallback: for tiles still unassigned after steps 1–2
+       (ocean/far-offshore tiles), assign to the nearest admin boundary by
+       centroid distance. Ensures every tile gets an admin ID.
+
+    Note: step 3 only applies to tiles that do not intersect any admin region at all.
+    Tiles that straddle admin boundaries are handled by steps 1–2.
 
     Callers are responsible for normalising the admin ID column to 'id' before
     passing gdf_admins1 (see add_admin_ids).
@@ -963,15 +975,53 @@ def admins_overlay(gdf_admins1, gdf_mercator):
     Returns:
         gpd.GeoDataFrame: Mercator tiles with an added 'id' column (admin level 1 ID).
     """
-    # Overlay to get all tile-admin intersections, then compute intersection area
-    intersections = gpd.overlay(gdf_mercator, gdf_admins1, how="intersection")
-    intersections["intersection_area"] = intersections.geometry.area
+    # Step 1: centroid-based assignment (primary)
+    # Project to equal-area CRS for accurate centroid computation
+    centroids = gdf_mercator[["tile_id", "geometry"]].copy()
+    centroids["geometry"] = centroids.geometry.to_crs("ESRI:54009").centroid.to_crs(gdf_mercator.crs)
+    centroid_join = gpd.sjoin(
+        centroids,
+        gdf_admins1[["id", "geometry"]],
+        how="left",
+        predicate="within",
+    ).drop(columns=["index_right"], errors="ignore")
+    # Keep first match per tile (handles rare centroid-on-boundary duplicates)
+    centroid_join = centroid_join.drop_duplicates(subset="tile_id", keep="first")
+    assigned = centroid_join[["tile_id", "id"]].copy()
 
-    # For each tile, keep only the admin with maximum intersection area
-    max_area_idx = intersections.groupby("tile_id")["intersection_area"].idxmax()
-    assigned = intersections.loc[max_area_idx, ["tile_id", "id"]]
+    # Step 2: area-based fallback for tiles whose centroid is outside all admin regions
+    still_unassigned = assigned[assigned["id"].isna()]["tile_id"]
+    if len(still_unassigned) > 0:
+        tiles_fallback = gdf_mercator[gdf_mercator["tile_id"].isin(still_unassigned)]
+        intersections = gpd.overlay(tiles_fallback, gdf_admins1, how="intersection")
+        if len(intersections) > 0:
+            intersections["intersection_area"] = (
+                intersections.geometry.to_crs("ESRI:54009").area
+            )
+            max_idx = intersections.groupby("tile_id")["intersection_area"].idxmax()
+            fallback = intersections.loc[max_idx, ["tile_id", "id"]]
+            assigned = assigned.set_index("tile_id")
+            assigned.update(fallback.set_index("tile_id"))
+            assigned = assigned.reset_index()
 
-    # Left-join back to preserve all original tiles (unmatched tiles get NaN id)
+    # Step 3: nearest-neighbour fallback for tiles still unassigned (no intersection
+    # with any admin — typically ocean or far-offshore tiles)
+    still_unassigned = assigned[assigned["id"].isna()]["tile_id"]
+    if len(still_unassigned) > 0:
+        logger.debug(
+            f"admins_overlay: {len(still_unassigned)} tiles unassigned after centroid "
+            "and area steps — applying nearest-neighbour fallback"
+        )
+        tiles_nn = gdf_mercator[gdf_mercator["tile_id"].isin(still_unassigned)].copy()
+        tiles_nn["geometry"] = tiles_nn.geometry.to_crs("ESRI:54009").centroid.to_crs(gdf_mercator.crs)
+        admins_proj = gdf_admins1[["id", "geometry"]].copy()
+        nearest = gpd.sjoin_nearest(tiles_nn[["tile_id", "geometry"]], admins_proj, how="left")
+        nearest = nearest.drop_duplicates(subset="tile_id", keep="first")[["tile_id", "id"]]
+        assigned = assigned.set_index("tile_id")
+        assigned.update(nearest.set_index("tile_id"))
+        assigned = assigned.reset_index()
+
+    # Left-join back to preserve all original tiles
     result = gdf_mercator.merge(assigned, on="tile_id", how="left")
     return gpd.GeoDataFrame(result, geometry="geometry", crs=gdf_mercator.crs)
 
@@ -992,11 +1042,26 @@ def add_admin_ids(view, country):
             - combined_view: GeoDataFrame with tiles and 'id' column (admin level 1 ID)
             - gdf_admins1: GeoDataFrame with admin level 1 boundaries
     """
-    gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=1).to_geodataframe()
-    # giga-spatial 0.9.x AdminBoundaries.to_geodataframe() returns 'boundary_id';
-    # older versions returned 'id'. Normalise to 'id' so downstream code is consistent.
-    if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
-        gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
+    try:
+        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=1).to_geodataframe()
+        # giga-spatial 0.9.x AdminBoundaries.to_geodataframe() returns 'boundary_id';
+        # older versions returned 'id'. Normalise to 'id' so downstream code is consistent.
+        if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
+            gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
+        if gdf_admins1.empty or "id" not in gdf_admins1.columns:
+            raise ValueError("Admin level 1 boundaries empty or missing 'id' column")
+    except Exception as e:
+        logger.warning(
+            f"{country}: Admin level 1 boundaries unavailable ({e}) — "
+            "falling back to admin level 0 (whole country as single region)"
+        )
+        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=0).to_geodataframe()
+        if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
+            gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
+        if "name" not in gdf_admins1.columns:
+            gdf_admins1["name"] = country
+        if "id" not in gdf_admins1.columns:
+            gdf_admins1["id"] = country
     combined_view = admins_overlay(gdf_admins1, view)
     return combined_view, gdf_admins1
 
@@ -1270,6 +1335,13 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
 
             # Group by large_id and aggregate
             agg = combined_view.groupby("id").agg(agg_dict).reset_index()
+            # Ensure all admin regions appear even if no tiles were assigned to them
+            # (e.g. very small regions like NCR whose border tiles all overlap more with neighbours)
+            all_ids = gdf_admins1[['id']].copy()
+            agg = all_ids.merge(agg, on='id', how='left')
+            for col in list(sum_cols_admin) + list(avg_cols_admin):
+                if col in agg.columns:
+                    agg[col] = agg[col].fillna(0)
             admin_view = agg.rename(columns={'id':'tile_id'})
             ### add names ###
             admin_view['name'] = admin_view['tile_id'].map(d)
@@ -1293,6 +1365,13 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
 
             # Group by large_id and aggregate
             agg = combined_view.groupby("id").agg(agg_dict).reset_index()
+            # Ensure all admin regions appear even if no tiles were assigned to them
+            # (e.g. very small regions like NCR whose border tiles all overlap more with neighbours)
+            all_ids = gdf_admins1[['id']].copy()
+            agg = all_ids.merge(agg, on='id', how='left')
+            for col in list(sum_cols_admin) + list(avg_cols_admin):
+                if col in agg.columns:
+                    agg[col] = agg[col].fillna(0)
             admin_view = agg.rename(columns={'id':'tile_id'})
             ### add names ###
             admin_view['name'] = admin_view['tile_id'].map(d)
