@@ -161,14 +161,6 @@ sum_cols_cci = [
     'CCI_under_18',    'E_CCI_under_18',
     'CCI_pop',         'E_CCI_pop',
 ]
-cci_cols = [
-    'CCI_children',    'E_CCI_children',
-    'CCI_pop',         'E_CCI_pop',
-    'CCI_school_age',  'E_CCI_school_age',
-    'CCI_infants',     'E_CCI_infants',
-    'CCI_under_18',    'E_CCI_under_18',
-]
-
 # Configuration constants
 BUFFER_DISTANCE_METERS = 150  # Buffer distance for schools and health centers (meters)
 WORLDPOP_RESOLUTION_HIGH = 1000  # High resolution for WorldPop data (meters)
@@ -759,7 +751,7 @@ def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
 # for a country (--type initialize / --type patch). These are written once and
 # reused across all storm update runs.
 # =============================================================================
-def create_mercator_country_layer(country, zoom_level=15, rewrite=0):
+def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
     """
     Create mercator tile layer with demographic and infrastructure data for a country.
 
@@ -783,7 +775,7 @@ def create_mercator_country_layer(country, zoom_level=15, rewrite=0):
 
     Args:
         country: ISO3 country code
-        zoom_level: Zoom level for mercator tiles (default: 15, typically 14 for analysis)
+        zoom_level: Zoom level for mercator tiles (default: 14)
         rewrite: If 1, re-fetch school, HC, shelter, and WASH location caches from API/OSM;
                  if 0, use cached parquets if available
 
@@ -1034,18 +1026,21 @@ def patch_country_layer(country, zoom_level, columns):
     population data or re-fetching schools and HCs.
 
     Supported columns:
-        built_surface_m2  — re-runs GHSL built surface (or uses custom built_surface_z<N>.csv)
-        smod_class        — re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
-        smod_class_l1     — alias for smod_class (both are always updated together)
-        rwi               — re-runs RWI (or uses custom rwi_z<N>.csv)
-        num_schools       — re-fetches school locations and recomputes counts
-        num_hcs           — re-fetches health center locations and recomputes counts
-        num_shelters      — re-fetches shelter locations from OSM or custom CSV and recomputes counts
-        num_wash          — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts
+        population             — re-runs WorldPop total population (or uses custom population_z<N>.csv)
+        school_age_population  — re-runs WorldPop school-age population
+        infant_population      — re-runs WorldPop infant population
+        under_18_population    — re-runs WorldPop under-18 population
+        built_surface_m2       — re-runs GHSL built surface (or uses custom built_surface_z<N>.csv)
+        smod_class             — re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
+        smod_class_l1          — alias for smod_class (both are always updated together)
+        rwi                    — re-runs RWI (or uses custom rwi_z<N>.csv)
+        num_schools            — re-fetches school locations and recomputes counts
+        num_hcs                — re-fetches health center locations and recomputes counts
+        num_shelters           — re-fetches shelter locations from OSM or custom CSV and recomputes counts
+        num_wash               — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts
 
-    Population columns (population, school_age_population, infant_population,
-    under_18_population) are intentionally excluded — they are hard requirements and
-    any error in them requires a full re-initialization.
+    Population columns are patched individually — use this when a new WorldPop dataset is
+    available without needing to re-fetch schools, HCs, or raster data for other columns.
 
     Custom tile CSVs (e.g. geodb/custom/<COUNTRY>_built_surface_z<ZOOM>.csv) take priority
     over raster processing for the same column, exactly as in create_mercator_country_layer().
@@ -1059,11 +1054,17 @@ def patch_country_layer(country, zoom_level, columns):
         FileNotFoundError: If no base mercator parquet exists for the country (run init first)
         ValueError: If an unsupported column is requested
     """
-    PATCHABLE = {'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi', 'num_schools', 'num_hcs', 'num_shelters', 'num_wash'}
+    PATCHABLE = {
+        'population', 'school_age_population', 'infant_population', 'under_18_population',
+        'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi',
+        'num_schools', 'num_hcs', 'num_shelters', 'num_wash',
+    }
     unsupported = set(columns) - PATCHABLE
     if unsupported:
-        raise ValueError(f"{country}: Cannot patch population columns {unsupported}. "
-                         f"Run --type initialize --rewrite 1 to regenerate population data.")
+        raise ValueError(
+            f"{country}: Unsupported columns {unsupported}. "
+            f"Patchable columns: {sorted(PATCHABLE)}"
+        )
 
     # Normalise: smod_class_l1 is always derived from smod_class
     if 'smod_class_l1' in columns and 'smod_class' not in columns:
@@ -1128,6 +1129,42 @@ def patch_country_layer(country, zoom_level, columns):
                 logger.warning(f"{country}: RWI still unavailable during patch: {e}")
         logger.info(f"{country}: Patched rwi")
 
+    pop_cols_requested = [c for c in ['population', 'school_age_population', 'infant_population', 'under_18_population'] if c in columns]
+    if pop_cols_requested:
+        custom_pop = _load_custom_tiles_csv(country, 'population', zoom_level)
+        if custom_pop is not None:
+            for col in pop_cols_requested:
+                if col in custom_pop.columns:
+                    gdf[col] = gdf['tile_id'].map(custom_pop[col])
+                    logger.info(f"{country}: Patched {col} from custom CSV")
+                else:
+                    logger.warning(f"{country}: Custom population CSV missing column '{col}' — skipping")
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            if 'school_age_population' in pop_cols_requested:
+                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
+                                  output_column='school_age_population', school_age=True,
+                                  project='age_structures', un_adjusted=False, sex='F_M')
+                gdf['school_age_population'] = gdf['tile_id'].map(viewer.view['school_age_population'].to_dict())
+                logger.info(f"{country}: Patched school_age_population")
+            if 'infant_population' in pop_cols_requested:
+                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
+                                  output_column='infant_population', predicate='centroid_within',
+                                  school_age=False, project='age_structures', un_adjusted=False,
+                                  min_age=INFANT_AGE_MIN, max_age=INFANT_AGE_MAX)
+                gdf['infant_population'] = gdf['tile_id'].map(viewer.view['infant_population'].to_dict())
+                logger.info(f"{country}: Patched infant_population")
+            if 'under_18_population' in pop_cols_requested:
+                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW,
+                                  output_column='under_18_population', under_18=True,
+                                  project='age_structures', un_adjusted=False)
+                gdf['under_18_population'] = gdf['tile_id'].map(viewer.view['under_18_population'].to_dict())
+                logger.info(f"{country}: Patched under_18_population")
+            if 'population' in pop_cols_requested:
+                viewer.map_wp_pop(country=country, resolution=100)
+                gdf['population'] = gdf['tile_id'].map(viewer.view['population'].to_dict())
+                logger.info(f"{country}: Patched population")
+
     if 'num_schools' in columns:
         gdf_schools = fetch_schools(country, rewrite=0)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
@@ -1176,8 +1213,8 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             d = gdf_admins1.set_index('id')['name'].to_dict()
             d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
             save_mercator_view(combined_view, country, zoom_level)
-            #### Aggregate by admin ####
             
+            #### Aggregate by admin ####
             # Define aggregation dictionary
             agg_dict = {col: "sum" for col in sum_cols_admin}
             agg_dict.update({col: "mean" for col in avg_cols_admin})
@@ -1190,7 +1227,7 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
             admin_view = convert_to_geodataframe(admin_view)
             save_admin_view(admin_view,country)
-            ############################
+      
             initialized = True
         elif rewrite:
             # When rewrite=1, regenerate the entire mercator view from scratch
@@ -1213,7 +1250,7 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
             admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
             admin_view = convert_to_geodataframe(admin_view)
             save_admin_view(admin_view,country)
-            ############################
+            
             initialized = True
         else:
             # File already exists and rewrite=0
@@ -1240,7 +1277,6 @@ def save_json_storms(d):
     """
     Save json file with processed storm,dates
     """
-    import json
     filename = os.path.join(RESULTS_DIR, STORMS_FILE)
     data_store.write_file(filename, json.dumps(d).encode())
 
@@ -1249,7 +1285,6 @@ def load_json_storms():
     """
     Read json file with saved storm,dates
     """
-    import json
     filename = os.path.join(RESULTS_DIR, STORMS_FILE)
     if data_store.file_exists(filename):
         raw = data_store.read_file(filename)
@@ -1257,7 +1292,7 @@ def load_json_storms():
     return {'storms': {}}
 
 
-def load_mercator_view(country, zoom_level=15):
+def load_mercator_view(country, zoom_level=14):
     """Load mercator view for country"""
     file_name = f"{country}_{zoom_level}.parquet"
     return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
@@ -1314,7 +1349,7 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
         logger.error("School GeoDataFrame has no valid geometry column. Returning empty views.")
         return {}
     
-    gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=150)
+    gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
@@ -1430,9 +1465,11 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
     Returns:
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
     """
-    if not isinstance(gdf_shelters, gpd.GeoDataFrame) or gdf_shelters.empty:
-        if not isinstance(gdf_shelters, gpd.GeoDataFrame):
-            logger.error("gdf_shelters must be a GeoDataFrame. Returning empty views.")
+    if not isinstance(gdf_shelters, gpd.GeoDataFrame):
+        logger.error(f"gdf_shelters must be a GeoDataFrame, got {type(gdf_shelters)}. Returning empty views.")
+        return {}
+    if gdf_shelters.empty:
+        logger.warning("Shelter GeoDataFrame is empty, returning empty views")
         return {}
     if 'geometry' not in gdf_shelters.columns or gdf_shelters.geometry.isna().all():
         logger.error("Shelter GeoDataFrame has no valid geometry. Returning empty views.")
@@ -1475,9 +1512,11 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
               Empty dict if gdf_wash is empty or invalid.
     """
-    if not isinstance(gdf_wash, gpd.GeoDataFrame) or gdf_wash.empty:
-        if not isinstance(gdf_wash, gpd.GeoDataFrame):
-            logger.error("gdf_wash must be a GeoDataFrame. Returning empty views.")
+    if not isinstance(gdf_wash, gpd.GeoDataFrame):
+        logger.error(f"gdf_wash must be a GeoDataFrame, got {type(gdf_wash)}. Returning empty views.")
+        return {}
+    if gdf_wash.empty:
+        logger.warning("WASH GeoDataFrame is empty, returning empty views")
         return {}
     if 'geometry' not in gdf_wash.columns or gdf_wash.geometry.isna().all():
         logger.error("WASH GeoDataFrame has no valid geometry. Returning empty views.")

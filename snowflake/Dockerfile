@@ -81,9 +81,6 @@ COPY snowflake_utils.py /app/
 COPY reports.py /app/
 COPY country_utils.py /app/
 
-# Copy gigaspatial library (local copy with multiprocessing fixes)
-COPY gigaspatial/ /app/gigaspatial/
-
 # Copy requirements
 COPY requirements.txt /app/requirements.txt
 
@@ -129,7 +126,6 @@ ENV DATA_PIPELINE_DB=LOCAL
 ENV ROOT_DATA_DIR=geodb
 ENV VIEWS_DIR=aos_views
 ENV RESULTS_DIR=results
-ENV BBOX_FILE=bbox.parquet
 ENV STORMS_FILE=storms.json
 
 # Snowflake configuration

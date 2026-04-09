@@ -41,7 +41,7 @@ class Config:
     DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL')
     
     # Application Configuration
-    RESULTS_DIR = os.getenv('RESULTS_DIR', 'project_results/climate/lacro_project')
+    RESULTS_DIR = os.getenv('RESULTS_DIR', 'results')
     STORMS_FILE = os.getenv('STORMS_FILE', 'storms.json')
     VIEWS_DIR = os.getenv('VIEWS_DIR', 'aos_views')
     ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR', 'geodb')
