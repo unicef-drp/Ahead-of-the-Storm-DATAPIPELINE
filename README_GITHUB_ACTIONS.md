@@ -213,9 +213,9 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | Column | Source |
 |--------|--------|
 | `population` | WorldPop (total, 1km) |
-| `school_age_population` | WorldPop (ages 5–15, 100m) |
+| `school_age_population` | WorldPop GR2/2025 (ages 5–14, 100m) |
 | `infant_population` | WorldPop (ages 0–4, 100m) |
-| `under_18_population` | WorldPop (ages 0–17, 100m) |
+| `adolescent_population` | WorldPop GR2/2025 (ages 15–19y, 100m) |
 | `built_surface_m2` | GHSL built surface |
 | `smod_class` | GHSL SMOD L2 settlement class |
 | `smod_class_l1` | Derived from `smod_class` (always updated together) |
@@ -247,7 +247,7 @@ Zoom Level: 14
 
 # Update population from a new WorldPop dataset
 Countries: TWN,DOM
-Columns: population school_age_population infant_population under_18_population
+Columns: population school_age_population infant_population adolescent_population
 Zoom Level: 14
 ```
 

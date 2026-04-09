@@ -100,9 +100,9 @@ from reports import do_report, save_json_report
 
 data_cols = [
     'population',           # Total population (WorldPop GR2, year=2025, 1km)
-    'school_age_population',# School-age population 5–15 years (WorldPop 100m, age_structures)
-    'infant_population',    # Infant population 0–4 years (WorldPop 100m, age_structures)
-    'under_18_population',  # Under-18 population (WorldPop 100m, age_structures)
+    'school_age_population',# School-age population 5–14 years (WorldPop GR2/2025, 100m, age_structures)
+    'infant_population',    # Infant population 0–4 years (WorldPop GR2/2025, 100m, age_structures)
+    'adolescent_population', # Adolescent population 15–19 years (WorldPop GR2/2025, 100m, age_structures)
     'built_surface_m2',     # Built surface area in m² (GHSL GHS-BUILT-S)
     'smod_class',           # Settlement model L2 class 10–30 (GHSL GHS-SMOD)
     'smod_class_l1',        # Derived L1 class: 1=rural, 2=suburban, 3=urban
@@ -119,7 +119,7 @@ sum_cols = [
     'E_population',
     'E_school_age_population',
     'E_infant_population',
-    'E_under_18_population',
+    'E_adolescent_population',
     'E_built_surface_m2',
     'E_num_schools',
     'E_num_hcs',
@@ -140,7 +140,7 @@ sum_cols_admin = [
     'population',
     'school_age_population',
     'infant_population',
-    'under_18_population',
+    'adolescent_population',
     'built_surface_m2',
     'num_schools',
     'num_hcs',
@@ -158,7 +158,7 @@ sum_cols_cci = [
     'CCI_children',    'E_CCI_children',
     'CCI_school_age',  'E_CCI_school_age',
     'CCI_infants',     'E_CCI_infants',
-    'CCI_under_18',    'E_CCI_under_18',
+    'CCI_adolescents',    'E_CCI_adolescents',
     'CCI_pop',         'E_CCI_pop',
 ]
 # Configuration constants
@@ -169,6 +169,8 @@ SCHOOL_AGE_MIN = 5   # GR2 min_age: picks _05_ (5–9y) and _10_ (10–14y) band
 SCHOOL_AGE_MAX = 10  # GR2 max_age: picks _05_ (5–9y) and _10_ (10–14y) bands
 INFANT_AGE_MIN = 0   # GR2 min_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
 INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
+ADOLESCENT_AGE_MIN = 15  # GR2 min_age: picks _15_ (15–19y) band
+ADOLESCENT_AGE_MAX = 15  # GR2 max_age: picks _15_ (15–19y) band — 1 file only
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
 
 
@@ -425,7 +427,7 @@ def _load_custom_tiles_csv(country, kind, zoom):
     country's base mercator parquet. Empty cells are interpreted as NaN.
 
     Supported kinds and their columns:
-        population:    tile_id, population, school_age_population, infant_population, under_18_population
+        population:    tile_id, population, school_age_population, infant_population, adolescent_population
         built_surface: tile_id, built_surface_m2
         smod:          tile_id, smod_class
         rwi:           tile_id, rwi
@@ -796,7 +798,7 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
     # ------------------------------------------------------------------
     custom_pop = _load_custom_tiles_csv(country, 'population', zoom_level)
     if custom_pop is not None:
-        for col in ['school_age_population', 'infant_population', 'under_18_population', 'population']:
+        for col in ['school_age_population', 'infant_population', 'adolescent_population', 'population']:
             if col in custom_pop.columns:
                 tiles_viewer.add_variable_to_view(custom_pop[col].to_dict(), col)
             else:
@@ -833,14 +835,20 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
             max_age=INFANT_AGE_MAX,
             sex='T',
         )
-        # Map under-18 population — hard requirement, raises on failure
+        # Map adolescent population (15–19y) — hard requirement, raises on failure
+        # GR2: picks _15_ band only (15–19y), sex='T' for combined total — 1 file
         tiles_viewer.map_wp_pop(
             country=country,
             resolution=WORLDPOP_RESOLUTION_LOW,
-            output_column="under_18_population",
-            under_18=True,
+            output_column="adolescent_population",
+            school_age=False,
             project="age_structures",
+            release="GR2",
+            constrained=True,
             un_adjusted=False,
+            min_age=ADOLESCENT_AGE_MIN,
+            max_age=ADOLESCENT_AGE_MAX,
+            sex='T',
         )
         # Map total population — hard requirement, raises on failure
         tiles_viewer.map_wp_pop(country=country, resolution=100)
@@ -1040,7 +1048,7 @@ def patch_country_layer(country, zoom_level, columns):
         population             — re-runs WorldPop total population (or uses custom population_z<N>.csv)
         school_age_population  — re-runs WorldPop school-age population
         infant_population      — re-runs WorldPop infant population
-        under_18_population    — re-runs WorldPop under-18 population
+        adolescent_population  — re-runs WorldPop adolescent population (15–19y)
         built_surface_m2       — re-runs GHSL built surface (or uses custom built_surface_z<N>.csv)
         smod_class             — re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
         smod_class_l1          — alias for smod_class (both are always updated together)
@@ -1066,7 +1074,7 @@ def patch_country_layer(country, zoom_level, columns):
         ValueError: If an unsupported column is requested
     """
     PATCHABLE = {
-        'population', 'school_age_population', 'infant_population', 'under_18_population',
+        'population', 'school_age_population', 'infant_population', 'adolescent_population',
         'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi',
         'schools', 'hcs', 'shelters', 'wash',
     }
@@ -1140,7 +1148,7 @@ def patch_country_layer(country, zoom_level, columns):
                 logger.warning(f"{country}: RWI still unavailable during patch: {e}")
         logger.info(f"{country}: Patched rwi")
 
-    pop_cols_requested = [c for c in ['population', 'school_age_population', 'infant_population', 'under_18_population'] if c in columns]
+    pop_cols_requested = [c for c in ['population', 'school_age_population', 'infant_population', 'adolescent_population'] if c in columns]
     if pop_cols_requested:
         custom_pop = _load_custom_tiles_csv(country, 'population', zoom_level)
         if custom_pop is not None:
@@ -1168,13 +1176,14 @@ def patch_country_layer(country, zoom_level, columns):
                 v = viewer.to_geodataframe().set_index('zone_id')['infant_population']
                 gdf['infant_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched infant_population")
-            if 'under_18_population' in pop_cols_requested:
+            if 'adolescent_population' in pop_cols_requested:
                 viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW,
-                                  output_column='under_18_population', under_18=True,
-                                  project='age_structures', un_adjusted=False)
-                v = viewer.to_geodataframe().set_index('zone_id')['under_18_population']
-                gdf['under_18_population'] = gdf['tile_id'].map(v.to_dict())
-                logger.info(f"{country}: Patched under_18_population")
+                                  output_column='adolescent_population', school_age=False,
+                                  project='age_structures', release='GR2', constrained=True,
+                                  un_adjusted=False, min_age=ADOLESCENT_AGE_MIN, max_age=ADOLESCENT_AGE_MAX, sex='T')
+                v = viewer.to_geodataframe().set_index('zone_id')['adolescent_population']
+                gdf['adolescent_population'] = gdf['tile_id'].map(v.to_dict())
+                logger.info(f"{country}: Patched adolescent_population")
             if 'population' in pop_cols_requested:
                 viewer.map_wp_pop(country=country, resolution=100)
                 v = viewer.to_geodataframe().set_index('zone_id')['population']
@@ -2097,10 +2106,15 @@ def create_admin_country_layer(country, rewrite=0):
     tiles_viewer.map_wp_pop(
         country=country,
         resolution=WORLDPOP_RESOLUTION_LOW,
-        output_column="under_18_population",
-        under_18=True,
+        output_column="adolescent_population",
+        school_age=False,
         project="age_structures",
+        release="GR2",
+        constrained=True,
         un_adjusted=False,
+        min_age=ADOLESCENT_AGE_MIN,
+        max_age=ADOLESCENT_AGE_MAX,
+        sex='T',
     )
     tiles_viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW)
 
@@ -2245,8 +2259,8 @@ def save_tracks_view(gdf, country, storm, date, wind_th):
 # =============================================================================
 # CCI CALCULATION
 # =============================================================================
-cci_cols = ['CCI_children', 'CCI_pop', 'CCI_school_age', 'CCI_infants', 'CCI_under_18',
-            'E_CCI_children', 'E_CCI_pop', 'E_CCI_school_age', 'E_CCI_infants', 'E_CCI_under_18']
+cci_cols = ['CCI_children', 'CCI_pop', 'CCI_school_age', 'CCI_infants', 'CCI_adolescents',
+            'E_CCI_children', 'E_CCI_pop', 'E_CCI_school_age', 'E_CCI_infants', 'E_CCI_adolescents']
 
 
 def calculate_ccis(wind_tiles_views, gdf_tiles):
@@ -2295,7 +2309,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     k = len(sorted_wind_views_indexed)
     gdf_tiles_index = gdf_tiles.rename(columns={'tile_id':'zone_id'}).set_index('zone_id')
     # Ensure all expected population columns are present (old tile files may be missing new columns)
-    for pop_col in ['school_age_population', 'infant_population', 'under_18_population', 'population']:
+    for pop_col in ['school_age_population', 'infant_population', 'adolescent_population', 'population']:
         if pop_col not in gdf_tiles_index.columns:
             logger.warning(f"Column '{pop_col}' missing from tile data — CCI_{pop_col} will be NaN (re-initialize country)")
             gdf_tiles_index[pop_col] = np.nan
@@ -2370,24 +2384,24 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     # under-18 cci
     for i in range(k-1):
         wind = winds[i]
-        cci_tiles_view[f"{wind}"] = (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
+        cci_tiles_view[f"{wind}"] = (gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
-    cci_tiles_view[f"{wind}"] = (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
+    cci_tiles_view[f"{wind}"] = (gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER
              for col in cci_tiles_view.columns if col not in cci_cols]
-    cci_tiles_view['CCI_under_18'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18']]
+    cci_tiles_view['CCI_adolescents'] = sum(wcols)
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_adolescents']]
 
     # under-18 e cci
     for i in range(k-1):
         wind = winds[i]
-        cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_under_18_population']) - (sorted_wind_views_indexed[i+1]['E_under_18_population'])
+        cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_adolescent_population']) - (sorted_wind_views_indexed[i+1]['E_adolescent_population'])
     wind = winds[-1]
-    cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_under_18_population'])
+    cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_adolescent_population'])
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER
              for col in cci_tiles_view.columns if col not in cci_cols]
-    cci_tiles_view['E_CCI_under_18'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18']]
+    cci_tiles_view['E_CCI_adolescents'] = sum(wcols)
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_adolescents','E_CCI_adolescents']]
 
     # pop cci
     for i in range(k-1):
@@ -2398,7 +2412,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_pop'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18','CCI_pop']]
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_adolescents','E_CCI_adolescents','CCI_pop']]
 
     # pop e cci
     for i in range(k-1):
@@ -2409,7 +2423,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_pop'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18','CCI_pop','E_CCI_pop']]
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_adolescents','E_CCI_adolescents','CCI_pop','E_CCI_pop']]
     cci_tiles_view = cci_tiles_view.reset_index()
     
     # Ensure the index column is named 'zone_id'

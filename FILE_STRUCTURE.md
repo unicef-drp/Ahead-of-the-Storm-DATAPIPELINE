@@ -21,7 +21,7 @@ The pipeline uses environment variables to configure base directories:
 - **Example:** `geodb/aos_views/mercator_views/DOM_14.parquet`
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** Mercator tiles at specified zoom level with:
-  - Population data (WorldPop): `population`, `school_age_population`, `infant_population`, `under_18_population`
+  - Population data (WorldPop): `population`, `school_age_population`, `infant_population`, `adolescent_population`
   - Built surface area (GHSL): `built_surface_m2`
   - Settlement classification (SMOD): `smod_class` (L2 raw), `smod_class_l1` (derived 3-class)
   - Relative Wealth Index: `rwi`
@@ -35,7 +35,7 @@ The pipeline uses environment variables to configure base directories:
 - **Example:** `geodb/aos_views/admin_views/DOM_admin1.parquet`
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** Administrative level 1 boundaries with aggregated:
-  - Population totals: `population`, `school_age_population`, `infant_population`, `under_18_population`
+  - Population totals: `population`, `school_age_population`, `infant_population`, `adolescent_population`
   - Built surface total: `built_surface_m2`
   - Facility counts: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Average wealth/settlement: `rwi`, `smod_class`, `smod_class_l1`
@@ -118,7 +118,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Example:** `geodb/aos_views/mercator_views/DOM_LORENZO_20251015120000_34_14.csv`
 - **Format:** CSV (DataFrame, no geometry)
 - **Content:** Expected impact values per tile:
-  - `E_population`, `E_school_age_population`, `E_infant_population`, `E_under_18_population`
+  - `E_population`, `E_school_age_population`, `E_infant_population`, `E_adolescent_population`
   - `E_built_surface_m2`
   - `E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`
   - `E_rwi`, `E_smod_class`, `E_smod_class_l1`
@@ -134,7 +134,7 @@ For each storm/forecast combination processed, the following files are created:
   - `CCI_children`, `E_CCI_children`
   - `CCI_school_age`, `E_CCI_school_age`
   - `CCI_infants`, `E_CCI_infants`
-  - `CCI_under_18`, `E_CCI_under_18`
+  - `CCI_adolescent`, `E_CCI_adolescent`
   - `CCI_pop`, `E_CCI_pop`
 - **Created by:** `save_cci_tiles()`
 - **Note:** One file per storm (aggregates all wind thresholds)
@@ -144,7 +144,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_34_admin1.csv`
 - **Format:** CSV (DataFrame, no geometry)
 - **Content:** Expected impact values aggregated by admin level 1:
-  - `E_population`, `E_school_age_population`, `E_infant_population`, `E_under_18_population`
+  - `E_population`, `E_school_age_population`, `E_infant_population`, `E_adolescent_population`
   - `E_built_surface_m2`
   - `E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`
   - `E_rwi`, `E_smod_class`, `E_smod_class_l1`
@@ -214,25 +214,25 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 ### 18. WorldPop Population Data
 - **Source:** WorldPop API (GR2, year=2025)
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** giga-spatial local cache only — not on stage
-- **Stored in mercator parquet as:** `population` (1km res, sum per tile), `school_age_population`, `infant_population`, `under_18_population` (all 100m res, sum per tile)
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store (local filesystem or Snowflake stage). On first init for a country all 62 age-band files (~175 MB) are downloaded and cached; subsequent runs reuse the cache.
+- **Stored in mercator parquet as:** `population` (100m res, sum per tile), `school_age_population`, `infant_population`, `adolescent_population` (all 100m res, sum per tile)
 
 ### 19. GHSL Built Surface Data
 - **Source:** Global Human Settlement Layer (GHSL), year=2020, 100m resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** giga-spatial local cache only — not on stage
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `built_surface_m2` (sum per tile)
 
 ### 20. SMOD Settlement Classification Data
 - **Source:** GHSL Settlement Model (SMOD), year=2020, 1km resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** giga-spatial local cache only — not on stage
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `smod_class` (raw L2 median per tile, values 10–30) and `smod_class_l1` (derived 3-class: 1=rural, 2=suburban, 3=urban)
 
 ### 21. Relative Wealth Index (RWI) Data
 - **Source:** Facebook/Meta RWI dataset via HDX
 - **Downloaded by:** `RWIHandler` (giga-spatial internal)
-- **Raw cache:** giga-spatial local cache only — not on stage
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `rwi` (mean per tile)
 - **Note:** Not available for all countries. Tiles will have NaN for `rwi` where data is unavailable — no error raised.
 

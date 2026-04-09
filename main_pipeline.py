@@ -13,7 +13,7 @@ Key Features:
   impact views at 8 wind thresholds (34–137 kt) plus JSON reports and CCI values
 - patch: backfills specific columns in existing mercator parquets without full
   re-initialization (supported: population, school_age_population, infant_population,
-  under_18_population, built_surface_m2, smod_class, smod_class_l1, rwi,
+  adolescent_population, built_surface_m2, smod_class, smod_class_l1, rwi,
   schools, hcs, shelters, wash)
 
 - Custom data overrides: place a CSV in geodb/custom/ to replace any API or raster source
@@ -410,7 +410,7 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
     - Re-runs raster processing for any columns without a custom CSV
     - Re-derives smod_class_l1 whenever smod_class is patched
 
-    Supported columns: population, school_age_population, infant_population, under_18_population,
+    Supported columns: population, school_age_population, infant_population, adolescent_population,
     built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash
 
     Args:
@@ -637,7 +637,7 @@ def main():
     python main_pipeline.py --type patch --countries PNG --columns built_surface_m2 rwi
 
     # Update population data when a new WorldPop dataset is available
-    python main_pipeline.py --type patch --countries PNG --columns population under_18_population
+    python main_pipeline.py --type patch --countries PNG --columns population adolescent_population
     """
     )
     
@@ -663,7 +663,7 @@ def main():
         default=None,
         help=(
             "Columns to patch (only used with --type patch). "
-            "Supported: population, school_age_population, infant_population, under_18_population, "
+            "Supported: population, school_age_population, infant_population, adolescent_population, "
             "built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash. "
             "Example: --columns built_surface_m2 rwi"
         )

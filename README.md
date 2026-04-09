@@ -76,7 +76,7 @@ python main_pipeline.py --type initialize
 **What it does:**
 - Creates mercator tiles for each country at specified zoom level
 - Creates admin level 1 views for each country
-- Downloads and aggregates demographic data (WorldPop: total population, school-age, infants, under-18)
+- Downloads and aggregates demographic data (WorldPop: total population, school-age, infants, adolescent (15–19y))
 - Downloads and aggregates infrastructure data (GHSL built surface, SMOD settlement)
 - Fetches school locations (via GIGA API)
 - Fetches health center locations (via HealthSites API)
@@ -195,7 +195,7 @@ Backfills one or more optional columns in existing mercator and admin parquets w
 python main_pipeline.py --type patch --countries PNG --columns shelters wash
 ```
 
-**Supported columns:** `population`, `school_age_population`, `infant_population`, `under_18_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`
+**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`
 
 **Notes:**
 - Patching any column updates both the mercator parquet and the admin parquet (re-aggregated automatically)

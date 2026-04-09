@@ -90,16 +90,16 @@ logger = logging.getLogger(__name__)
 # Used for validation to ensure all required fields are present
 REPORT_TEMPLATE = {
     'storm': '', 'forecast_date': '', 'expected_landfall': '', 'storm_category': '', 'country': '',
-    'expected_children': 0, 'expected_school_age': 0, 'expected_infants': 0, 'expected_under_18': 0,
+    'expected_children': 0, 'expected_school_age': 0, 'expected_infants': 0, 'expected_adolescent': 0,
     'expected_schools': 0, 'expected_hcs': 0, 'expected_shelters': 0, 'expected_wash': 0,
     'children_change_direction': '', 'children_change': 0, 'children_change_perc': 0,
-    'rows_admins_pop_total': [], 'rows_admins_school': [], 'rows_admins_infant': [], 'rows_admins_under_18': [],
+    'rows_admins_pop_total': [], 'rows_admins_school': [], 'rows_admins_infant': [], 'rows_admins_adolescent': [],
     'rows_schools_winds': [], 'rows_hcs_winds': [], 'rows_shelters_winds': [], 'rows_wash_winds': [],
-    'expected_pop': 0, 'expected_cci_pop': 0, 'expected_cci_school': 0, 'expected_cci_infant': 0, 'expected_cci_under_18': 0,
+    'expected_pop': 0, 'expected_cci_pop': 0, 'expected_cci_school': 0, 'expected_cci_infant': 0, 'expected_cci_adolescent': 0,
     'expected_pop_poverty': 0, 'expected_pop_severe': 0, 'expected_pop_urban': 0, 'expected_pop_rural': 0,
     'expected_school_poverty': 0, 'expected_school_severe': 0, 'expected_school_urban': 0, 'expected_school_rural': 0,
     'expected_infant_poverty': 0, 'expected_infant_severe': 0, 'expected_infant_urban': 0, 'expected_infant_rural': 0,
-    'expected_under_18_poverty': 0, 'expected_under_18_severe': 0, 'expected_under_18_urban': 0, 'expected_under_18_rural': 0,
+    'expected_adolescent_poverty': 0, 'expected_adolescent_severe': 0, 'expected_adolescent_urban': 0, 'expected_adolescent_rural': 0,
     'next_forecast_date': '', 'report_date': ''
 }
 
@@ -109,7 +109,7 @@ for wind in STORM_CATEGORIES.keys():
         f'expected_children_{wind}': 0, f'change_children_{wind}': '',
         f'expected_school_{wind}': 0, f'change_school_{wind}': '',
         f'expected_infant_{wind}': 0, f'change_infant_{wind}': '',
-        f'expected_under_18_{wind}': 0,
+        f'expected_adolescent_{wind}': 0,
         f'expected_pop_{wind}': 0,
         f'expected_schools_{wind}': 0, f'change_schools_{wind}': '',
         f'expected_hcs_{wind}': 0, f'change_hcs_{wind}': '',
@@ -381,11 +381,11 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
         'expected_pop_urban': 0, 'expected_pop_rural': 0,
         'expected_school_urban': 0, 'expected_school_rural': 0,
         'expected_infant_urban': 0, 'expected_infant_rural': 0,
-        'expected_under_18_urban': 0, 'expected_under_18_rural': 0,
+        'expected_adolescent_urban': 0, 'expected_adolescent_rural': 0,
         'expected_pop_poverty': 0, 'expected_pop_severe': 0,
         'expected_school_poverty': 0, 'expected_school_severe': 0,
         'expected_infant_poverty': 0, 'expected_infant_severe': 0,
-        'expected_under_18_poverty': 0, 'expected_under_18_severe': 0,
+        'expected_adolescent_poverty': 0, 'expected_adolescent_severe': 0,
     }
     
     # Urban/Rural classification based on SMOD
@@ -406,13 +406,13 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
                 result['expected_pop_urban'] = int(urban_tiles['E_population'].sum())
                 result['expected_school_urban'] = int(urban_tiles['E_school_age_population'].sum())
                 result['expected_infant_urban'] = int(urban_tiles['E_infant_population'].sum())
-                result['expected_under_18_urban'] = int(urban_tiles['E_under_18_population'].sum())
+                result['expected_adolescent_urban'] = int(urban_tiles['E_adolescent_population'].sum())
             
             if not rural_tiles.empty:
                 result['expected_pop_rural'] = int(rural_tiles['E_population'].sum())
                 result['expected_school_rural'] = int(rural_tiles['E_school_age_population'].sum())
                 result['expected_infant_rural'] = int(rural_tiles['E_infant_population'].sum())
-                result['expected_under_18_rural'] = int(rural_tiles['E_under_18_population'].sum())
+                result['expected_adolescent_rural'] = int(rural_tiles['E_adolescent_population'].sum())
     
     # Poverty/Severe classification based on RWI
     tiles_rwi = tiles_df.dropna(subset=['E_rwi'])
@@ -431,13 +431,13 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
                 result['expected_pop_poverty'] = int(poverty_tiles['E_population'].sum())
                 result['expected_school_poverty'] = int(poverty_tiles['E_school_age_population'].sum())
                 result['expected_infant_poverty'] = int(poverty_tiles['E_infant_population'].sum())
-                result['expected_under_18_poverty'] = int(poverty_tiles['E_under_18_population'].sum())
+                result['expected_adolescent_poverty'] = int(poverty_tiles['E_adolescent_population'].sum())
             
             if not severe_tiles.empty:
                 result['expected_pop_severe'] = int(severe_tiles['E_population'].sum())
                 result['expected_school_severe'] = int(severe_tiles['E_school_age_population'].sum())
                 result['expected_infant_severe'] = int(severe_tiles['E_infant_population'].sum())
-                result['expected_under_18_severe'] = int(severe_tiles['E_under_18_population'].sum())
+                result['expected_adolescent_severe'] = int(severe_tiles['E_adolescent_population'].sum())
     
     return result
 
@@ -465,7 +465,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
     rows_admins_pop_total = []
     rows_admins_school = []
     rows_admins_infant = []
-    rows_admins_under_18 = []
+    rows_admins_adolescent = []
     rows_schools_winds = []
     rows_hcs_winds = []
     rows_shelters_winds = []
@@ -479,7 +479,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         d_rows_admins_pop_total = {'name': admin_name}
         d_rows_admins_school = {'name': admin_name}
         d_rows_admins_infant = {'name': admin_name}
-        d_rows_admins_under_18 = {'name': admin_name}
+        d_rows_admins_adolescent = {'name': admin_name}
         d_rows_schools_winds = {'name': admin_name}
         d_rows_hcs_winds = {'name': admin_name}
         d_rows_shelters_winds = {'name': admin_name}
@@ -492,7 +492,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_pop_total[f"{wind}"] = 0
                 d_rows_admins_school[f"{wind}"] = 0
                 d_rows_admins_infant[f"{wind}"] = 0
-                d_rows_admins_under_18[f"{wind}"] = 0
+                d_rows_admins_adolescent[f"{wind}"] = 0
                 d_rows_schools_winds[f"{wind}"] = 0
                 d_rows_hcs_winds[f"{wind}"] = 0
                 d_rows_shelters_winds[f"{wind}"] = 0
@@ -503,7 +503,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_pop_total[f"{wind}"] = int(admin_view['E_population'].sum())
                 d_rows_admins_school[f"{wind}"] = int(admin_view['E_school_age_population'].sum())
                 d_rows_admins_infant[f"{wind}"] = int(admin_view['E_infant_population'].sum())
-                d_rows_admins_under_18[f"{wind}"] = int(admin_view['E_under_18_population'].sum())
+                d_rows_admins_adolescent[f"{wind}"] = int(admin_view['E_adolescent_population'].sum())
                 d_rows_schools_winds[f"{wind}"] = int(admin_view['E_num_schools'].sum())
                 d_rows_hcs_winds[f"{wind}"] = int(admin_view['E_num_hcs'].sum())
                 # Guard against older parquets that pre-date shelters/WASH columns
@@ -533,12 +533,12 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         d_rows_admins_pop_total["cci"] = int(admin_cci['E_CCI_pop'].sum())
         d_rows_admins_school["cci"] = int(admin_cci['E_CCI_school_age'].sum())
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())
-        d_rows_admins_under_18["cci"] = int(admin_cci['E_CCI_under_18'].sum())
+        d_rows_admins_adolescent["cci"] = int(admin_cci['E_CCI_adolescent'].sum())
 
         rows_admins_pop_total.append(d_rows_admins_pop_total)
         rows_admins_school.append(d_rows_admins_school)
         rows_admins_infant.append(d_rows_admins_infant)
-        rows_admins_under_18.append(d_rows_admins_under_18)
+        rows_admins_adolescent.append(d_rows_admins_adolescent)
         rows_schools_winds.append(d_rows_schools_winds)
         rows_hcs_winds.append(d_rows_hcs_winds)
         rows_shelters_winds.append(d_rows_shelters_winds)
@@ -548,7 +548,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         'rows_admins_pop_total': rows_admins_pop_total,
         'rows_admins_school': rows_admins_school,
         'rows_admins_infant': rows_admins_infant,
-        'rows_admins_under_18': rows_admins_under_18,
+        'rows_admins_adolescent': rows_admins_adolescent,
         'rows_schools_winds': rows_schools_winds,
         'rows_hcs_winds': rows_hcs_winds,
         'rows_shelters_winds': rows_shelters_winds,
@@ -624,7 +624,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     expected_tiles = wind_tiles_views[expected_wind]
     d['expected_school_age'] = int(expected_tiles['E_school_age_population'].sum())
     d['expected_infants'] = int(expected_tiles['E_infant_population'].sum())
-    d['expected_under_18'] = int(expected_tiles['E_under_18_population'].sum())
+    d['expected_adolescent'] = int(expected_tiles['E_adolescent_population'].sum())
     d['expected_children'] = int(d['expected_school_age'] + d['expected_infants'])
     d['expected_pop'] = int(expected_tiles['E_population'].sum())
     d['expected_schools'] = int(expected_tiles['E_num_schools'].sum())
@@ -634,7 +634,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     d['expected_cci_pop'] = int(cci_tiles_view['E_CCI_pop'].sum())
     d['expected_cci_school'] = int(cci_tiles_view['E_CCI_school_age'].sum())
     d['expected_cci_infant'] = int(cci_tiles_view['E_CCI_infants'].sum())
-    d['expected_cci_under_18'] = int(cci_tiles_view['E_CCI_under_18'].sum())
+    d['expected_cci_adolescent'] = int(cci_tiles_view['E_CCI_adolescent'].sum())
     
     # Calculate children change from previous forecast
     children_change = _calculate_children_change(d['expected_children'], d_previous)
@@ -649,7 +649,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         d[f"expected_pop_{wind}"] = int(wind_tiles['E_population'].sum())
         d[f"expected_school_{wind}"] = int(wind_tiles['E_school_age_population'].sum())
         d[f"expected_infant_{wind}"] = int(wind_tiles['E_infant_population'].sum())
-        d[f"expected_under_18_{wind}"] = int(wind_tiles['E_under_18_population'].sum())
+        d[f"expected_adolescent_{wind}"] = int(wind_tiles['E_adolescent_population'].sum())
         d[f"expected_children_{wind}"] = int(d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"])
         d[f"expected_schools_{wind}"] = int(wind_tiles['E_num_schools'].sum())
         d[f"expected_hcs_{wind}"] = int(wind_tiles['E_num_hcs'].sum())

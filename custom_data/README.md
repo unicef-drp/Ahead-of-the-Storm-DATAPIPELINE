@@ -167,7 +167,7 @@ at the specified zoom level for the country boundary.
 | `population` | Yes | float | Total population (sum within tile) |
 | `school_age_population` | Yes | float | School-age population (sum within tile) |
 | `infant_population` | Yes | float | Infant population 0–4 years (sum within tile) |
-| `under_18_population` | Yes | float | Under-18 population (sum within tile) |
+| `adolescent_population` | Yes | float | Adolescent population 15–19y (sum within tile) |
 
 All four population columns are required together — they are hard requirements for the pipeline.
 Use `NaN` for tiles with no data (e.g. ocean tiles).
