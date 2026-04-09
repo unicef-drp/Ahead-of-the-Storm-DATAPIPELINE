@@ -13,12 +13,8 @@ snowflake-connector-python[pandas]>=3.0.0
 # Environment management
 python-dotenv>=1.0.0
 
-# Azure Blob Storage (for GigaSpatial)
-azure-storage-blob>=12.0.0
-
 # GigaSpatial platform integration
-giga-spatial>=0.7.4
-# pip install giga-spatial
+giga-spatial[all]>=0.9.2
 psutil>=5.9.0
 
 # Optional: Unit parsing with improved disambiguation (reduces warnings)

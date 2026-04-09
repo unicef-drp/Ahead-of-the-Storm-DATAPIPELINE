@@ -9,6 +9,7 @@ __pycache__/
 *.json
 *.xml
 *.csv
+!custom_data/*.csv
 *.zip
 *.nc
 *.kmz
@@ -34,3 +35,4 @@ download_tracks.py
 snowflake/data_sharing/
 download_tc_tracks.py
 geosight/
+test-scripts/

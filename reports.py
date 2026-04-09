@@ -11,7 +11,7 @@ Key Features:
 - Calculates changes from previous forecast times
 - Includes vulnerability metrics (poverty, severity, urban/rural)
 - Provides administrative-level impact breakdowns
-- Tracks top at-risk facilities (schools and health centers)
+- Tracks top at-risk facilities (schools, health centers, shelters, WASH)
 """
 
 import os
@@ -49,7 +49,7 @@ STORM_CATEGORIES = {
 }
 
 # Configuration constants
-KEY_FOR_EXPECTED = 34  # Wind threshold used for "expected" impact calculations
+KEY_FOR_EXPECTED = 50  # Wind threshold used for "expected" impact calculations
 SEVERE_RWI_THRESHOLD = -1.0  # RWI threshold for severe poverty
 POVERTY_RWI_THRESHOLD = -0.5  # RWI threshold for poverty
 URBAN_SMOD_THRESHOLD = 20  # SMOD threshold for urban classification
@@ -90,15 +90,16 @@ logger = logging.getLogger(__name__)
 # Used for validation to ensure all required fields are present
 REPORT_TEMPLATE = {
     'storm': '', 'forecast_date': '', 'expected_landfall': '', 'storm_category': '', 'country': '',
-    'expected_children': 0, 'expected_school_age': 0, 'expected_infants': 0,
-    'expected_schools': 0, 'expected_hcs': 0,
+    'expected_children': 0, 'expected_school_age': 0, 'expected_infants': 0, 'expected_under_18': 0,
+    'expected_schools': 0, 'expected_hcs': 0, 'expected_shelters': 0, 'expected_wash': 0,
     'children_change_direction': '', 'children_change': 0, 'children_change_perc': 0,
-    'rows_admins_pop_total': [], 'rows_admins_school': [], 'rows_admins_infant': [],
-    'rows_schools_winds': [], 'rows_hcs_winds': [],
-    'expected_pop': 0, 'expected_cci_pop': 0, 'expected_cci_school': 0, 'expected_cci_infant': 0,
+    'rows_admins_pop_total': [], 'rows_admins_school': [], 'rows_admins_infant': [], 'rows_admins_under_18': [],
+    'rows_schools_winds': [], 'rows_hcs_winds': [], 'rows_shelters_winds': [], 'rows_wash_winds': [],
+    'expected_pop': 0, 'expected_cci_pop': 0, 'expected_cci_school': 0, 'expected_cci_infant': 0, 'expected_cci_under_18': 0,
     'expected_pop_poverty': 0, 'expected_pop_severe': 0, 'expected_pop_urban': 0, 'expected_pop_rural': 0,
     'expected_school_poverty': 0, 'expected_school_severe': 0, 'expected_school_urban': 0, 'expected_school_rural': 0,
     'expected_infant_poverty': 0, 'expected_infant_severe': 0, 'expected_infant_urban': 0, 'expected_infant_rural': 0,
+    'expected_under_18_poverty': 0, 'expected_under_18_severe': 0, 'expected_under_18_urban': 0, 'expected_under_18_rural': 0,
     'next_forecast_date': '', 'report_date': ''
 }
 
@@ -108,16 +109,21 @@ for wind in STORM_CATEGORIES.keys():
         f'expected_children_{wind}': 0, f'change_children_{wind}': '',
         f'expected_school_{wind}': 0, f'change_school_{wind}': '',
         f'expected_infant_{wind}': 0, f'change_infant_{wind}': '',
+        f'expected_under_18_{wind}': 0,
         f'expected_pop_{wind}': 0,
         f'expected_schools_{wind}': 0, f'change_schools_{wind}': '',
-        f'expected_hcs_{wind}': 0, f'change_hcs_{wind}': ''
+        f'expected_hcs_{wind}': 0, f'change_hcs_{wind}': '',
+        f'expected_shelters_{wind}': 0, f'change_shelters_{wind}': '',
+        f'expected_wash_{wind}': 0, f'change_wash_{wind}': ''
     })
 
 # Add top facilities keys
 for i in range(1, TOP_FACILITIES_COUNT + 1):
     REPORT_TEMPLATE.update({
         f'school_name_{i}': '', f'school_edulevel_{i}': '', f'school_prob_{i}': 0,
-        f'hc_name_{i}': '', f'hc_type_{i}': '', f'hc_prob_{i}': 0
+        f'hc_name_{i}': '', f'hc_type_{i}': '', f'hc_prob_{i}': 0,
+        f'shelter_name_{i}': '', f'shelter_type_{i}': '', f'shelter_prob_{i}': 0,
+        f'wash_name_{i}': '', f'wash_type_{i}': '', f'wash_prob_{i}': 0
     })
 
 
@@ -375,9 +381,11 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
         'expected_pop_urban': 0, 'expected_pop_rural': 0,
         'expected_school_urban': 0, 'expected_school_rural': 0,
         'expected_infant_urban': 0, 'expected_infant_rural': 0,
+        'expected_under_18_urban': 0, 'expected_under_18_rural': 0,
         'expected_pop_poverty': 0, 'expected_pop_severe': 0,
         'expected_school_poverty': 0, 'expected_school_severe': 0,
-        'expected_infant_poverty': 0, 'expected_infant_severe': 0
+        'expected_infant_poverty': 0, 'expected_infant_severe': 0,
+        'expected_under_18_poverty': 0, 'expected_under_18_severe': 0,
     }
     
     # Urban/Rural classification based on SMOD
@@ -398,11 +406,13 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
                 result['expected_pop_urban'] = int(urban_tiles['E_population'].sum())
                 result['expected_school_urban'] = int(urban_tiles['E_school_age_population'].sum())
                 result['expected_infant_urban'] = int(urban_tiles['E_infant_population'].sum())
+                result['expected_under_18_urban'] = int(urban_tiles['E_under_18_population'].sum())
             
             if not rural_tiles.empty:
                 result['expected_pop_rural'] = int(rural_tiles['E_population'].sum())
                 result['expected_school_rural'] = int(rural_tiles['E_school_age_population'].sum())
                 result['expected_infant_rural'] = int(rural_tiles['E_infant_population'].sum())
+                result['expected_under_18_rural'] = int(rural_tiles['E_under_18_population'].sum())
     
     # Poverty/Severe classification based on RWI
     tiles_rwi = tiles_df.dropna(subset=['E_rwi'])
@@ -421,11 +431,13 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
                 result['expected_pop_poverty'] = int(poverty_tiles['E_population'].sum())
                 result['expected_school_poverty'] = int(poverty_tiles['E_school_age_population'].sum())
                 result['expected_infant_poverty'] = int(poverty_tiles['E_infant_population'].sum())
+                result['expected_under_18_poverty'] = int(poverty_tiles['E_under_18_population'].sum())
             
             if not severe_tiles.empty:
                 result['expected_pop_severe'] = int(severe_tiles['E_population'].sum())
                 result['expected_school_severe'] = int(severe_tiles['E_school_age_population'].sum())
                 result['expected_infant_severe'] = int(severe_tiles['E_infant_population'].sum())
+                result['expected_under_18_severe'] = int(severe_tiles['E_under_18_population'].sum())
     
     return result
 
@@ -444,25 +456,35 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
     
     Returns:
         dict: Dictionary with keys 'rows_admins_pop_total', 'rows_admins_school',
-              'rows_admins_infant', 'rows_schools_winds', 'rows_hcs_winds'
+              'rows_admins_infant', 'rows_schools_winds', 'rows_hcs_winds',
+              'rows_shelters_winds', 'rows_wash_winds'.
+              Population rows include 'change_{wind}' keys (vs previous forecast).
+              Facility wind rows (schools, HCs, shelters, WASH) contain counts only — no
+              change tracking at admin level.
     """
     rows_admins_pop_total = []
     rows_admins_school = []
     rows_admins_infant = []
+    rows_admins_under_18 = []
     rows_schools_winds = []
     rows_hcs_winds = []
-    
+    rows_shelters_winds = []
+    rows_wash_winds = []
+
     for i, (_, row) in enumerate(gdf_admin.iterrows()):
         admin_id = row['tile_id']
         admin_name = row['name']
-        
+
         # Initialize row dictionaries
         d_rows_admins_pop_total = {'name': admin_name}
         d_rows_admins_school = {'name': admin_name}
         d_rows_admins_infant = {'name': admin_name}
+        d_rows_admins_under_18 = {'name': admin_name}
         d_rows_schools_winds = {'name': admin_name}
         d_rows_hcs_winds = {'name': admin_name}
-        
+        d_rows_shelters_winds = {'name': admin_name}
+        d_rows_wash_winds = {'name': admin_name}
+
         # Calculate values for each wind threshold
         for wind in STORM_CATEGORIES.keys():
             if wind not in wind_admin_views:
@@ -470,17 +492,24 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_pop_total[f"{wind}"] = 0
                 d_rows_admins_school[f"{wind}"] = 0
                 d_rows_admins_infant[f"{wind}"] = 0
+                d_rows_admins_under_18[f"{wind}"] = 0
                 d_rows_schools_winds[f"{wind}"] = 0
                 d_rows_hcs_winds[f"{wind}"] = 0
+                d_rows_shelters_winds[f"{wind}"] = 0
+                d_rows_wash_winds[f"{wind}"] = 0
             else:
                 # Filter admin view for this admin ID and sum values
                 admin_view = wind_admin_views[wind][wind_admin_views[wind]['tile_id'] == admin_id]
                 d_rows_admins_pop_total[f"{wind}"] = int(admin_view['E_population'].sum())
                 d_rows_admins_school[f"{wind}"] = int(admin_view['E_school_age_population'].sum())
                 d_rows_admins_infant[f"{wind}"] = int(admin_view['E_infant_population'].sum())
+                d_rows_admins_under_18[f"{wind}"] = int(admin_view['E_under_18_population'].sum())
                 d_rows_schools_winds[f"{wind}"] = int(admin_view['E_num_schools'].sum())
                 d_rows_hcs_winds[f"{wind}"] = int(admin_view['E_num_hcs'].sum())
-            
+                # Guard against older parquets that pre-date shelters/WASH columns
+                d_rows_shelters_winds[f"{wind}"] = int(admin_view['E_num_shelters'].sum()) if 'E_num_shelters' in admin_view.columns else 0
+                d_rows_wash_winds[f"{wind}"] = int(admin_view['E_num_wash'].sum()) if 'E_num_wash' in admin_view.columns else 0
+
             # Calculate changes from previous forecast
             if not d_previous:
                 d_rows_admins_pop_total[f"change_{wind}"] = d_rows_admins_pop_total[f"{wind}"]
@@ -490,36 +519,43 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 prev_rows = d_previous.get('rows_admins_pop_total', [])
                 prev_school_rows = d_previous.get('rows_admins_school', [])
                 prev_infant_rows = d_previous.get('rows_admins_infant', [])
-                
+
                 prev_pop = prev_rows[i].get(f"{wind}", 0) if i < len(prev_rows) else 0
                 prev_school = prev_school_rows[i].get(f"{wind}", 0) if i < len(prev_school_rows) else 0
                 prev_infant = prev_infant_rows[i].get(f"{wind}", 0) if i < len(prev_infant_rows) else 0
-                
+
                 d_rows_admins_pop_total[f"change_{wind}"] = d_rows_admins_pop_total[f"{wind}"] - prev_pop
                 d_rows_admins_school[f"change_{wind}"] = d_rows_admins_school[f"{wind}"] - prev_school
                 d_rows_admins_infant[f"change_{wind}"] = d_rows_admins_infant[f"{wind}"] - prev_infant
-        
+
         # Calculate CCI values for this admin
         admin_cci = cci_admin_view[cci_admin_view['tile_id'] == admin_id]
         d_rows_admins_pop_total["cci"] = int(admin_cci['E_CCI_pop'].sum())
         d_rows_admins_school["cci"] = int(admin_cci['E_CCI_school_age'].sum())
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())
-        
+        d_rows_admins_under_18["cci"] = int(admin_cci['E_CCI_under_18'].sum())
+
         rows_admins_pop_total.append(d_rows_admins_pop_total)
         rows_admins_school.append(d_rows_admins_school)
         rows_admins_infant.append(d_rows_admins_infant)
+        rows_admins_under_18.append(d_rows_admins_under_18)
         rows_schools_winds.append(d_rows_schools_winds)
         rows_hcs_winds.append(d_rows_hcs_winds)
-    
+        rows_shelters_winds.append(d_rows_shelters_winds)
+        rows_wash_winds.append(d_rows_wash_winds)
+
     return {
         'rows_admins_pop_total': rows_admins_pop_total,
         'rows_admins_school': rows_admins_school,
         'rows_admins_infant': rows_admins_infant,
+        'rows_admins_under_18': rows_admins_under_18,
         'rows_schools_winds': rows_schools_winds,
-        'rows_hcs_winds': rows_hcs_winds
+        'rows_hcs_winds': rows_hcs_winds,
+        'rows_shelters_winds': rows_shelters_winds,
+        'rows_wash_winds': rows_wash_winds
     }
 
-def do_report(wind_school_views: Dict[int, pd.DataFrame], 
+def do_report(wind_school_views: Dict[int, pd.DataFrame],
               wind_hc_views: Dict[int, pd.DataFrame],
               wind_tiles_views: Dict[int, pd.DataFrame],
               wind_admin_views: Dict[int, pd.DataFrame],
@@ -527,14 +563,16 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
               cci_admin_view: pd.DataFrame,
               gdf_admin: gpd.GeoDataFrame,
               gdf_tracks: gpd.GeoDataFrame,
-              country: str, storm: str, date: str) -> Dict[str, Any]:
+              country: str, storm: str, date: str,
+              wind_shelter_views: Optional[Dict[int, pd.DataFrame]] = None,
+              wind_wash_views: Optional[Dict[int, pd.DataFrame]] = None) -> Dict[str, Any]:
     """
     Generate comprehensive impact report from analysis views.
-    
+
     This function aggregates impact data across multiple wind thresholds and
     administrative levels, calculates changes from previous forecasts, and
     identifies top at-risk facilities.
-    
+
     Args:
         wind_school_views: Dictionary mapping wind thresholds to school impact views
         wind_hc_views: Dictionary mapping wind thresholds to health center impact views
@@ -547,10 +585,16 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
-    
+        wind_shelter_views: Dictionary mapping wind thresholds to shelter impact views (optional)
+        wind_wash_views: Dictionary mapping wind thresholds to WASH facility impact views (optional)
+
     Returns:
         dict: Comprehensive report dictionary, or empty dict if no impact detected
     """
+    if wind_shelter_views is None:
+        wind_shelter_views = {}
+    if wind_wash_views is None:
+        wind_wash_views = {}
     # Check if there's any impact
     max_wind = _get_max_wind_threshold(wind_admin_views)
     if max_wind == 0:
@@ -580,13 +624,17 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     expected_tiles = wind_tiles_views[expected_wind]
     d['expected_school_age'] = int(expected_tiles['E_school_age_population'].sum())
     d['expected_infants'] = int(expected_tiles['E_infant_population'].sum())
+    d['expected_under_18'] = int(expected_tiles['E_under_18_population'].sum())
     d['expected_children'] = int(d['expected_school_age'] + d['expected_infants'])
     d['expected_pop'] = int(expected_tiles['E_population'].sum())
     d['expected_schools'] = int(expected_tiles['E_num_schools'].sum())
     d['expected_hcs'] = int(expected_tiles['E_num_hcs'].sum())
+    d['expected_shelters'] = int(expected_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in expected_tiles.columns else 0
+    d['expected_wash'] = int(expected_tiles['E_num_wash'].sum()) if 'E_num_wash' in expected_tiles.columns else 0
     d['expected_cci_pop'] = int(cci_tiles_view['E_CCI_pop'].sum())
     d['expected_cci_school'] = int(cci_tiles_view['E_CCI_school_age'].sum())
     d['expected_cci_infant'] = int(cci_tiles_view['E_CCI_infants'].sum())
+    d['expected_cci_under_18'] = int(cci_tiles_view['E_CCI_under_18'].sum())
     
     # Calculate children change from previous forecast
     children_change = _calculate_children_change(d['expected_children'], d_previous)
@@ -601,10 +649,13 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         d[f"expected_pop_{wind}"] = int(wind_tiles['E_population'].sum())
         d[f"expected_school_{wind}"] = int(wind_tiles['E_school_age_population'].sum())
         d[f"expected_infant_{wind}"] = int(wind_tiles['E_infant_population'].sum())
+        d[f"expected_under_18_{wind}"] = int(wind_tiles['E_under_18_population'].sum())
         d[f"expected_children_{wind}"] = int(d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"])
         d[f"expected_schools_{wind}"] = int(wind_tiles['E_num_schools'].sum())
         d[f"expected_hcs_{wind}"] = int(wind_tiles['E_num_hcs'].sum())
-        
+        d[f"expected_shelters_{wind}"] = int(wind_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in wind_tiles.columns else 0
+        d[f"expected_wash_{wind}"] = int(wind_tiles['E_num_wash'].sum()) if 'E_num_wash' in wind_tiles.columns else 0
+
         # Calculate changes from previous forecast
         if not d_previous:
             d[f"change_school_{wind}"] = d[f"expected_school_{wind}"]
@@ -612,12 +663,16 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
             d[f"change_children_{wind}"] = d[f"expected_children_{wind}"]
             d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"]
             d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"]
+            d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"]
+            d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"]
         else:
             d[f"change_school_{wind}"] = d[f"expected_school_{wind}"] - d_previous.get(f"expected_school_{wind}", 0)
             d[f"change_infant_{wind}"] = d[f"expected_infant_{wind}"] - d_previous.get(f"expected_infant_{wind}", 0)
             d[f"change_children_{wind}"] = d[f"expected_children_{wind}"] - d_previous.get(f"expected_children_{wind}", 0)
             d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"] - d_previous.get(f"expected_schools_{wind}", 0)
             d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"] - d_previous.get(f"expected_hcs_{wind}", 0)
+            d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"] - d_previous.get(f"expected_shelters_{wind}", 0)
+            d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"] - d_previous.get(f"expected_wash_{wind}", 0)
     
     # Get top at-risk facilities
     if wind_school_views:
@@ -633,8 +688,24 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         top_hcs = wind_hc_views[expected_wind_hcs].nlargest(TOP_FACILITIES_COUNT, 'probability')
         for i, (_, row) in enumerate(top_hcs.iterrows(), start=1):
             d[f"hc_name_{i}"] = row.get('name', '')
-            d[f"hc_type_{i}"] = row.get('healthcare', '')
+            d[f"hc_type_{i}"] = row.get('amenity', '')  # HealthSites.io uses 'amenity' column
             d[f"hc_prob_{i}"] = float(row.get('probability', 0))
+
+    if wind_shelter_views:
+        expected_wind_shelters = KEY_FOR_EXPECTED if KEY_FOR_EXPECTED in wind_shelter_views else min(wind_shelter_views.keys())
+        top_shelters = wind_shelter_views[expected_wind_shelters].nlargest(TOP_FACILITIES_COUNT, 'probability')
+        for i, (_, row) in enumerate(top_shelters.iterrows(), start=1):
+            d[f"shelter_name_{i}"] = row.get('name', '')
+            d[f"shelter_type_{i}"] = row.get('shelter_type', '')
+            d[f"shelter_prob_{i}"] = float(row.get('probability', 0))
+
+    if wind_wash_views:
+        expected_wind_wash = KEY_FOR_EXPECTED if KEY_FOR_EXPECTED in wind_wash_views else min(wind_wash_views.keys())
+        top_wash = wind_wash_views[expected_wind_wash].nlargest(TOP_FACILITIES_COUNT, 'probability')
+        for i, (_, row) in enumerate(top_wash.iterrows(), start=1):
+            d[f"wash_name_{i}"] = row.get('name', '')
+            d[f"wash_type_{i}"] = row.get('wash_type', '')
+            d[f"wash_prob_{i}"] = float(row.get('probability', 0))
     
     # Calculate vulnerability metrics
     vulnerability_metrics = _calculate_vulnerability_metrics(expected_tiles)
