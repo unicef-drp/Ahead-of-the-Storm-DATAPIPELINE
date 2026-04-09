@@ -165,10 +165,10 @@ sum_cols_cci = [
 BUFFER_DISTANCE_METERS = 150  # Buffer distance for schools and health centers (meters)
 WORLDPOP_RESOLUTION_HIGH = 1000  # High resolution for WorldPop data (meters)
 WORLDPOP_RESOLUTION_LOW = 100  # Low resolution for WorldPop data (meters)
-SCHOOL_AGE_MIN = 5  # Minimum age for school-age population
-SCHOOL_AGE_MAX = 15  # Maximum age for school-age population
-INFANT_AGE_MIN = 0  # Minimum age for infant population
-INFANT_AGE_MAX = 4  # Maximum age for infant population
+SCHOOL_AGE_MIN = 5   # GR2 min_age: picks _05_ (5–9y) and _10_ (10–14y) bands
+SCHOOL_AGE_MAX = 10  # GR2 max_age: picks _05_ (5–9y) and _10_ (10–14y) bands
+INFANT_AGE_MIN = 0   # GR2 min_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
+INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
 
 
@@ -802,27 +802,36 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
             else:
                 raise ValueError(f"{country}: Custom population CSV missing required column '{col}'")
     else:
-        # Map school-age population — hard requirement, raises on failure
+        # Map school-age population (5–14y) — hard requirement, raises on failure
+        # GR2: uses individual 5-year age bands (_05_ = 5–9y, _10_ = 10–14y), sex='T' for combined total
         tiles_viewer.map_wp_pop(
             country=country,
-            resolution=WORLDPOP_RESOLUTION_HIGH,
+            resolution=WORLDPOP_RESOLUTION_LOW,
             output_column="school_age_population",
-            school_age=True,
+            school_age=False,
             project="age_structures",
+            release="GR2",
+            constrained=True,
             un_adjusted=False,
-            sex='F_M'
+            min_age=SCHOOL_AGE_MIN,
+            max_age=SCHOOL_AGE_MAX,
+            sex='T',
         )
-        # Map infant population — hard requirement, raises on failure
+        # Map infant population (0–4y) — hard requirement, raises on failure
+        # GR2: uses individual 5-year age bands (_00_ = 0–12mo, _01_ = 1–4y), sex='T' for combined total
         tiles_viewer.map_wp_pop(
             country=country,
-            resolution=WORLDPOP_RESOLUTION_HIGH,
+            resolution=WORLDPOP_RESOLUTION_LOW,
             output_column="infant_population",
             predicate='centroid_within',
             school_age=False,
             project="age_structures",
+            release="GR2",
+            constrained=True,
             un_adjusted=False,
             min_age=INFANT_AGE_MIN,
-            max_age=INFANT_AGE_MAX
+            max_age=INFANT_AGE_MAX,
+            sex='T',
         )
         # Map under-18 population — hard requirement, raises on failure
         tiles_viewer.map_wp_pop(
@@ -1144,17 +1153,18 @@ def patch_country_layer(country, zoom_level, columns):
         else:
             viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
             if 'school_age_population' in pop_cols_requested:
-                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
-                                  output_column='school_age_population', school_age=True,
-                                  project='age_structures', un_adjusted=False, sex='F_M')
+                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW,
+                                  output_column='school_age_population', school_age=False,
+                                  project='age_structures', release='GR2', constrained=True,
+                                  un_adjusted=False, min_age=SCHOOL_AGE_MIN, max_age=SCHOOL_AGE_MAX, sex='T')
                 v = viewer.to_geodataframe().set_index('zone_id')['school_age_population']
                 gdf['school_age_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched school_age_population")
             if 'infant_population' in pop_cols_requested:
-                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_HIGH,
+                viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW,
                                   output_column='infant_population', predicate='centroid_within',
-                                  school_age=False, project='age_structures', un_adjusted=False,
-                                  min_age=INFANT_AGE_MIN, max_age=INFANT_AGE_MAX)
+                                  school_age=False, project='age_structures', release='GR2', constrained=True,
+                                  un_adjusted=False, min_age=INFANT_AGE_MIN, max_age=INFANT_AGE_MAX, sex='T')
                 v = viewer.to_geodataframe().set_index('zone_id')['infant_population']
                 gdf['infant_population'] = gdf['tile_id'].map(v.to_dict())
                 logger.info(f"{country}: Patched infant_population")
@@ -2059,23 +2069,30 @@ def create_admin_country_layer(country, rewrite=0):
     # Population — hard requirements, raises on failure
     tiles_viewer.map_wp_pop(
         country=country,
-        resolution=WORLDPOP_RESOLUTION_HIGH,
+        resolution=WORLDPOP_RESOLUTION_LOW,
         output_column="school_age_population",
-        school_age=True,
+        school_age=False,
         project="age_structures",
+        release="GR2",
+        constrained=True,
         un_adjusted=False,
-        sex='F_M'
+        min_age=SCHOOL_AGE_MIN,
+        max_age=SCHOOL_AGE_MAX,
+        sex='T',
     )
     tiles_viewer.map_wp_pop(
         country=country,
-        resolution=WORLDPOP_RESOLUTION_HIGH,
+        resolution=WORLDPOP_RESOLUTION_LOW,
         output_column="infant_population",
         predicate='centroid_within',
         school_age=False,
         project="age_structures",
+        release="GR2",
+        constrained=True,
         un_adjusted=False,
         min_age=INFANT_AGE_MIN,
-        max_age=INFANT_AGE_MAX
+        max_age=INFANT_AGE_MAX,
+        sex='T',
     )
     tiles_viewer.map_wp_pop(
         country=country,
