@@ -220,22 +220,24 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | `smod_class` | GHSL SMOD L2 settlement class |
 | `smod_class_l1` | Derived from `smod_class` (always updated together) |
 | `rwi` | HDX Relative Wealth Index |
-| `num_schools` | GIGA school location API |
-| `num_hcs` | HealthSites API |
-| `num_shelters` | OSM Overpass / custom CSV |
-| `num_wash` | OSM Overpass / custom CSV |
+| `schools` | GIGA school location API → updates `num_schools` column |
+| `hcs` | HealthSites API → updates `num_hcs` column |
+| `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
+| `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
 
 **Notes:**
+- `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
+- All patches update both the mercator parquet and the admin parquet (re-aggregated automatically)
 - Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
 - The country must already be initialized (base mercator parquet must exist)
 - Population columns can be patched individually — useful when a new WorldPop dataset is released
 
 **Examples:**
 ```
-# Backfill shelter and WASH counts after adding custom data files
+# Backfill shelter and WASH data after adding custom data files
 Countries: PNG
-Columns: num_shelters num_wash
+Columns: shelters wash
 Zoom Level: 14
 
 # Update wealth and settlement data for all active countries

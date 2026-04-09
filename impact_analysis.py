@@ -1021,9 +1021,11 @@ def patch_country_layer(country, zoom_level, columns):
     Backfill specific columns in an existing base mercator parquet without full re-initialization.
 
     Loads the existing parquet for the country, re-fetches only the requested data sources,
-    merges the new values back, and saves. This is the preferred way to populate NaN columns
-    (e.g. after GHSL/SMOD/RWI data becomes available for a country) without re-downloading
-    population data or re-fetching schools and HCs.
+    merges the new values back, and saves. After saving the mercator parquet, the admin parquet
+    is also re-aggregated so baseline admin-level counts stay in sync.
+
+    This is the preferred way to populate NaN columns (e.g. after GHSL/SMOD/RWI data becomes
+    available for a country) without re-downloading population data or re-fetching schools and HCs.
 
     Supported columns:
         population             — re-runs WorldPop total population (or uses custom population_z<N>.csv)
@@ -1034,10 +1036,10 @@ def patch_country_layer(country, zoom_level, columns):
         smod_class             — re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
         smod_class_l1          — alias for smod_class (both are always updated together)
         rwi                    — re-runs RWI (or uses custom rwi_z<N>.csv)
-        num_schools            — re-fetches school locations and recomputes counts
-        num_hcs                — re-fetches health center locations and recomputes counts
-        num_shelters           — re-fetches shelter locations from OSM or custom CSV and recomputes counts
-        num_wash               — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts
+        schools                — re-fetches school locations and recomputes counts (updates num_schools column)
+        hcs                    — re-fetches health center locations and recomputes counts (updates num_hcs column)
+        shelters               — re-fetches shelter locations from OSM or custom CSV and recomputes counts (updates num_shelters column)
+        wash                   — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts (updates num_wash column)
 
     Population columns are patched individually — use this when a new WorldPop dataset is
     available without needing to re-fetch schools, HCs, or raster data for other columns.
@@ -1057,7 +1059,7 @@ def patch_country_layer(country, zoom_level, columns):
     PATCHABLE = {
         'population', 'school_age_population', 'infant_population', 'under_18_population',
         'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi',
-        'num_schools', 'num_hcs', 'num_shelters', 'num_wash',
+        'schools', 'hcs', 'shelters', 'wash',
     }
     unsupported = set(columns) - PATCHABLE
     if unsupported:
@@ -1165,28 +1167,28 @@ def patch_country_layer(country, zoom_level, columns):
                 gdf['population'] = gdf['tile_id'].map(viewer.view['population'].to_dict())
                 logger.info(f"{country}: Patched population")
 
-    if 'num_schools' in columns:
+    if 'schools' in columns:
         gdf_schools = fetch_schools(country, rewrite=0)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         schools = viewer.map_points(points=gdf_schools)
         gdf['num_schools'] = gdf['tile_id'].map(schools)
         logger.info(f"{country}: Patched num_schools")
 
-    if 'num_hcs' in columns:
+    if 'hcs' in columns:
         gdf_hcs = fetch_health_centers(country, rewrite=0)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         hcs = viewer.map_points(points=gdf_hcs)
         gdf['num_hcs'] = gdf['tile_id'].map(hcs)
         logger.info(f"{country}: Patched num_hcs")
 
-    if 'num_shelters' in columns:
+    if 'shelters' in columns:
         gdf_shelters = fetch_shelters(country, rewrite=0)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         shelters = viewer.map_points(points=gdf_shelters)
         gdf['num_shelters'] = gdf['tile_id'].map(shelters)
         logger.info(f"{country}: Patched num_shelters")
 
-    if 'num_wash' in columns:
+    if 'wash' in columns:
         gdf_wash = fetch_wash(country, rewrite=0)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         wash_pts = viewer.map_points(points=gdf_wash)
@@ -1195,6 +1197,30 @@ def patch_country_layer(country, zoom_level, columns):
 
     write_dataset(gdf, data_store, file_path)
     logger.info(f"{country}: Patch complete — saved updated mercator parquet")
+
+    # Re-aggregate the admin parquet so baseline admin-level counts stay in sync.
+    # Only possible if the mercator parquet has the 'id' column (admin assignment).
+    admin_file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', f"{country}_admin1.parquet")
+    if 'id' not in gdf.columns:
+        logger.warning(f"{country}: Mercator parquet has no 'id' column — skipping admin parquet update "
+                       f"(run --type initialize to add admin assignments)")
+    elif not data_store.file_exists(admin_file_path):
+        logger.warning(f"{country}: No admin parquet found — skipping admin update "
+                       f"(run --type initialize to create it)")
+    else:
+        gdf_admin = read_dataset(data_store, admin_file_path)
+        agg_dict = {col: "sum" for col in sum_cols_admin if col in gdf.columns}
+        agg_dict.update({col: "mean" for col in avg_cols_admin if col in gdf.columns})
+        agg = gdf.groupby("id").agg(agg_dict).reset_index()
+        agg = agg.rename(columns={'id': 'tile_id'})
+        # Restore names and geometries from the existing admin parquet
+        d_name = gdf_admin.set_index('tile_id')['name'].to_dict() if 'name' in gdf_admin.columns else {}
+        d_geo = gdf_admin.set_index('tile_id')['geometry'].to_dict()
+        agg['name'] = agg['tile_id'].map(d_name)
+        agg['geometry'] = agg['tile_id'].map(d_geo)
+        agg = convert_to_geodataframe(agg)
+        save_admin_view(agg, country)
+        logger.info(f"{country}: Updated admin parquet with patched columns")
 
 
 def save_mercator_and_admin_views(countries,zoom_level,rewrite):

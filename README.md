@@ -188,16 +188,18 @@ Impact analysis completed successfully
 
 ## Step 3 (optional): Patch Specific Columns
 
-Backfills one or more optional columns in an existing mercator parquet without re-running full initialization. Useful when a data source becomes available after the country was first initialized (e.g. RWI data, a custom shelter registry).
+Backfills one or more optional columns in existing mercator and admin parquets without re-running full initialization. Useful when a data source becomes available after the country was first initialized (e.g. RWI data, a custom shelter registry).
 
 **Command:**
 ```bash
-python main_pipeline.py --type patch --countries PNG --columns num_shelters num_wash
+python main_pipeline.py --type patch --countries PNG --columns shelters wash
 ```
 
-**Supported columns:** `population`, `school_age_population`, `infant_population`, `under_18_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
+**Supported columns:** `population`, `school_age_population`, `infant_population`, `under_18_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`
 
 **Notes:**
+- Patching any column updates both the mercator parquet and the admin parquet (re-aggregated automatically)
+- `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache (OSM or custom CSV) and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Custom CSVs in `geodb/custom/` take priority over raster/API re-processing in patch mode too
 - Raises an error if no base mercator parquet exists for the country (must initialize first)
@@ -239,7 +241,7 @@ python main_pipeline.py --type update --countries TWN
 python main_pipeline.py --type update --countries TWN --date 2025-11-10 --storm FUNG-WONG
 
 # 4. Backfill optional columns after data becomes available (no full re-init needed)
-python main_pipeline.py --type patch --countries PNG --columns num_shelters num_wash
+python main_pipeline.py --type patch --countries PNG --columns shelters wash
 ```
 
 

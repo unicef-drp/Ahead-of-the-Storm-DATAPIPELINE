@@ -9,7 +9,7 @@ on:
         default: ''
         type: string
       columns:
-        description: 'Space-separated columns to patch (e.g., "num_shelters num_wash" or "built_surface_m2 rwi"). Supported: population, school_age_population, infant_population, under_18_population, built_surface_m2, smod_class, smod_class_l1, rwi, num_schools, num_hcs, num_shelters, num_wash'
+        description: 'Space-separated columns to patch (e.g., "shelters wash" or "built_surface_m2 rwi"). Supported: population, school_age_population, infant_population, under_18_population, built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash'
         required: true
         type: string
       zoom_level:
