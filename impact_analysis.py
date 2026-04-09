@@ -1,24 +1,56 @@
 #!/usr/bin/env python3
 """
-Impact Analysis Script
+Impact Analysis Module
 
-This script performs hurricane impact analysis by reading hurricane envelope data directly 
-from Snowflake and creating impact analysis views for schools, health centers, population, 
-and infrastructure. The analysis uses geospatial intersection calculations to determine 
-potential impacts on critical infrastructure.
+Core geospatial engine for the Ahead of the Storm pipeline. Imported and driven by
+main_pipeline.py — not intended to be run directly.
 
 Key Features:
-- Reads hurricane envelope data directly from Snowflake TC_ENVELOPES_COMBINED table
-- Performs geospatial intersection analysis with infrastructure data
-- Creates impact views for multiple wind speed thresholds
-- Supports multiple countries and flexible storage backends (local/blob)
-- Generates comprehensive impact statistics and visualizations
+- Initialises country base layers: mercator tile grids and admin-level views with
+  population (WorldPop), built surface (GHSL), settlement class (GHSL SMOD), wealth
+  index (HDX RWI), schools (GIGA API), health centers (HealthSites.io), shelters and
+  WASH infrastructure (OSM Overpass)
+- Intersects hurricane wind envelopes with country infrastructure at each wind speed
+  threshold (34–137 kt) to produce per-facility and per-tile impact views
+- Supports custom data overrides: place a CSV in geodb/custom/ to replace any API or
+  raster source for a specific country (never overwritten by the pipeline)
+- Patches specific columns in existing mercator parquets without full re-initialisation
+  (patch_country_layer)
+- Storage-backend agnostic: LOCAL filesystem, Azure Blob (ADLS), or Snowflake internal
+  stage — controlled by DATA_PIPELINE_DB env var
 
-Usage:
-    python impact_analysis.py --storm JERRY --date "20251010000000"
-    python impact_analysis.py --storm JERRY --date "20251010000000" --countries DOM
+Entry points called from main_pipeline.py:
+    create_mercator_country_layer()       -- --type initialize
+    create_admin_country_layer()          -- --type initialize
+    create_views_from_envelopes_in_country()  -- --type update
+    patch_country_layer()                 -- --type patch
+
+Module structure (sections in order):
+    CUSTOM DATA HELPERS             -- _custom_file_path, _load_custom_points_csv,
+                                       _load_custom_tiles_csv
+    DATA FETCHING AND CACHING       -- fetch_schools, fetch_health_centers,
+                                       fetch_shelters, fetch_wash
+    GEOGRAPHIC UTILITIES            -- get_country_boundaries, is_envelope_in_zone
+    BASE LAYER INITIALIZATION       -- create_mercator_country_layer, save_mercator_view,
+                                       admins_overlay, add_admin_ids,
+                                       write_country_boundary, patch_country_layer,
+                                       save_mercator_and_admin_views
+    STORM METADATA                  -- save/load_json_storms, load_mercator_view
+    PER-STORM IMPACT VIEW GENERATION -- create_school/hc/shelter/wash/mercator/admin/
+                                        tracks_view_from_envelopes
+    FACILITY VIEW PERSISTENCE       -- save/load/exist per facility type
+                                       (schools, HCs, shelters, WASH)
+    ADMIN COUNTRY LAYER             -- create_admin_country_layer
+                                       (logically part of base layer init)
+    TILE & STORM VIEW PERSISTENCE   -- save/load for tile views, CCI views,
+                                       admin views, track views
+    CCI CALCULATION                 -- calculate_ccis
+    MAIN IMPACT ANALYSIS            -- create_views_from_envelopes_in_country
+    SNOWFLAKE DATA LOADING          -- load_envelopes_from_snowflake
 """
 
+import io
+import json
 import os
 import sys
 import logging
@@ -62,19 +94,80 @@ from reports import do_report, save_json_report
 # CONSTANTS
 # =============================================================================
 
-# Data column definitions
-data_cols = ['population', 'built_surface_m2', 'num_schools', 'school_age_population', 
-             'infant_population', 'num_hcs', 'rwi', 'smod_class']
-sum_cols = ["E_school_age_population", "E_infant_population", "E_built_surface_m2", 
-            "E_population", "E_num_schools", "E_num_hcs"]
-avg_cols = ["E_smod_class", "E_rwi", "probability"]
-sum_cols_admin = ["school_age_population", "infant_population", "built_surface_m2", 
-                  "population", "num_schools", "num_hcs"]
-avg_cols_admin = ["smod_class", "rwi"]
-sum_cols_cci = ['CCI_children', 'E_CCI_children', 'CCI_school_age', 'E_CCI_school_age', 
-                'CCI_infants', 'E_CCI_infants', 'CCI_pop', 'E_CCI_pop']
-cci_cols = ['CCI_children', 'CCI_pop', 'CCI_school_age', 'CCI_infants', 
-            'E_CCI_children', 'E_CCI_pop', 'E_CCI_school_age', 'E_CCI_infants']
+# Columns stored in every mercator and admin base parquet.
+# sum_cols / avg_cols define how each column is aggregated when computing E_ (expected) values during impact view generation (col * probability). 
+# Counts and populations are summed; continuous indices (RWI, SMOD) are averaged to preserve their meaning.
+
+data_cols = [
+    'population',           # Total population (WorldPop GR2, year=2025, 1km)
+    'school_age_population',# School-age population 5–15 years (WorldPop 100m, age_structures)
+    'infant_population',    # Infant population 0–4 years (WorldPop 100m, age_structures)
+    'under_18_population',  # Under-18 population (WorldPop 100m, age_structures)
+    'built_surface_m2',     # Built surface area in m² (GHSL GHS-BUILT-S)
+    'smod_class',           # Settlement model L2 class 10–30 (GHSL GHS-SMOD)
+    'smod_class_l1',        # Derived L1 class: 1=rural, 2=suburban, 3=urban
+    'rwi',                  # Relative Wealth Index, ~-2.5 to +2.5 (Meta/HDX)
+    'num_schools',          # Number of schools in tile (GIGA API)
+    'num_hcs',              # Number of health centers in tile (HealthSites.io)
+    'num_shelters',         # Number of emergency shelters in tile (OSM social_facility=shelter)
+    'num_wash',             # Number of WASH facilities in tile (OSM amenity/man_made)
+]
+
+# Columns multiplied by probability to produce E_ (expected impact) values per tile.
+# Used in create_mercator_view_from_envelopes and create_admin_view_from_envelopes_new.
+sum_cols = [
+    'E_population',
+    'E_school_age_population',
+    'E_infant_population',
+    'E_under_18_population',
+    'E_built_surface_m2',
+    'E_num_schools',
+    'E_num_hcs',
+    'E_num_shelters',
+    'E_num_wash',
+]
+
+# Continuous index columns — averaged (not summed) when aggregating across tiles.
+avg_cols = [
+    'E_smod_class',     # Expected SMOD L2 class (smod_class * probability)
+    'E_smod_class_l1',  # Expected SMOD L1 class
+    'E_rwi',            # Expected RWI (rwi * probability)
+    'probability',      # Mean ensemble probability across tiles
+]
+
+# Admin-level aggregation: same logic, but operating on already-aggregated tile values.
+sum_cols_admin = [
+    'population',
+    'school_age_population',
+    'infant_population',
+    'under_18_population',
+    'built_surface_m2',
+    'num_schools',
+    'num_hcs',
+    'num_shelters',
+    'num_wash',
+]
+avg_cols_admin = [
+    'smod_class',       # Mean SMOD L2 class across tiles in admin unit
+    'smod_class_l1',    # Mean SMOD L1 class
+    'rwi',              # Mean RWI across tiles in admin unit
+]
+
+# CCI columns written to tile and admin CCI views.
+sum_cols_cci = [
+    'CCI_children',    'E_CCI_children',
+    'CCI_school_age',  'E_CCI_school_age',
+    'CCI_infants',     'E_CCI_infants',
+    'CCI_under_18',    'E_CCI_under_18',
+    'CCI_pop',         'E_CCI_pop',
+]
+cci_cols = [
+    'CCI_children',    'E_CCI_children',
+    'CCI_pop',         'E_CCI_pop',
+    'CCI_school_age',  'E_CCI_school_age',
+    'CCI_infants',     'E_CCI_infants',
+    'CCI_under_18',    'E_CCI_under_18',
+]
 
 # Configuration constants
 BUFFER_DISTANCE_METERS = 150  # Buffer distance for schools and health centers (meters)
@@ -86,10 +179,126 @@ INFANT_AGE_MIN = 0  # Minimum age for infant population
 INFANT_AGE_MAX = 4  # Maximum age for infant population
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
 
+
+#==============================================================================
+# HEALTH FACILITY TYPES
+#==============================================================================
+# Health facility types to include in impact analysis, keyed by OSM/HealthSites column.
+#
+# Format mirrors SHELTER_LOCATION_TYPES and WASH_LOCATION_TYPES: a dict of
+# {column_name: [values]} so additional tag keys (e.g. 'healthcare', 'emergency')
+# can be added alongside 'amenity' without changing the filter logic.
+#
+# The HealthSites.io API (https://healthsites.io/api/v3/) returns an `amenity` column
+# whose documented values are: clinic, doctors, hospital, dentist, pharmacy.
+# Filtering uses the `amenity` column (not `healthcare`).
+#
+# Included:
+#   amenity=hospital  – Inpatient care, typically with emergency department.
+#                       Most critical for mass-casualty and evacuation response.
+#   amenity=clinic    – Outpatient clinics and clinics with beds.
+#                       Primary care backbone in most low/middle-income countries.
+#   amenity=doctors   – Individual practitioner offices (OSM amenity=doctors, plural).
+#                       Lower capacity than clinics but relevant for community-level care.
+#
+# Excluded intentionally:
+#   amenity=dentist   – Specialist care, not relevant to cyclone response.
+#   amenity=pharmacy  – Supply chain node, not direct emergency care delivery.
+#
+# To change the included types, update this dict. The raw (unfiltered) API response
+# is stored in the location cache so changes take effect on the next update run.
+
+HC_FACILITY_TYPES = {
+    'amenity': ['hospital', 'clinic', 'doctors'],
+}
+
+#==============================================================================
+# OSM LOCATION TYPES
+#==============================================================================
+# OSM location types for emergency shelters
+#
+# Queried via OSMLocationFetcher (Overpass API). Only social_facility=shelter is included
+# because it specifically denotes dedicated emergency/disaster shelter facilities in OSM.
+#
+# Included:
+#   social_facility=shelter – Dedicated emergency or disaster relief shelters
+#                             (refugee shelters, evacuation centres, disaster relief sites).
+#                             Tagged on amenity=social_facility nodes/ways in OSM.
+#
+# Excluded intentionally:
+#   amenity=shelter         – Too broad: includes bus stop shelters, hiking shelters,
+#                             picnic shelters, market covers. Not emergency-relevant.
+#   emergency=assembly_point / - Only evacuation_point, e.g. in case of a fire etc.
+#
+
+SHELTER_LOCATION_TYPES = {
+    'social_facility': ['shelter'],
+}
+
+#==============================================================================
+# WASH LOCATION TYPES
+#==============================================================================
+# OSM location types for humanitarian WASH infrastructure
+#
+# Queried via OSMLocationFetcher (Overpass API). Covers the full managed water and
+# sanitation infrastructure chain relevant to cyclone response.
+# Reference: https://wiki.openstreetmap.org/wiki/Humanitarian_OSM_Tags/WASH
+# (HOT wiki documents amenity=water_point and amenity=toilets as primary tags;
+# the man_made=* tags below extend coverage to upstream infrastructure.)
+#
+# Included:
+#   amenity=drinking_water         – Drinking water taps/fountains (public access points)
+#   amenity=water_point            – Water collection points (often in informal settlements)
+#   amenity=toilets                – Public toilets / latrines (core HOT WASH tag)
+#   amenity=shower                 – Public shower facilities (hygiene)
+#   man_made=water_well            – Water wells (managed, hand-pump or motorised)
+#   man_made=water_tap             – Piped water tap stands
+#   man_made=water_works           – Water treatment or pumping plants
+#   man_made=pumping_station       – Water supply pumping stations
+#   man_made=wastewater_treatment_plant – Sanitation infrastructure
+#
+# Excluded intentionally:
+#   natural=spring / natural=water – Natural sources, not managed infrastructure.
+#                                    Reliability after a cyclone is unpredictable.
+#   man_made=storage_tank          – Too broad: includes fuel, agricultural, industrial tanks.
+#
+
+WASH_LOCATION_TYPES = {
+    'amenity': ['drinking_water', 'water_point', 'toilets', 'shower'],
+    'man_made': ['water_well', 'water_tap', 'water_works', 'pumping_station', 'wastewater_treatment_plant'],
+}
+
+#==============================================================================
+# SCHOOL EDUCATION LEVELS
+#==============================================================================
+# School education levels available from the GIGA School Location API
+# (https://uni-ooi-giga-maps-service.azurewebsites.net)
+#
+#   'Pre-Primary'   – Pre-school / kindergarten
+#   'Primary'       – Primary school
+#   'Secondary'     – Secondary / high school
+#   'Unknown'       – Education level not recorded
+# Other values may exist in the API — all are retained regardless.
+
+
+#==============================================================================
+# GHSL SMOD L2→L1 RECLASSIFICATION MAPPING
+#==============================================================================
+# L2 raw values (10-30) → L1 simplified 3-class (1=rural, 2=suburban, 3=urban)
+SMOD_L2_TO_L1 = {
+    10: 1,  # Water → rural
+    11: 1,  # Very low density rural
+    12: 1,  # Low density rural
+    13: 1,  # Rural cluster
+    21: 2,  # Suburban/peri-urban
+    22: 2,  # Semi-dense urban cluster
+    23: 2,  # Dense urban cluster
+    30: 3,  # Urban centre
+}
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
 RESULTS_DIR = config.RESULTS_DIR
 STORMS_FILE = config.STORMS_FILE
 VIEWS_DIR = config.VIEWS_DIR
@@ -98,11 +307,15 @@ ROOT_DATA_DIR = config.ROOT_DATA_DIR
 # =============================================================================
 # DATA STORE INITIALIZATION
 # =============================================================================
-
 # Initialize data store using centralized utility
 # Defaults to LOCAL if DATA_PIPELINE_DB is not set or is LOCAL
 # In production (SPCS), DATA_PIPELINE_DB will be SNOWFLAKE and credentials will be available
 data_store = get_data_store()
+
+# Path for custom data overrides (schools, health centers, pre-aggregated tile values).
+# Same relative path is used across all backends (LOCAL, BLOB, SNOWFLAKE stage).
+# See custom_data/README.md for file formats and upload instructions.
+CUSTOM_DATA_DIR = os.path.join(ROOT_DATA_DIR, 'custom')
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -120,127 +333,372 @@ else:
 
 
 # =============================================================================
-# DATA FETCHING AND CACHING FUNCTIONS
+# CUSTOM DATA HELPERS
 # =============================================================================
-
-def fetch_health_centers(country, rewrite=0):
+def _custom_file_path(country, kind, zoom=None):
     """
-    Fetch health center locations for a country, using cache if available.
-    
-    This function handles fetching health center data from HealthSites API,
-    with automatic caching to avoid redundant API calls. If cached data exists
-    and rewrite=0, the cached version is returned.
-    
+    Return the data store path for a custom data override file.
+
     Args:
         country: ISO3 country code
-        rewrite: If 1, fetch fresh data and update cache; if 0, use cache if available
-    
+        kind: File type identifier — 'schools', 'health_centers', 'shelters', 'wash',
+              'population', 'built_surface', 'smod', or 'rwi'
+        zoom: Zoom level (required for tile-level files; None for point files)
+
     Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing health center locations with geometry.
-                         Returns empty GeoDataFrame if no data is available.
-    
-    Note:
-        Empty GeoDataFrames are returned with proper CRS (EPSG:4326) to ensure
-        compatibility with downstream processing.
+        str: Path relative to the data store root (e.g. 'geodb/custom/PNG_schools.csv')
     """
+    if zoom is not None:
+        filename = f"{country}_{kind}_z{zoom}.csv"
+    else:
+        filename = f"{country}_{kind}.csv"
+    return os.path.join(CUSTOM_DATA_DIR, filename)
+
+
+def _load_custom_points_csv(country, kind):
+    """
+    Load a custom point data CSV (schools or health_centers) from the data store.
+
+    Custom point files must follow the schema in custom_data/README.md. The file is
+    read from the data store at geodb/custom/<COUNTRY>_<kind>.csv. If the file is
+    absent, None is returned and the caller falls back to API fetching. If the file
+    exists but is invalid (missing required columns or unreadable), a ValueError is
+    raised — the pipeline does not silently fall back to the API when a custom file
+    is present.
+
+    The ID column is optional. Accepted names: 'id', 'school_id_giga' (schools),
+    'osm_id' (health_centers, shelters, wash). If none are present, sequential IDs
+    are auto-generated (e.g. 'schools_0', 'schools_1', ...).
+
+    Args:
+        country: ISO3 country code
+        kind: 'schools', 'health_centers', 'shelters', or 'wash'
+
+    Returns:
+        gpd.GeoDataFrame or None: GeoDataFrame with Point geometry (EPSG:4326), or None
+                                   if the custom file does not exist.
+    """
+    # Internal ID column name expected by GeometryBasedZonalViewGenerator calls
+    id_col = 'school_id_giga' if kind == 'schools' else 'osm_id'
+
+    path = _custom_file_path(country, kind)
+    if not data_store.file_exists(path):
+        return None
+    try:
+        raw = data_store.read_file(path)
+        df = pd.read_csv(io.BytesIO(raw))
+        # Required columns (ID is handled separately below)
+        required = {
+            'schools':        ['latitude', 'longitude'],
+            'health_centers': ['latitude', 'longitude', 'amenity'],
+            'shelters':       ['latitude', 'longitude'],
+            'wash':           ['latitude', 'longitude', 'wash_type'],
+        }[kind]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"{country}: Custom {kind} CSV at '{path}' is missing required columns: {missing}. "
+                f"Fix the file or remove it to fall back to API fetching."
+            )
+        # Normalize ID column: accept 'id' as alias for the internal name,
+        # or auto-generate sequential IDs if no ID column is present at all.
+        if id_col not in df.columns:
+            if 'id' in df.columns:
+                df = df.rename(columns={'id': id_col})
+            else:
+                df[id_col] = [f"{kind}_{i}" for i in range(len(df))]
+                logger.info(f"{country}: No ID column in custom {kind} CSV — auto-generated sequential IDs")
+        gdf = gpd.GeoDataFrame(
+            df,
+            geometry=gpd.points_from_xy(df['longitude'], df['latitude']),
+            crs='EPSG:4326'
+        )
+        logger.info(f"{country}: Loaded {len(gdf)} custom {kind} from '{path}' (custom data — API skipped, --rewrite has no effect)")
+        return gdf
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"{country}: Failed to read custom {kind} CSV at '{path}': {e}. "
+            f"Fix the file or remove it to fall back to API fetching."
+        ) from e
+
+
+def _load_custom_tiles_csv(country, kind, zoom):
+    """
+    Load a custom tile-level CSV from the data store and return it as a DataFrame.
+
+    Custom tile files must follow the schema in custom_data/README.md. The tile_id
+    column must contain mercator quadkeys at the specified zoom level matching the
+    country's base mercator parquet. Empty cells are interpreted as NaN.
+
+    Supported kinds and their columns:
+        population:    tile_id, population, school_age_population, infant_population, under_18_population
+        built_surface: tile_id, built_surface_m2
+        smod:          tile_id, smod_class
+        rwi:           tile_id, rwi
+
+    Args:
+        country: ISO3 country code
+        kind: 'population', 'built_surface', 'smod', or 'rwi'
+        zoom: Zoom level (must match country's configured zoom)
+
+    Returns:
+        pd.DataFrame or None: DataFrame with tile_id index and value columns,
+                              or None if the file does not exist. Raises ValueError
+                              if the file exists but is invalid.
+    """
+    path = _custom_file_path(country, kind, zoom)
+    if not data_store.file_exists(path):
+        return None
+    try:
+        raw = data_store.read_file(path)
+        df = pd.read_csv(io.BytesIO(raw), dtype={'tile_id': str})
+        if 'tile_id' not in df.columns:
+            raise ValueError(
+                f"{country}: Custom {kind} CSV at '{path}' is missing required 'tile_id' column. "
+                f"Fix the file or remove it to fall back to raster processing."
+            )
+        logger.info(f"{country}: Loaded custom {kind} (zoom={zoom}) from '{path}' ({len(df)} tiles, custom data — raster processing skipped)")
+        return df.set_index('tile_id')
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"{country}: Failed to read custom {kind} CSV at '{path}': {e}. "
+            f"Fix the file or remove it to fall back to raster processing."
+        ) from e
+
+
+# =============================================================================
+# DATA FETCHING AND CACHING FUNCTIONS
+# =============================================================================
+def fetch_health_centers(country, rewrite=0):
+    """
+    Fetch health center locations for a country, using custom data or cache if available.
+
+    Priority order:
+        1. Custom file at geodb/custom/<COUNTRY>_health_centers.csv — always used if present;
+           --rewrite has no effect on custom data. Custom data is never overwritten.
+        2. Location cache (hc_views/<COUNTRY>_health_centers.parquet) — if rewrite=0.
+        3. HealthSites.io API — fetched if no cache or rewrite=1.
+
+    The cache stores ALL facility types from HealthSites (full OSM healthcare taxonomy).
+    Filtering to HC_FACILITY_TYPES happens at analysis time in
+    create_health_center_view_from_envelopes(), not here. This ensures custom data is
+    filtered consistently and the cache can be reused if filtering changes.
+
+    Cache location:
+        LOCAL/BLOB: geodb/aos_views/hc_views/<COUNTRY>_health_centers.parquet
+        SNOWFLAKE:  AOTS_ANALYSIS stage (PUT during init, GET'd during update)
+
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, re-fetch from API and overwrite cache (ignored if custom file exists);
+                 if 0, use cache if available
+
+    Returns:
+        gpd.GeoDataFrame: All health center locations with geometry (EPSG:4326).
+                         Empty GeoDataFrame if no data is available from any source.
+    """
+    # 1. Custom data takes priority — never overwritten
+    custom_gdf = _load_custom_points_csv(country, 'health_centers')
+    if custom_gdf is not None:
+        save_hc_locations(custom_gdf, country)
+        return custom_gdf
+
+    # 2. Use cache if available and rewrite not requested
     if hc_exist(country) and rewrite == 0:
         return load_hc_locations(country)
-    
+
+    # 3. Fetch from HealthSites.io API
     try:
         gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
         if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
-            logger.warning(f"No health center data available for {country}, skipping...")
+            logger.warning(f"{country}: HealthSites API returned no data")
             return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-        
         gdf_hcs = gdf_hcs.set_crs(4326)
+        logger.info(f"{country}: Fetched {len(gdf_hcs)} health facilities from HealthSites API "
+                    f"(all types cached; filtering to {HC_FACILITY_TYPES} happens at analysis time)")
         save_hc_locations(gdf_hcs, country)
         return gdf_hcs
     except Exception as e:
-        logger.error(f"Error fetching health centers for {country}: {str(e)}")
+        if '403' in str(e):
+            logger.error(f"{country}: HealthSites API returned 403 Forbidden — likely daily rate limit "
+                         f"exceeded (50 requests/day). Run scripts/test_healthsites.py to confirm. "
+                         f"To skip the API, provide a custom file at "
+                         f"geodb/custom/{country}_health_centers.csv (see custom_data/README.md)")
+        else:
+            logger.error(f"{country}: Error fetching health centers from HealthSites API: {e}")
         return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+
 
 def fetch_schools(country, rewrite=0):
     """
-    Fetch school locations for a country from GIGA API, using cache if available.
-    
-    This function handles fetching school data from GIGA API, with automatic caching
-    to avoid redundant API calls. If cached data exists and rewrite=0, the cached
-    version is returned.
-    
+    Fetch school locations for a country using custom data, cache, or GIGA API.
+
+    Priority order:
+        1. Custom file at geodb/custom/<COUNTRY>_schools.csv — always used if present;
+           --rewrite has no effect on custom data. Custom data is never overwritten.
+        2. Location cache (school_views/<COUNTRY>_schools.parquet) — if rewrite=0.
+        3. GIGA school location API — fetched if no cache or rewrite=1.
+
+    All education levels are kept in the cache. The count stored in
+    mercator/admin tiles is num_schools (total across all levels). Education level
+    is not preserved in tile impact files.
+
+    Cache location:
+        LOCAL/BLOB: geodb/aos_views/school_views/<COUNTRY>_schools.parquet
+        SNOWFLAKE:  AOTS_ANALYSIS stage (PUT during init, GET'd during update)
+
     Args:
         country: ISO3 country code
-        rewrite: If 1, fetch fresh data and update cache; if 0, use cache if available
-    
+        rewrite: If 1, re-fetch from GIGA API and overwrite cache (ignored if custom file exists);
+                 if 0, use cache if available
+
     Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing school locations with geometry
-    
-    Note:
-        Handles legacy column name 'giga_id_school' by renaming to 'school_id_giga'.
-        Cached files are stored in the same directory as health center caches.
-        Always returns a GeoDataFrame, even if empty or if API fails.
+        gpd.GeoDataFrame: School locations with geometry (EPSG:4326).
+                         Empty GeoDataFrame if no data available from any source.
     """
+    # 1. Custom data takes priority — never overwritten
+    custom_gdf = _load_custom_points_csv(country, 'schools')
+    if custom_gdf is not None:
+        save_school_locations(custom_gdf, country)
+        return custom_gdf
+
+    # 2. Use cache if available and rewrite not requested
     if school_exist(country) and rewrite == 0:
         gdf_schools = load_school_locations(country)
-        # Validate that loaded data is a GeoDataFrame
         if not isinstance(gdf_schools, gpd.GeoDataFrame):
-            logger.warning(f"Cached school data for {country} is not a GeoDataFrame, converting or returning empty GeoDataFrame")
-            if isinstance(gdf_schools, pd.DataFrame) and not gdf_schools.empty:
-                # Try to convert if it has geometry column
-                if 'geometry' in gdf_schools.columns:
-                    gdf_schools = gpd.GeoDataFrame(gdf_schools, geometry='geometry', crs='EPSG:4326')
-                else:
-                    logger.error(f"Cached school data for {country} has no geometry column, returning empty GeoDataFrame")
-                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+            if isinstance(gdf_schools, pd.DataFrame) and not gdf_schools.empty and 'geometry' in gdf_schools.columns:
+                gdf_schools = gpd.GeoDataFrame(gdf_schools, geometry='geometry', crs='EPSG:4326')
             else:
-                return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-        return gdf_schools
-    
+                logger.warning(f"{country}: Cached school data invalid — re-fetching from API")
+                # Fall through to API fetch below
+                gdf_schools = None
+        if gdf_schools is not None:
+            return gdf_schools
+
+    # 3. Fetch from GIGA API
     try:
         result = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
-        
-        # Validate that result is a GeoDataFrame
-        # GigaSchoolLocationFetcher may return pd.DataFrame on API failure
         if not isinstance(result, gpd.GeoDataFrame):
-            if isinstance(result, pd.DataFrame):
-                if result.empty:
-                    logger.warning(f"No school data available for {country} from API")
-                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-                # Try to convert if it has geometry column
-                if 'geometry' in result.columns:
-                    result = gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326')
-                else:
-                    logger.error(f"School data for {country} has no geometry column, returning empty GeoDataFrame")
-                    return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+            if isinstance(result, pd.DataFrame) and not result.empty and 'geometry' in result.columns:
+                result = gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326')
             else:
-                logger.error(f"Unexpected return type from GigaSchoolLocationFetcher for {country}: {type(result)}")
+                logger.warning(f"{country}: GIGA API returned no usable school data")
                 return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
-        
         gdf_schools = result
-        
-        # Handle legacy API column name
         if 'giga_id_school' in gdf_schools.columns:
             gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
-        
-        # Ensure CRS is set
         if gdf_schools.crs is None:
             gdf_schools.set_crs('EPSG:4326', inplace=True)
-        
-        # Save to cache
-        # If rewrite=1, always save (even if empty) to overwrite corrupted files
-        # If rewrite=0 and empty, don't save (avoid overwriting good data with empty)
         if rewrite == 1 or not gdf_schools.empty:
             save_school_locations(gdf_schools, country)
-        
         return gdf_schools
     except Exception as e:
-        logger.error(f"Error fetching schools for {country}: {str(e)}")
-        # Return empty GeoDataFrame with proper structure for downstream processing
+        logger.error(f"{country}: Error fetching schools from GIGA API: {e}")
         return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
 
-# =============================================================================
-# GEOSPATIAL PROCESSING FUNCTIONS
-# =============================================================================
 
+def fetch_shelters(country, rewrite=0):
+    """
+    Fetch emergency shelter locations for a country using custom data, cache, or OSM.
+
+    Priority order:
+        1. Custom file at geodb/custom/<COUNTRY>_shelters.csv — always used if present.
+        2. Location cache (shelter_views/<COUNTRY>_shelters.parquet) — if rewrite=0.
+        3. OSM via Overpass API using SHELTER_LOCATION_TYPES (social_facility=shelter).
+
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, re-fetch from OSM and overwrite cache (ignored if custom file exists)
+
+    Returns:
+        gpd.GeoDataFrame: Shelter locations with geometry (EPSG:4326) and 'osm_id' column.
+    """
+    # 1. Custom data takes priority — never overwritten
+    custom_gdf = _load_custom_points_csv(country, 'shelters')
+    if custom_gdf is not None:
+        save_shelter_locations(custom_gdf, country)
+        return custom_gdf
+
+    # 2. Use cache if available and rewrite not requested
+    if shelter_exist(country) and rewrite == 0:
+        return load_shelter_locations(country)
+
+    # 3. Fetch from OSM via Overpass API
+    try:
+        from gigaspatial.handlers.osm import OSMLocationFetcher
+        df = OSMLocationFetcher(country=country, location_types=SHELTER_LOCATION_TYPES).fetch_locations()
+        if df.empty:
+            logger.warning(f"{country}: No shelter data found in OSM (social_facility=shelter)")
+            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
+        gdf = gpd.GeoDataFrame(
+            df, geometry=gpd.points_from_xy(df['longitude'], df['latitude']), crs='EPSG:4326'
+        )
+        gdf = gdf.rename(columns={'source_id': 'osm_id', 'category_value': 'shelter_type'})
+        logger.info(f"{country}: Fetched {len(gdf)} shelters from OSM")
+        save_shelter_locations(gdf, country)
+        return gdf
+    except Exception as e:
+        logger.error(f"{country}: Error fetching shelters from OSM: {e}")
+        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
+
+
+def fetch_wash(country, rewrite=0):
+    """
+    Fetch WASH infrastructure locations for a country using custom data, cache, or OSM.
+
+    Priority order:
+        1. Custom file at geodb/custom/<COUNTRY>_wash.csv — always used if present.
+        2. Location cache (wash_views/<COUNTRY>_wash.parquet) — if rewrite=0.
+        3. OSM via Overpass API using WASH_LOCATION_TYPES.
+
+    Fetches: drinking_water, water_point, toilets, shower (amenity) and
+    water_well, water_tap, water_works, pumping_station, wastewater_treatment_plant (man_made).
+    Natural sources (springs) are excluded — only managed infrastructure.
+
+    Args:
+        country: ISO3 country code
+        rewrite: If 1, re-fetch from OSM and overwrite cache (ignored if custom file exists)
+
+    Returns:
+        gpd.GeoDataFrame: WASH facility locations with geometry (EPSG:4326) and 'osm_id' column.
+    """
+    # 1. Custom data takes priority — never overwritten
+    custom_gdf = _load_custom_points_csv(country, 'wash')
+    if custom_gdf is not None:
+        save_wash_locations(custom_gdf, country)
+        return custom_gdf
+
+    # 2. Use cache if available and rewrite not requested
+    if wash_exist(country) and rewrite == 0:
+        return load_wash_locations(country)
+
+    # 3. Fetch from OSM via Overpass API
+    try:
+        from gigaspatial.handlers.osm import OSMLocationFetcher
+        df = OSMLocationFetcher(country=country, location_types=WASH_LOCATION_TYPES).fetch_locations()
+        if df.empty:
+            logger.warning(f"{country}: No WASH data found in OSM")
+            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
+        gdf = gpd.GeoDataFrame(
+            df, geometry=gpd.points_from_xy(df['longitude'], df['latitude']), crs='EPSG:4326'
+        )
+        gdf = gdf.rename(columns={'source_id': 'osm_id', 'category_value': 'wash_type'})
+        logger.info(f"{country}: Fetched {len(gdf)} WASH facilities from OSM "
+                    f"({df['category_value'].value_counts().to_dict()})")
+        save_wash_locations(gdf, country)
+        return gdf
+    except Exception as e:
+        logger.error(f"{country}: Error fetching WASH facilities from OSM: {e}")
+        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
+
+
+# =============================================================================
+# GEOGRAPHIC UTILITIES
+# =============================================================================
 def get_country_boundaries(countries):
     """
     Retrieve country boundary geometries for a list of countries.
@@ -264,138 +722,204 @@ def get_country_boundaries(countries):
             raise
     return country_boundaries
 
-def is_envelope_in_zone(bbox, df_envelopes, geometry_column='geometry'):
+
+def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
     """
-    Check if any hurricane envelope intersects with a given bounding box/zone.
-    
+    Check if any hurricane envelope intersects with a given zone geometry.
+
+    Used in the Python fallback path of run_complete_impact_analysis when the SQL
+    pre-filter (ST_DWITHIN on COUNTRY_BOUNDARY) is unavailable. The zone geometry
+    is typically a 1,500 km buffer around a country boundary.
+
     Args:
-        bbox: Shapely polygon representing the bounding box/zone to check
+        zone_geom: Shapely geometry representing the zone to check against
         df_envelopes: DataFrame or GeoDataFrame containing hurricane envelope geometries
         geometry_column: Name of the geometry column (default: 'geometry')
-    
+
     Returns:
-        bool: True if any envelope intersects with the bbox, False otherwise
+        bool: True if any envelope intersects with the zone, False otherwise
     """
     if df_envelopes.empty:
         return False
 
     if geometry_column != 'geometry':
         df_envelopes = df_envelopes.rename(columns={geometry_column: 'geometry'})
-    
+
     if isinstance(df_envelopes, pd.DataFrame):
         gdf_envelopes = convert_to_geodataframe(df_envelopes.dropna(subset=['geometry']))
-    else:  # GeoDataFrame
+    else:
         gdf_envelopes = df_envelopes.copy()
 
-    mask = gdf_envelopes.intersects(bbox)
-    return bool(mask.any())
+    return bool(gdf_envelopes.intersects(zone_geom).any())
 
+
+# =============================================================================
+# BASE LAYER INITIALIZATION
+# Functions for building and persisting the base mercator and admin parquets
+# for a country (--type initialize / --type patch). These are written once and
+# reused across all storm update runs.
+# =============================================================================
 def create_mercator_country_layer(country, zoom_level=15, rewrite=0):
     """
     Create mercator tile layer with demographic and infrastructure data for a country.
-    
-    This function generates a comprehensive mercator tile view containing:
-    - Population data (total, school-age, infants) from WorldPop
-    - Infrastructure data (built surface, SMOD settlement classification)
-    - School locations from GIGA API
-    - Health center locations from HealthSites API
-    - Relative Wealth Index (RWI) data
-    
+
+    Called during `--type initialize` (and as fallback during `--type update` if the base
+    mercator parquet is missing). Produces one row per tile with all data columns.
+
+    Data requirements — **hard failures** (init aborts if unavailable):
+        - Total population (WorldPop 1km)
+        - School-age population (WorldPop 100m, age_structures)
+        - Infant population (WorldPop 100m, age_structures)
+        - Under-18 population (WorldPop 100m, age_structures)
+
+    Data requirements — **optional** (NaN/0 if unavailable; backfill with --type patch):
+        - GHSL built surface (built_surface_m2)
+        - SMOD settlement class L2 (smod_class) and derived L1 (smod_class_l1)
+        - Relative Wealth Index (rwi)
+        - Schools (num_schools) — 0 if API fails or no data
+        - Health centers (num_hcs) — 0 if API fails or no data
+        - Emergency shelters (num_shelters) — 0 if OSM returns nothing
+        - WASH facilities (num_wash) — 0 if OSM returns nothing
+
     Args:
         country: ISO3 country code
         zoom_level: Zoom level for mercator tiles (default: 15, typically 14 for analysis)
-        rewrite: If 1, replace existing health center cache; if 0, use cached if available
-    
+        rewrite: If 1, re-fetch school, HC, shelter, and WASH location caches from API/OSM;
+                 if 0, use cached parquets if available
+
     Returns:
-        gpd.GeoDataFrame: GeoDataFrame with mercator tiles containing all demographic and
-                         infrastructure data. Column 'zone_id' is renamed to 'tile_id'.
-    
-    Note:
-        Missing data (e.g., RWI, age-specific population) is handled gracefully with NaN values.
-        The function attempts multiple fallback strategies for age-specific population data.
+        gpd.GeoDataFrame: GeoDataFrame with mercator tiles and all demographic/infrastructure
+                         columns. 'zone_id' renamed to 'tile_id'.
     """
-    # Fetch schools and health centers using helper functions with caching
+    # Fetch facility locations using helper functions with caching
     gdf_schools = fetch_schools(country, rewrite)
     gdf_hcs = fetch_health_centers(country, rewrite)
+    gdf_shelters = fetch_shelters(country, rewrite)
+    gdf_wash = fetch_wash(country, rewrite)
 
     tiles_viewer = MercatorViewGenerator(source=country, zoom_level=zoom_level, data_store=data_store)
-    
-    # Map school-age population (with fallback strategies)
-    try:
+
+    # ------------------------------------------------------------------
+    # Population (hard requirement — raises if neither custom nor raster)
+    # ------------------------------------------------------------------
+    custom_pop = _load_custom_tiles_csv(country, 'population', zoom_level)
+    if custom_pop is not None:
+        for col in ['school_age_population', 'infant_population', 'under_18_population', 'population']:
+            if col in custom_pop.columns:
+                tiles_viewer.add_variable_to_view(custom_pop[col].to_dict(), col)
+            else:
+                raise ValueError(f"{country}: Custom population CSV missing required column '{col}'")
+    else:
+        # Map school-age population — hard requirement, raises on failure
         tiles_viewer.map_wp_pop(
-            country=country, 
-            resolution=WORLDPOP_RESOLUTION_HIGH, 
-            output_column="school_age_population", 
-            school_age=True, 
-            project="age_structures", 
-            un_adjusted=False, 
+            country=country,
+            resolution=WORLDPOP_RESOLUTION_HIGH,
+            output_column="school_age_population",
+            school_age=True,
+            project="age_structures",
+            un_adjusted=False,
             sex='F_M'
         )
-    except Exception:
-        # Fallback: try age range method
-        try:
-            tiles_viewer.map_wp_pop(
-                country=country, 
-                resolution=WORLDPOP_RESOLUTION_HIGH, 
-                output_column="school_age_population", 
-                predicate='centroid_within', 
-                school_age=False, 
-                project="age_structures", 
-                un_adjusted=False,
-                min_age=SCHOOL_AGE_MIN, 
-                max_age=SCHOOL_AGE_MAX
-            )
-        except Exception:
-            # Final fallback: set to NaN
-            logger.warning(f"No school-age population data available for {country}")
-            school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
-            tiles_viewer.add_variable_to_view(school_age, 'school_age_population')
-
-    # Map infant population
-    try:
+        # Map infant population — hard requirement, raises on failure
         tiles_viewer.map_wp_pop(
-            country=country, 
-            resolution=WORLDPOP_RESOLUTION_HIGH, 
-            output_column="infant_population", 
-            predicate='centroid_within', 
-            school_age=False, 
-            project="age_structures", 
+            country=country,
+            resolution=WORLDPOP_RESOLUTION_HIGH,
+            output_column="infant_population",
+            predicate='centroid_within',
+            school_age=False,
+            project="age_structures",
             un_adjusted=False,
-            min_age=INFANT_AGE_MIN, 
+            min_age=INFANT_AGE_MIN,
             max_age=INFANT_AGE_MAX
         )
-    except Exception:
-        logger.warning(f"No infant population data available for {country}")
-        infant_pop = {k: np.nan for k in tiles_viewer.view.index.unique()}
-        tiles_viewer.add_variable_to_view(infant_pop, 'infant_population')
+        # Map under-18 population — hard requirement, raises on failure
+        tiles_viewer.map_wp_pop(
+            country=country,
+            resolution=WORLDPOP_RESOLUTION_LOW,
+            output_column="under_18_population",
+            under_18=True,
+            project="age_structures",
+            un_adjusted=False,
+        )
+        # Map total population — hard requirement, raises on failure
+        tiles_viewer.map_wp_pop(country=country, resolution=100)
 
-    tiles_viewer.map_wp_pop(country=country, resolution=100)
-    tiles_viewer.map_built_s()
-    tiles_viewer.map_smod()
-    
-    ## schools
+    # ------------------------------------------------------------------
+    # GHSL built surface — optional, NaN fallback, custom override supported
+    # ------------------------------------------------------------------
+    custom_built = _load_custom_tiles_csv(country, 'built_surface', zoom_level)
+    if custom_built is not None and 'built_surface_m2' in custom_built.columns:
+        tiles_viewer.add_variable_to_view(custom_built['built_surface_m2'].to_dict(), 'built_surface_m2')
+    else:
+        try:
+            tiles_viewer.map_built_s()
+        except Exception as e:
+            logger.warning(f"{country}: GHSL built surface unavailable — setting to NaN: {e}")
+            tiles_viewer.add_variable_to_view(
+                {k: np.nan for k in tiles_viewer.view.index.unique()}, 'built_surface_m2'
+            )
+
+    # ------------------------------------------------------------------
+    # SMOD settlement class — optional, NaN fallback, custom override supported
+    # ------------------------------------------------------------------
+    custom_smod = _load_custom_tiles_csv(country, 'smod', zoom_level)
+    if custom_smod is not None and 'smod_class' in custom_smod.columns:
+        tiles_viewer.add_variable_to_view(custom_smod['smod_class'].to_dict(), 'smod_class')
+    else:
+        try:
+            tiles_viewer.map_smod()
+        except Exception as e:
+            logger.warning(f"{country}: GHSL SMOD unavailable — setting to NaN: {e}")
+            tiles_viewer.add_variable_to_view(
+                {k: np.nan for k in tiles_viewer.view.index.unique()}, 'smod_class'
+            )
+
+    # Derive smod_class_l1 from smod_class (always derived, never loaded from custom)
+    try:
+        smod_l2 = tiles_viewer.view['smod_class']
+        smod_l1 = smod_l2.map(SMOD_L2_TO_L1)
+        tiles_viewer.add_variable_to_view(smod_l1.to_dict(), 'smod_class_l1')
+    except Exception as e:
+        logger.warning(f"{country}: Could not derive smod_class_l1: {e}")
+        tiles_viewer.add_variable_to_view(
+            {k: np.nan for k in tiles_viewer.view.index.unique()}, 'smod_class_l1'
+        )
+
+    # Schools, health centers, shelters, WASH
     schools = tiles_viewer.map_points(points=gdf_schools)
     tiles_viewer.add_variable_to_view(schools, "num_schools")
-
-    ## health centers
+    
     hcs = tiles_viewer.map_points(points=gdf_hcs)
     tiles_viewer.add_variable_to_view(hcs, "num_hcs")
-
-    # should we do RWI?
-    try:
-        handler = RWIHandler(data_store=data_store)
-        rwi_df = handler.load_data(country, ensure_available=True)
-        rwi_gdf = convert_to_geodataframe(rwi_df)
-        rwi = tiles_viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
-    except Exception as e:
-        logger.warning(f"Relative Wealth Index will be empty: {e}")
-        rwi = {k: np.nan for k in tiles_viewer.view.index.unique()}
     
-    tiles_viewer.add_variable_to_view(rwi, 'rwi')
+    shelters = tiles_viewer.map_points(points=gdf_shelters)
+    tiles_viewer.add_variable_to_view(shelters, "num_shelters")
+    
+    wash_pts = tiles_viewer.map_points(points=gdf_wash)
+    tiles_viewer.add_variable_to_view(wash_pts, "num_wash")
+
+    # ------------------------------------------------------------------
+    # RWI — optional, NaN fallback, custom override supported
+    # ------------------------------------------------------------------
+    custom_rwi = _load_custom_tiles_csv(country, 'rwi', zoom_level)
+    if custom_rwi is not None and 'rwi' in custom_rwi.columns:
+        tiles_viewer.add_variable_to_view(custom_rwi['rwi'].to_dict(), 'rwi')
+    else:
+        try:
+            handler = RWIHandler(data_store=data_store)
+            rwi_df = handler.load_data(country, ensure_available=True)
+            if rwi_df is None or (hasattr(rwi_df, 'empty') and rwi_df.empty):
+                raise ValueError(f"No RWI data available for {country}")
+            rwi_gdf = convert_to_geodataframe(rwi_df)
+            rwi = tiles_viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
+        except Exception as e:
+            logger.warning(f"{country}: Relative Wealth Index unavailable — setting to NaN: {e}")
+            rwi = {k: np.nan for k in tiles_viewer.view.index.unique()}
+        tiles_viewer.add_variable_to_view(rwi, 'rwi')
 
     gdf_tiles = tiles_viewer.to_geodataframe()
     gdf_tiles.rename(columns={'zone_id': 'tile_id'}, inplace=True)
-    
+
     return gdf_tiles
 
 
@@ -411,58 +935,62 @@ def save_mercator_view(gdf, country, zoom_level):
     file_name = f"{country}_{zoom_level}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
 
+
 def admins_overlay(gdf_admins1, gdf_mercator):
     """
     Assign admin level 1 IDs to mercator tiles based on maximum intersection area.
-    
-    For each mercator tile, this function determines which admin level 1 boundary
-    it belongs to by finding the admin boundary with the largest intersection area.
-    This handles cases where tiles may intersect multiple admin boundaries.
-    
-    Args:
-        gdf_admins1: GeoDataFrame containing admin level 1 boundaries (must have 'id' column)
-        gdf_mercator: GeoDataFrame containing mercator tiles (must have 'tile_id' column)
-    
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame with mercator tiles and assigned admin IDs
-    """
-    small_gdf = gdf_mercator.copy()
-    large_gdf = gdf_admins1.copy()
-    
-    # Overlay to get all intersections
-    intersections = gpd.overlay(small_gdf, large_gdf, how="intersection")
 
-    # Compute intersection area for each intersection
+    For each mercator tile, finds the admin level 1 boundary with the largest
+    intersection area and assigns its 'id' to the tile. Tiles that don't intersect
+    any admin boundary (e.g. ocean tiles) get NaN for 'id'.
+
+    Callers are responsible for normalising the admin ID column to 'id' before
+    passing gdf_admins1 (see add_admin_ids).
+
+    Args:
+        gdf_admins1: GeoDataFrame with admin level 1 boundaries. Must have 'id' column.
+        gdf_mercator: GeoDataFrame with mercator tiles. Must have 'tile_id' column.
+
+    Returns:
+        gpd.GeoDataFrame: Mercator tiles with an added 'id' column (admin level 1 ID).
+    """
+    # Overlay to get all tile-admin intersections, then compute intersection area
+    intersections = gpd.overlay(gdf_mercator, gdf_admins1, how="intersection")
     intersections["intersection_area"] = intersections.geometry.area
 
-    # For each tile, keep the admin with maximum intersection area
+    # For each tile, keep only the admin with maximum intersection area
     max_area_idx = intersections.groupby("tile_id")["intersection_area"].idxmax()
     assigned = intersections.loc[max_area_idx, ["tile_id", "id"]]
 
-    # Merge back with original tiles to assign admin IDs
-    result = small_gdf.merge(assigned, on="tile_id", how="left")
+    # Left-join back to preserve all original tiles (unmatched tiles get NaN id)
+    result = gdf_mercator.merge(assigned, on="tile_id", how="left")
+    return gpd.GeoDataFrame(result, geometry="geometry", crs=gdf_mercator.crs)
 
-    # Ensure result is a GeoDataFrame with correct geometry and CRS
-    return gpd.GeoDataFrame(result, geometry="geometry", crs=small_gdf.crs)
 
-def add_admin_ids(view, country, zoom_level, rewrite):
+def add_admin_ids(view, country):
     """
     Add admin level 1 IDs to a mercator tile view.
-    
+
+    Fetches admin level 1 boundaries from GeoRepo and assigns each tile to the
+    admin boundary with the largest intersection area (via admins_overlay).
+
     Args:
-        view: GeoDataFrame containing mercator tiles
+        view: GeoDataFrame containing mercator tiles (must have 'tile_id' column)
         country: ISO3 country code
-        zoom_level: Zoom level (unused, kept for API compatibility)
-        rewrite: Rewrite flag (unused, kept for API compatibility)
-    
+
     Returns:
         tuple: (combined_view, gdf_admins1) where:
-            - combined_view: GeoDataFrame with tiles and admin IDs
+            - combined_view: GeoDataFrame with tiles and 'id' column (admin level 1 ID)
             - gdf_admins1: GeoDataFrame with admin level 1 boundaries
     """
     gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=1).to_geodataframe()
+    # giga-spatial 0.9.x AdminBoundaries.to_geodataframe() returns 'boundary_id';
+    # older versions returned 'id'. Normalise to 'id' so downstream code is consistent.
+    if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
+        gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
     combined_view = admins_overlay(gdf_admins1, view)
     return combined_view, gdf_admins1
+
 
 def write_country_boundary(country: str):
     """
@@ -473,15 +1001,19 @@ def write_country_boundary(country: str):
     try:
         boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
         gdf = boundaries.to_geodataframe()
-        if gdf.empty or gdf.geometry.iloc[0] is None:
+        if gdf.empty or gdf.geometry.isna().all():
             logger.warning(f"{country}: GeoRepo returned no boundary — COUNTRY_BOUNDARY not updated")
             return
-        wkt = gdf.geometry.iloc[0].wkt
+        # Union all rows in case GeoRepo returns multiple polygons for admin_level=0
+        geom = gdf.geometry.union_all()
+        wkt = geom.wkt
         conn = get_snowflake_connection()
         cur = conn.cursor()
+        # Use TO_GEOGRAPHY (not TRY_TO_GEOGRAPHY) so invalid WKT raises immediately
+        # rather than silently writing NULL to COUNTRY_BOUNDARY.
         cur.execute("""
             UPDATE AOTS.TC_ECMWF.PIPELINE_COUNTRIES
-            SET COUNTRY_BOUNDARY = TRY_TO_GEOGRAPHY(%(wkt)s)
+            SET COUNTRY_BOUNDARY = TO_GEOGRAPHY(%(wkt)s)
             WHERE COUNTRY_CODE = %(iso)s
         """, {"wkt": wkt, "iso": country})
         conn.commit()
@@ -490,6 +1022,142 @@ def write_country_boundary(country: str):
         logger.info(f"{country}: COUNTRY_BOUNDARY written to Snowflake")
     except Exception as e:
         logger.warning(f"{country}: Could not write COUNTRY_BOUNDARY to Snowflake: {e}")
+
+
+def patch_country_layer(country, zoom_level, columns):
+    """
+    Backfill specific columns in an existing base mercator parquet without full re-initialization.
+
+    Loads the existing parquet for the country, re-fetches only the requested data sources,
+    merges the new values back, and saves. This is the preferred way to populate NaN columns
+    (e.g. after GHSL/SMOD/RWI data becomes available for a country) without re-downloading
+    population data or re-fetching schools and HCs.
+
+    Supported columns:
+        built_surface_m2  — re-runs GHSL built surface (or uses custom built_surface_z<N>.csv)
+        smod_class        — re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
+        smod_class_l1     — alias for smod_class (both are always updated together)
+        rwi               — re-runs RWI (or uses custom rwi_z<N>.csv)
+        num_schools       — re-fetches school locations and recomputes counts
+        num_hcs           — re-fetches health center locations and recomputes counts
+        num_shelters      — re-fetches shelter locations from OSM or custom CSV and recomputes counts
+        num_wash          — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts
+
+    Population columns (population, school_age_population, infant_population,
+    under_18_population) are intentionally excluded — they are hard requirements and
+    any error in them requires a full re-initialization.
+
+    Custom tile CSVs (e.g. geodb/custom/<COUNTRY>_built_surface_z<ZOOM>.csv) take priority
+    over raster processing for the same column, exactly as in create_mercator_country_layer().
+
+    Args:
+        country: ISO3 country code
+        zoom_level: Zoom level (must match the existing parquet)
+        columns: List of column names to patch (e.g. ['built_surface_m2', 'rwi'])
+
+    Raises:
+        FileNotFoundError: If no base mercator parquet exists for the country (run init first)
+        ValueError: If an unsupported column is requested
+    """
+    PATCHABLE = {'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi', 'num_schools', 'num_hcs', 'num_shelters', 'num_wash'}
+    unsupported = set(columns) - PATCHABLE
+    if unsupported:
+        raise ValueError(f"{country}: Cannot patch population columns {unsupported}. "
+                         f"Run --type initialize --rewrite 1 to regenerate population data.")
+
+    # Normalise: smod_class_l1 is always derived from smod_class
+    if 'smod_class_l1' in columns and 'smod_class' not in columns:
+        columns = list(columns) + ['smod_class']
+
+    file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', f"{country}_{zoom_level}.parquet")
+    if not data_store.file_exists(file_path):
+        raise FileNotFoundError(f"No base mercator parquet found for {country} at zoom {zoom_level}. "
+                                f"Run --type initialize first.")
+
+    gdf = read_dataset(data_store, file_path)
+    logger.info(f"{country}: Patching columns {columns} in existing mercator parquet ({len(gdf)} tiles)")
+
+    # Temporary MercatorViewGenerator seeded from existing tile geometries
+    from gigaspatial.generators import MercatorViewGenerator as _MVG
+
+    if 'built_surface_m2' in columns:
+        custom = _load_custom_tiles_csv(country, 'built_surface', zoom_level)
+        if custom is not None and 'built_surface_m2' in custom.columns:
+            gdf['built_surface_m2'] = gdf['tile_id'].map(custom['built_surface_m2'])
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            try:
+                viewer.map_built_s()
+                built = viewer.view['built_surface_m2'].rename_axis('tile_id')
+                gdf['built_surface_m2'] = gdf['tile_id'].map(built.to_dict())
+            except Exception as e:
+                logger.warning(f"{country}: GHSL built surface still unavailable during patch: {e}")
+        logger.info(f"{country}: Patched built_surface_m2")
+
+    if 'smod_class' in columns:
+        custom = _load_custom_tiles_csv(country, 'smod', zoom_level)
+        if custom is not None and 'smod_class' in custom.columns:
+            gdf['smod_class'] = gdf['tile_id'].map(custom['smod_class'])
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            try:
+                viewer.map_smod()
+                smod = viewer.view['smod_class'].rename_axis('tile_id')
+                gdf['smod_class'] = gdf['tile_id'].map(smod.to_dict())
+            except Exception as e:
+                logger.warning(f"{country}: GHSL SMOD still unavailable during patch: {e}")
+        # Always re-derive L1 when L2 is patched
+        gdf['smod_class_l1'] = gdf['smod_class'].map(SMOD_L2_TO_L1)
+        logger.info(f"{country}: Patched smod_class + smod_class_l1")
+
+    if 'rwi' in columns:
+        custom = _load_custom_tiles_csv(country, 'rwi', zoom_level)
+        if custom is not None and 'rwi' in custom.columns:
+            gdf['rwi'] = gdf['tile_id'].map(custom['rwi'])
+        else:
+            try:
+                handler = RWIHandler(data_store=data_store)
+                rwi_df = handler.load_data(country, ensure_available=True)
+                if rwi_df is None or (hasattr(rwi_df, 'empty') and rwi_df.empty):
+                    raise ValueError(f"No RWI data")
+                rwi_gdf = convert_to_geodataframe(rwi_df)
+                viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+                rwi_vals = viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
+                gdf['rwi'] = gdf['tile_id'].map(rwi_vals)
+            except Exception as e:
+                logger.warning(f"{country}: RWI still unavailable during patch: {e}")
+        logger.info(f"{country}: Patched rwi")
+
+    if 'num_schools' in columns:
+        gdf_schools = fetch_schools(country, rewrite=0)
+        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+        schools = viewer.map_points(points=gdf_schools)
+        gdf['num_schools'] = gdf['tile_id'].map(schools)
+        logger.info(f"{country}: Patched num_schools")
+
+    if 'num_hcs' in columns:
+        gdf_hcs = fetch_health_centers(country, rewrite=0)
+        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+        hcs = viewer.map_points(points=gdf_hcs)
+        gdf['num_hcs'] = gdf['tile_id'].map(hcs)
+        logger.info(f"{country}: Patched num_hcs")
+
+    if 'num_shelters' in columns:
+        gdf_shelters = fetch_shelters(country, rewrite=0)
+        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+        shelters = viewer.map_points(points=gdf_shelters)
+        gdf['num_shelters'] = gdf['tile_id'].map(shelters)
+        logger.info(f"{country}: Patched num_shelters")
+
+    if 'num_wash' in columns:
+        gdf_wash = fetch_wash(country, rewrite=0)
+        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+        wash_pts = viewer.map_points(points=gdf_wash)
+        gdf['num_wash'] = gdf['tile_id'].map(wash_pts)
+        logger.info(f"{country}: Patched num_wash")
+
+    write_dataset(gdf, data_store, file_path)
+    logger.info(f"{country}: Patch complete — saved updated mercator parquet")
 
 
 def save_mercator_and_admin_views(countries,zoom_level,rewrite):
@@ -504,7 +1172,7 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
         
         if not data_store.file_exists(file_path):
             view = create_mercator_country_layer(country, zoom_level, rewrite)
-            combined_view, gdf_admins1 = add_admin_ids(view,country,zoom_level,rewrite)
+            combined_view, gdf_admins1 = add_admin_ids(view, country)
             d = gdf_admins1.set_index('id')['name'].to_dict()
             d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
             save_mercator_view(combined_view, country, zoom_level)
@@ -527,7 +1195,7 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
         elif rewrite:
             # When rewrite=1, regenerate the entire mercator view from scratch
             view = create_mercator_country_layer(country, zoom_level, rewrite)
-            combined_view, gdf_admins1 = add_admin_ids(view,country,zoom_level,rewrite)
+            combined_view, gdf_admins1 = add_admin_ids(view, country)
             d = gdf_admins1.set_index('id')['name'].to_dict()
             d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
             save_mercator_view(combined_view, country, zoom_level)
@@ -564,23 +1232,29 @@ def save_mercator_and_admin_views(countries,zoom_level,rewrite):
                 logger.warning("  (Initialization completed, but tracking failed)")
             write_country_boundary(country)
 
+
+# =============================================================================
+# STORM METADATA
+# =============================================================================
 def save_json_storms(d):
     """
     Save json file with processed storm,dates
     """
+    import json
     filename = os.path.join(RESULTS_DIR, STORMS_FILE)
-    write_dataset(d, data_store, filename)
+    data_store.write_file(filename, json.dumps(d).encode())
+
 
 def load_json_storms():
     """
     Read json file with saved storm,dates
     """
+    import json
     filename = os.path.join(RESULTS_DIR, STORMS_FILE)
     if data_store.file_exists(filename):
-        df = read_dataset(data_store, filename)
-        column_name = df.columns[0]
-        return {column_name: df[column_name].to_dict()}
-    return {'storms':{}}
+        raw = data_store.read_file(filename)
+        return json.loads(raw)
+    return {'storms': {}}
 
 
 def load_mercator_view(country, zoom_level=15):
@@ -588,11 +1262,42 @@ def load_mercator_view(country, zoom_level=15):
     file_name = f"{country}_{zoom_level}.parquet"
     return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
 
+
+# =============================================================================
+# PER-STORM IMPACT VIEW GENERATION
+# Functions that intersect storm envelopes with facility/tile data to produce
+# per-storm impact probability views. Called on every --type update run.
+# =============================================================================
 def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     """
-    gdf_schools: a geodataframe with school data
-    gdf_envelopes: a geodataframe with envelopes
-    returns a dictionary of wind threshold - geodataframe with the corresponding school view
+    Create per-facility school impact views from hurricane envelopes.
+
+    For each wind speed threshold, calculates the probability that each individual
+    school will be affected by winds at or above that threshold. Probability is
+    computed as the fraction of ensemble members whose wind envelope intersects
+    the school (buffered by 150m).
+
+    Output is one row per school per wind threshold — NOT aggregated to tiles.
+    This preserves all school attributes from the location cache (including
+    education_level, school_type, etc.) alongside the computed probability.
+    To get per-school detail by type, join the impact view to the location cache
+    (<COUNTRY>_schools.parquet) on school_id_giga.
+
+    The impact views are saved as:
+        school_views/<COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    The location cache (written once at init) is:
+        school_views/<COUNTRY>_schools.parquet
+
+    Args:
+        gdf_schools: GeoDataFrame of school locations (from fetch_schools / location cache).
+                     Must have 'school_id_giga' column and valid geometry.
+        gdf_envelopes: GeoDataFrame of hurricane envelope geometries with
+                       'wind_threshold' and 'ensemble_member' columns.
+
+    Returns:
+        dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per school,
+              containing 'zone_id' (= school_id_giga) and 'probability' (0.0–1.0).
+              Empty dict if gdf_schools is empty or invalid.
     """
     # Validate input is a GeoDataFrame
     if not isinstance(gdf_schools, gpd.GeoDataFrame):
@@ -632,21 +1337,58 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
 
     return wind_views
 
+
 def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     """
-    Create health center impact views from hurricane envelopes.
-    
-    For each wind speed threshold, calculates the probability that each health center
-    will be affected by winds at or above that threshold.
-    
+    Create per-facility health center impact views from hurricane envelopes.
+
+    For each wind speed threshold, calculates the probability that each individual
+    health center will be affected by winds at or above that threshold. Probability
+    is computed as the fraction of ensemble members whose wind envelope intersects
+    the facility (buffered by BUFFER_DISTANCE_METERS).
+
+    Output is one row per facility per wind threshold — NOT aggregated to tiles.
+    All attributes from the location cache are preserved (including the `amenity`
+    column), so impact views can be filtered by facility type without joining back
+    to the cache. Only facilities matching HC_FACILITY_TYPES are included.
+    To cross-reference with full facility metadata, join on 'osm_id' to the
+    location cache (<COUNTRY>_health_centers.parquet).
+
+    The impact views are saved as:
+        hc_views/<COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    The location cache (written once at init, filtered to HC_FACILITY_TYPES) is:
+        hc_views/<COUNTRY>_health_centers.parquet
+
     Args:
-        gdf_hcs: GeoDataFrame containing health center locations
-        gdf_envelopes: GeoDataFrame containing hurricane envelope geometries with wind_threshold column
-    
+        gdf_hcs: GeoDataFrame of health center locations (from fetch_health_centers /
+                 location cache). Must have 'osm_id' column and valid geometry.
+        gdf_envelopes: GeoDataFrame of hurricane envelope geometries with
+                       'wind_threshold' and 'ensemble_member' columns.
+
     Returns:
-        dict: Dictionary mapping wind threshold (int) to GeoDataFrame with health center impact data.
-              Each GeoDataFrame contains 'probability' column indicating impact probability.
+        dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per facility,
+              containing 'zone_id' (= osm_id) and 'probability' (0.0–1.0).
+              Empty dict if gdf_hcs is empty or invalid.
     """
+    # Filter to relevant facility types at analysis time using HC_FACILITY_TYPES.
+    # HC_FACILITY_TYPES is a dict of {column: [values]} so multiple OSM tag keys
+    # can be combined (e.g. amenity + healthcare). A facility matches if ANY
+    # of the specified column/value pairs apply (OR logic across keys).
+    # The cache stores all types; this filter controls what enters impact files.
+    # Applies equally to API-sourced and custom data.
+    if not gdf_hcs.empty:
+        before = len(gdf_hcs)
+        mask = pd.Series(False, index=gdf_hcs.index)
+        for col, values in HC_FACILITY_TYPES.items():
+            if col in gdf_hcs.columns:
+                mask |= gdf_hcs[col].isin(values)
+        gdf_hcs = gdf_hcs[mask].copy()
+        logger.debug(f"HC type filter: {before} → {len(gdf_hcs)} facilities (kept: {HC_FACILITY_TYPES})")
+
+    if gdf_hcs.empty:
+        logger.warning(f"No health facilities matching {HC_FACILITY_TYPES} — returning empty impact views")
+        return {}
+
     gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
@@ -669,6 +1411,95 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
             wind_views[wind_th] = gdf_view
 
     return wind_views
+
+
+def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
+    """
+    Create per-facility shelter impact views from hurricane envelopes.
+
+    For each wind speed threshold, calculates the probability that each shelter
+    will be affected by winds at or above that threshold.
+
+    All cached shelter types enter impact files (no type filtering).
+    Impact views saved as: shelter_views/<COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+
+    Args:
+        gdf_shelters: GeoDataFrame of shelter locations. Must have 'osm_id' column.
+        gdf_envelopes: GeoDataFrame of hurricane envelopes.
+
+    Returns:
+        dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
+    """
+    if not isinstance(gdf_shelters, gpd.GeoDataFrame) or gdf_shelters.empty:
+        if not isinstance(gdf_shelters, gpd.GeoDataFrame):
+            logger.error("gdf_shelters must be a GeoDataFrame. Returning empty views.")
+        return {}
+    if 'geometry' not in gdf_shelters.columns or gdf_shelters.geometry.isna().all():
+        logger.error("Shelter GeoDataFrame has no valid geometry. Returning empty views.")
+        return {}
+
+    gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+    wind_views = {}
+    for wind_th in gdf_envelopes.wind_threshold.unique():
+        gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        if not gdf_env_wth.empty:
+            num_ensembles = len(gdf_env_wth.ensemble_member.unique())
+            viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_shelters_buff, zone_id_column='osm_id')
+            try:
+                new_col = viewer.map_polygons(gdf_env_wth)
+                probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
+            except Exception as e:
+                logger.warning(f"Error mapping polygons for shelter view at {wind_th}kt: {e}")
+                probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
+            viewer.add_variable_to_view(probs, 'probability')
+            wind_views[wind_th] = viewer.to_geodataframe()
+    return wind_views
+
+
+def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
+    """
+    Create per-facility WASH impact views from hurricane envelopes.
+
+    For each wind speed threshold, calculates the probability that each WASH
+    facility will be affected by winds at or above that threshold. All facility
+    types in the cache enter impact calculations — type selection is controlled
+    by WASH_LOCATION_TYPES at fetch time.
+
+    Impact views saved as: wash_views/<COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+
+    Args:
+        gdf_wash: GeoDataFrame of WASH facility locations. Must have 'osm_id' column.
+        gdf_envelopes: GeoDataFrame of hurricane envelopes.
+
+    Returns:
+        dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
+              Empty dict if gdf_wash is empty or invalid.
+    """
+    if not isinstance(gdf_wash, gpd.GeoDataFrame) or gdf_wash.empty:
+        if not isinstance(gdf_wash, gpd.GeoDataFrame):
+            logger.error("gdf_wash must be a GeoDataFrame. Returning empty views.")
+        return {}
+    if 'geometry' not in gdf_wash.columns or gdf_wash.geometry.isna().all():
+        logger.error("WASH GeoDataFrame has no valid geometry. Returning empty views.")
+        return {}
+
+    gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+    wind_views = {}
+    for wind_th in gdf_envelopes.wind_threshold.unique():
+        gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        if not gdf_env_wth.empty:
+            num_ensembles = len(gdf_env_wth.ensemble_member.unique())
+            viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_wash_buff, zone_id_column='osm_id')
+            try:
+                new_col = viewer.map_polygons(gdf_env_wth)
+                probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
+            except Exception as e:
+                logger.warning(f"Error mapping polygons for WASH view at {wind_th}kt: {e}")
+                probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
+            viewer.add_variable_to_view(probs, 'probability')
+            wind_views[wind_th] = viewer.to_geodataframe()
+    return wind_views
+
 
 def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
     """
@@ -703,9 +1534,13 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
 
             df_view = tiles_viewer.to_dataframe()
             for col in data_cols:
-                df_view[f"E_{col}"] = df_view[col]*df_view['probability']
+                if col in df_view.columns:
+                    df_view[f"E_{col}"] = df_view[col] * df_view['probability']
+                else:
+                    df_view[f"E_{col}"] = np.nan
+                    logger.debug(f"Column '{col}' missing from tile data — E_{col} set to NaN (re-initialize country to populate)")
 
-            df_view = df_view.drop(columns=data_cols)
+            df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
             
             # Reset index to make zone_id a column (needed for calculate_ccis)
             # Check if 'zone_id' already exists as a column
@@ -727,8 +1562,8 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
 
             wind_views[wind_th] = df_view
 
-
     return wind_views
+
 
 def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
     d = gdf_admin.set_index('tile_id')['name'].to_dict()
@@ -750,9 +1585,13 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
 
             df_view = tiles_viewer.to_dataframe()
             for col in data_cols:
-                df_view[f"E_{col}"] = df_view[col]*df_view['probability']
+                if col in df_view.columns:
+                    df_view[f"E_{col}"] = df_view[col] * df_view['probability']
+                else:
+                    df_view[f"E_{col}"] = np.nan
+                    logger.debug(f"Column '{col}' missing from tile data — E_{col} set to NaN (re-initialize country to populate)")
 
-            df_view = df_view.drop(columns=data_cols)
+            df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
             
             # Admin IDs must be present in gdf_tiles (added during initialization or on load)
             if 'id' not in gdf_tiles.columns:
@@ -814,33 +1653,6 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
 
     return wind_views
 
-def create_admin_view_from_envelopes(gdf_admin, gdf_envelopes):
-    """Create admin tile impact views from envelopes"""
-    wind_views = {}
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
-    for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
-        if not gdf_envelopes_wth.empty:
-            num_ensembles = len(list(gdf_envelopes_wth.ensemble_member.unique()))
-
-            admin_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_admin, zone_id_column='tile_id')
-            try:
-                new_col = admin_viewer.map_polygons(gdf_envelopes_wth)
-                probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
-            except Exception as e:
-                logger.warning(f"map_polygons failed for admin wind threshold, defaulting probabilities to 0: {e}")
-                probs = {k: 0.0 for k in admin_viewer.view['zone_id'].unique()}
-            admin_viewer.add_variable_to_view(probs, 'probability')
-
-            df_view = admin_viewer.to_dataframe()
-            for col in data_cols:
-                df_view[f"E_{col}"] = df_view[col]*df_view['probability']
-
-            df_view = df_view.drop(columns=data_cols)
-
-            wind_views[wind_th] = df_view
-
-    return wind_views
 
 def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member'):
     """Create tracks impact views from envelopes"""
@@ -881,12 +1693,26 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
     return wind_views
 
 
+# =============================================================================
+# FACILITY VIEW PERSISTENCE
+# Save / load / existence-check functions for per-facility location caches
+# (written once at --type initialize) and per-storm impact views (written on
+# every --type update). Grouped by facility type: schools, HCs, shelters, WASH.
+# =============================================================================
 def save_school_view(gdf, country, storm, date, wind_th):
     """
-    Save school impact view for a specific storm, date, and wind threshold.
-    
+    Save per-facility school impact view for a specific storm, date, and wind threshold.
+
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    Stored under: school_views/ in the configured data store.
+
+    Note: This is distinct from the location cache (<COUNTRY>_schools.parquet).
+    The impact view has one row per school with a 'probability' column; the
+    location cache has full school metadata (education_level, etc.). Join on
+    school_id_giga to combine them.
+
     Args:
-        gdf: GeoDataFrame containing school impact data
+        gdf: GeoDataFrame with per-school impact data (zone_id + probability)
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
@@ -935,7 +1761,24 @@ def school_exist(country):
 
 def save_hc_view(gdf, country, storm, date, wind_th):
     """
-    Saves health center views
+    Save per-facility health center impact view for a specific storm, date, and wind threshold.
+
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    Stored under: hc_views/ in the configured data store.
+
+    Note: This is distinct from the location cache (<COUNTRY>_health_centers.parquet).
+    The impact view has one row per facility with a 'probability' column; the
+    location cache has full facility metadata including the 'amenity' column.
+    Join on osm_id to combine them, or filter the impact view directly by
+    'amenity' — only HC_FACILITY_TYPES values will be present since filtering
+    happens before the impact views are written.
+
+    Args:
+        gdf: GeoDataFrame with per-facility impact data (zone_id + probability)
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        wind_th: Wind threshold in knots
     """
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
@@ -967,10 +1810,10 @@ def load_hc_locations(country):
 def hc_exist(country):
     """
     Check if cached health center locations exist for a country.
-    
+
     Args:
         country: ISO3 country code
-    
+
     Returns:
         bool: True if cached health center data exists, False otherwise
     """
@@ -978,115 +1821,266 @@ def hc_exist(country):
     return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
 
+def save_shelter_view(gdf, country, storm, date, wind_th):
+    """
+    Save per-facility shelter impact view for a specific storm, date, and wind threshold.
 
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    Stored under: shelter_views/ in the configured data store.
+
+    Note: This is distinct from the location cache (<COUNTRY>_shelters.parquet).
+    The impact view has one row per shelter with a 'probability' column; the
+    location cache has full shelter metadata (shelter_type, capacity, etc.).
+
+    Args:
+        gdf: GeoDataFrame with per-shelter impact data (zone_id + probability)
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        wind_th: Wind threshold in knots
+    """
+    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+
+def save_shelter_locations(gdf, country):
+    """
+    Save shelter locations to cache.
+
+    Args:
+        gdf: GeoDataFrame containing shelter locations
+        country: ISO3 country code
+    """
+    file_name = f"{country}_shelters.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+
+def load_shelter_locations(country):
+    """
+    Load cached shelter locations.
+
+    Args:
+        country: ISO3 country code
+
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing cached shelter locations
+    """
+    file_name = f"{country}_shelters.parquet"
+    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+
+def shelter_exist(country):
+    """
+    Check if cached shelter locations exist for a country.
+
+    Args:
+        country: ISO3 country code
+
+    Returns:
+        bool: True if cached shelter data exists, False otherwise
+    """
+    file_name = f"{country}_shelters.parquet"
+    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+
+
+def save_wash_view(gdf, country, storm, date, wind_th):
+    """
+    Save per-facility WASH impact view for a specific storm, date, and wind threshold.
+
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
+    Stored under: wash_views/ in the configured data store.
+
+    Note: This is distinct from the location cache (<COUNTRY>_wash.parquet).
+    The impact view has one row per WASH facility with a 'probability' column; the
+    location cache has full facility metadata (wash_type, name, etc.).
+
+    Args:
+        gdf: GeoDataFrame with per-facility impact data (zone_id + probability)
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        wind_th: Wind threshold in knots
+    """
+    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+
+def save_wash_locations(gdf, country):
+    """
+    Save WASH facility locations to cache.
+
+    Args:
+        gdf: GeoDataFrame containing WASH facility locations
+        country: ISO3 country code
+    """
+    file_name = f"{country}_wash.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+
+def load_wash_locations(country):
+    """
+    Load cached WASH facility locations.
+
+    Args:
+        country: ISO3 country code
+
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame containing cached WASH facility locations
+    """
+    file_name = f"{country}_wash.parquet"
+    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+
+def wash_exist(country):
+    """
+    Check if cached WASH facility locations exist for a country.
+
+    Args:
+        country: ISO3 country code
+
+    Returns:
+        bool: True if cached WASH data exists, False otherwise
+    """
+    file_name = f"{country}_wash.parquet"
+    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+
+
+# =============================================================================
+# ADMIN COUNTRY LAYER
+# Logically part of Base Layer Initialization but placed here for historical
+# reasons. Mirrors create_mercator_country_layer but aggregates at admin level 1.
+# =============================================================================
 def create_admin_country_layer(country, rewrite=0):
     """
     Create admin level 1 layer with demographic and infrastructure data for a country.
-    
-    This function generates an admin-level view containing:
-    - Population data (total, school-age, infants) from WorldPop
-    - Infrastructure data (built surface, SMOD settlement classification)
-    - School locations from GIGA API
-    - Health center locations from HealthSites API
-    - Relative Wealth Index (RWI) data
-    
+
+    Fallback used during `--type update` when the base admin parquet is missing. Produces
+    one row per admin level 1 boundary with all data columns aggregated to that level.
+    Applies the same data requirements as create_mercator_country_layer():
+
+    Data requirements — **hard failures** (aborts if unavailable):
+        - Total population (WorldPop 1km)
+        - School-age population (WorldPop 100m, age_structures)
+        - Infant population (WorldPop 100m, age_structures)
+        - Under-18 population (WorldPop 100m, age_structures)
+
+    Data requirements — **optional** (NaN/0 if unavailable; backfill with --type patch):
+        - GHSL built surface (built_surface_m2)
+        - SMOD settlement class L2 (smod_class) and derived L1 (smod_class_l1)
+        - Relative Wealth Index (rwi)
+        - Schools (num_schools) — 0 if API fails or no data
+        - Health centers (num_hcs) — 0 if API fails or no data
+        - Emergency shelters (num_shelters) — 0 if OSM returns nothing
+        - WASH facilities (num_wash) — 0 if OSM returns nothing
+
     Args:
         country: ISO3 country code
-        rewrite: If 1, replace existing cache; if 0, use cached if available
-    
+        rewrite: If 1, re-fetch school, HC, shelter, and WASH location caches from API/OSM;
+                 if 0, use cached parquets if available
+
     Returns:
-        gpd.GeoDataFrame: GeoDataFrame with admin level 1 boundaries containing all demographic and
-                         infrastructure data. Column 'zone_id' is renamed to 'tile_id'.
-    
-    Note:
-        Missing data (e.g., RWI, age-specific population) is handled gracefully with NaN values.
-        The function attempts multiple fallback strategies for age-specific population data.
+        gpd.GeoDataFrame: GeoDataFrame with admin level 1 boundaries and all demographic/
+                         infrastructure columns. 'zone_id' renamed to 'tile_id'.
     """
-    # Fetch schools and health centers using helper functions with caching
+    # Fetch facility locations — custom data priority handled inside fetch_*
     gdf_schools = fetch_schools(country, rewrite)
     gdf_hcs = fetch_health_centers(country, rewrite)
+    gdf_shelters = fetch_shelters(country, rewrite)
+    gdf_wash = fetch_wash(country, rewrite)
 
+    # Note: AdminBoundariesViewGenerator uses admin boundary IDs (not quadkeys), so
+    # custom tile-level CSVs (population_z<N>, built_surface_z<N>, etc.) do not apply here.
+    # Custom point data is handled above via fetch_schools/fetch_health_centers/fetch_shelters/fetch_wash.
     tiles_viewer = AdminBoundariesViewGenerator(country=country, admin_level=1, data_store=data_store)
-    
-    # Map school-age population (with fallback strategies)
-    try:
-        tiles_viewer.map_wp_pop(
-            country=country, 
-            resolution=WORLDPOP_RESOLUTION_HIGH, 
-            output_column="school_age_population", 
-            school_age=True, 
-            project="age_structures", 
-            un_adjusted=False, 
-            sex='F_M'
-        )
-    except Exception:
-        # Fallback: try age range method
-        try:
-            tiles_viewer.map_wp_pop(
-                country=country, 
-                resolution=WORLDPOP_RESOLUTION_HIGH, 
-                output_column="school_age_population", 
-                predicate='centroid_within', 
-                school_age=False, 
-                project="age_structures", 
-                un_adjusted=False,
-                min_age=SCHOOL_AGE_MIN, 
-                max_age=SCHOOL_AGE_MAX
-            )
-        except Exception:
-            # Final fallback: set to NaN
-            logger.warning(f"No school-age population data available for {country}")
-            school_age = {k: np.nan for k in tiles_viewer.view.index.unique()}
-            tiles_viewer.add_variable_to_view(school_age, 'school_age_population')
 
-    # Map infant population
-    try:
-        tiles_viewer.map_wp_pop(
-            country=country, 
-            resolution=WORLDPOP_RESOLUTION_HIGH, 
-            output_column="infant_population", 
-            predicate='centroid_within', 
-            school_age=False, 
-            project="age_structures", 
-            un_adjusted=False,
-            min_age=INFANT_AGE_MIN, 
-            max_age=INFANT_AGE_MAX
-        )
-    except Exception:
-        logger.warning(f"No infant population data available for {country}")
-        infant_pop = {k: np.nan for k in tiles_viewer.view.index.unique()}
-        tiles_viewer.add_variable_to_view(infant_pop, 'infant_population')
-
-    # Map total population and infrastructure data
+    # Population — hard requirements, raises on failure
+    tiles_viewer.map_wp_pop(
+        country=country,
+        resolution=WORLDPOP_RESOLUTION_HIGH,
+        output_column="school_age_population",
+        school_age=True,
+        project="age_structures",
+        un_adjusted=False,
+        sex='F_M'
+    )
+    tiles_viewer.map_wp_pop(
+        country=country,
+        resolution=WORLDPOP_RESOLUTION_HIGH,
+        output_column="infant_population",
+        predicate='centroid_within',
+        school_age=False,
+        project="age_structures",
+        un_adjusted=False,
+        min_age=INFANT_AGE_MIN,
+        max_age=INFANT_AGE_MAX
+    )
+    tiles_viewer.map_wp_pop(
+        country=country,
+        resolution=WORLDPOP_RESOLUTION_LOW,
+        output_column="under_18_population",
+        under_18=True,
+        project="age_structures",
+        un_adjusted=False,
+    )
     tiles_viewer.map_wp_pop(country=country, resolution=WORLDPOP_RESOLUTION_LOW)
-    tiles_viewer.map_built_s()
-    tiles_viewer.map_smod()
-    
-    ## schools
+
+    # GHSL built surface — optional, NaN fallback
+    try:
+        tiles_viewer.map_built_s()
+    except Exception as e:
+        logger.warning(f"{country}: GHSL built surface unavailable — setting to NaN: {e}")
+        tiles_viewer.add_variable_to_view(
+            {k: np.nan for k in tiles_viewer.view.index.unique()}, 'built_surface_m2'
+        )
+
+    # SMOD settlement class — optional, NaN fallback
+    try:
+        tiles_viewer.map_smod()
+    except Exception as e:
+        logger.warning(f"{country}: GHSL SMOD unavailable — setting to NaN: {e}")
+        tiles_viewer.add_variable_to_view(
+            {k: np.nan for k in tiles_viewer.view.index.unique()}, 'smod_class'
+        )
+
+    # Derive smod_class_l1
+    try:
+        smod_l2 = tiles_viewer.view['smod_class']
+        smod_l1 = smod_l2.map(SMOD_L2_TO_L1)
+        tiles_viewer.add_variable_to_view(smod_l1.to_dict(), 'smod_class_l1')
+    except Exception as e:
+        logger.warning(f"{country}: Could not derive smod_class_l1: {e}")
+        tiles_viewer.add_variable_to_view(
+            {k: np.nan for k in tiles_viewer.view.index.unique()}, 'smod_class_l1'
+        )
+
+    # Schools, health centers, shelters, WASH
     schools = tiles_viewer.map_points(points=gdf_schools)
     tiles_viewer.add_variable_to_view(schools, "num_schools")
-
-    ## health centers
     hcs = tiles_viewer.map_points(points=gdf_hcs)
     tiles_viewer.add_variable_to_view(hcs, "num_hcs")
+    shelters = tiles_viewer.map_points(points=gdf_shelters)
+    tiles_viewer.add_variable_to_view(shelters, "num_shelters")
+    wash_pts = tiles_viewer.map_points(points=gdf_wash)
+    tiles_viewer.add_variable_to_view(wash_pts, "num_wash")
 
-    # should we do RWI?
+    # RWI — optional, NaN fallback
     try:
         handler = RWIHandler(data_store=data_store)
         rwi_df = handler.load_data(country, ensure_available=True)
+        if rwi_df is None or (hasattr(rwi_df, 'empty') and rwi_df.empty):
+            raise ValueError(f"No RWI data available for {country}")
         rwi_gdf = convert_to_geodataframe(rwi_df)
         rwi = tiles_viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
     except Exception as e:
-        logger.warning(f"Relative Wealth Index will be empty: {e}")
+        logger.warning(f"{country}: Relative Wealth Index unavailable — setting to NaN: {e}")
         rwi = {k: np.nan for k in tiles_viewer.view.index.unique()}
-    
     tiles_viewer.add_variable_to_view(rwi, 'rwi')
 
     gdf_tiles = tiles_viewer.to_geodataframe()
     gdf_tiles.rename(columns={'zone_id': 'tile_id'}, inplace=True)
-    
+
     return gdf_tiles
 
+
+# =============================================================================
+# TILE & STORM VIEW PERSISTENCE
+# Save / load functions for per-storm tile impact views, CCI views, admin
+# aggregated views, and track views.
+# =============================================================================
 def save_admin_view(gdf, country):
     """Save base admin1 infrastructure view for country"""
     file_name = f"{country}_admin1.parquet"
@@ -1100,7 +2094,6 @@ def save_admin_views(countries, rewrite=0):
         countries: List of country codes
         rewrite: If 1, replace existing files; if 0, skip if exists
     """
-
     for country in countries:
         view = create_admin_country_layer(country, rewrite)
         save_admin_view(view, country)
@@ -1111,6 +2104,7 @@ def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level):
     """
     file_name = f"{country}_{storm}_{date}_{wind_th}_{zoom_level}.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+
 
 def save_cci_tiles(gdf, country, storm, date, zoom_level):
     """
@@ -1133,6 +2127,7 @@ def save_admin_tiles_view(gdf, country, storm, date, wind_th):
     file_name = f"{country}_{storm}_{date}_{wind_th}_admin1.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
+
 def save_cci_admin(gdf, country, storm, date):
     """
     Saves Child Cyclone Index (CCI) admin-level views to storage.
@@ -1151,6 +2146,7 @@ def load_admin_view(country):
     file_name = f"{country}_admin1.parquet"
     return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
+
 def save_tracks_view(gdf, country, storm, date, wind_th):
     """
     Saves tracks views
@@ -1159,9 +2155,13 @@ def save_tracks_view(gdf, country, storm, date, wind_th):
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name))
 
 
-##################################################
 
-cci_cols = ['CCI_children','CCI_pop','CCI_school_age','CCI_infants','E_CCI_children','E_CCI_pop','E_CCI_school_age','E_CCI_infants']    
+# =============================================================================
+# CCI CALCULATION
+# =============================================================================
+cci_cols = ['CCI_children', 'CCI_pop', 'CCI_school_age', 'CCI_infants', 'CCI_under_18',
+            'E_CCI_children', 'E_CCI_pop', 'E_CCI_school_age', 'E_CCI_infants', 'E_CCI_under_18']
+
 
 def calculate_ccis(wind_tiles_views, gdf_tiles):
     """
@@ -1208,6 +2208,11 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
         sorted_wind_views_indexed.append(df)
     k = len(sorted_wind_views_indexed)
     gdf_tiles_index = gdf_tiles.rename(columns={'tile_id':'zone_id'}).set_index('zone_id')
+    # Ensure all expected population columns are present (old tile files may be missing new columns)
+    for pop_col in ['school_age_population', 'infant_population', 'under_18_population', 'population']:
+        if pop_col not in gdf_tiles_index.columns:
+            logger.warning(f"Column '{pop_col}' missing from tile data — CCI_{pop_col} will be NaN (re-initialize country)")
+            gdf_tiles_index[pop_col] = np.nan
     cci_tiles_view = pd.DataFrame(index=gdf_tiles_index.index)
 
     # Children cci
@@ -1276,6 +2281,28 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     cci_tiles_view['E_CCI_infants'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants']]
 
+    # under-18 cci
+    for i in range(k-1):
+        wind = winds[i]
+        cci_tiles_view[f"{wind}"] = (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
+    wind = winds[-1]
+    cci_tiles_view[f"{wind}"] = (gdf_tiles_index['under_18_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER
+             for col in cci_tiles_view.columns if col not in cci_cols]
+    cci_tiles_view['CCI_under_18'] = sum(wcols)
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18']]
+
+    # under-18 e cci
+    for i in range(k-1):
+        wind = winds[i]
+        cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_under_18_population']) - (sorted_wind_views_indexed[i+1]['E_under_18_population'])
+    wind = winds[-1]
+    cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_under_18_population'])
+    wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER
+             for col in cci_tiles_view.columns if col not in cci_cols]
+    cci_tiles_view['E_CCI_under_18'] = sum(wcols)
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18']]
+
     # pop cci
     for i in range(k-1):
         wind = winds[i]
@@ -1285,7 +2312,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_pop'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop']]
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18','CCI_pop']]
 
     # pop e cci
     for i in range(k-1):
@@ -1296,7 +2323,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_pop'] = sum(wcols)
-    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_pop','E_CCI_pop']]
+    cci_tiles_view = cci_tiles_view[['CCI_children','E_CCI_children','CCI_school_age','E_CCI_school_age','CCI_infants','E_CCI_infants','CCI_under_18','E_CCI_under_18','CCI_pop','E_CCI_pop']]
     cci_tiles_view = cci_tiles_view.reset_index()
     
     # Ensure the index column is named 'zone_id'
@@ -1307,10 +2334,13 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     
     return cci_tiles_view
 
-##################################################
+
 
 # =============================================================================
-
+# MAIN IMPACT ANALYSIS ORCHESTRATION
+# Top-level function called per country per storm on every --type update run.
+# Coordinates all view generation, CCI calculation, and report writing.
+# =============================================================================
 def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom):
     """
     Create and save all impact views for a country from hurricane envelopes.
@@ -1319,6 +2349,8 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     storm forecast. It creates and saves:
     - School impact views (probability per wind threshold)
     - Health center impact views (probability per wind threshold)
+    - Shelter impact views (probability per wind threshold)
+    - WASH facility impact views (probability per wind threshold)
     - Tile impact views (expected impacts per tile per wind threshold)
     - Admin level impact views (aggregated by admin level 1)
     - Child Cyclone Index (CCI) views (both tile and admin level)
@@ -1355,6 +2387,22 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
     logger.info(f"    Created {len(wind_hc_views)} health center views")
 
+    # Shelters
+    logger.info(f"    Processing shelters...")
+    gdf_shelters = fetch_shelters(country, rewrite=0)
+    wind_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes)
+    for wind_th in wind_shelter_views:
+        save_shelter_view(wind_shelter_views[wind_th], country, storm, date, wind_th)
+    logger.info(f"    Created {len(wind_shelter_views)} shelter views")
+
+    # WASH
+    logger.info(f"    Processing WASH...")
+    gdf_wash = fetch_wash(country, rewrite=0)
+    wind_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes)
+    for wind_th in wind_wash_views:
+        save_wash_view(wind_wash_views[wind_th], country, storm, date, wind_th)
+    logger.info(f"    Created {len(wind_wash_views)} WASH views")
+
     # Tiles
     logger.info(f"    Processing tiles...")
     try:
@@ -1363,12 +2411,12 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         # Ensure admin IDs are present (in case file was created without them)
         if 'id' not in gdf_tiles.columns:
             logger.warning(f"    Mercator view missing admin IDs, adding them...")
-            gdf_tiles, _ = add_admin_ids(gdf_tiles, country, zoom, rewrite=0)
+            gdf_tiles, _ = add_admin_ids(gdf_tiles, country)
             save_mercator_view(gdf_tiles, country, zoom)
     except Exception as e:
         logger.info(f"    Creating base mercator tiles for {country}... ({e})")
         view = create_mercator_country_layer(country, zoom, rewrite=0)
-        gdf_tiles, _ = add_admin_ids(view, country, zoom, rewrite=0)
+        gdf_tiles, _ = add_admin_ids(view, country)
         save_mercator_view(gdf_tiles, country, zoom)
         logger.info(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
 
@@ -1377,10 +2425,9 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom)
     logger.info(f"    Created {len(wind_tiles_views)} tile views")
 
-    ### cci for tiles
+    # CCI for tiles
     cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
     save_cci_tiles(cci_tiles_view, country, storm, date, zoom)
-    #######
 
     # Admins
     logger.info(f"    Processing admins...")
@@ -1398,7 +2445,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th)
     logger.info(f"    Created {len(wind_admin_views)} admin views")
 
-    ### cci for admin
+    # CCI for admin
     # Define aggregation dictionary
     agg_dict = {col: "sum" for col in sum_cols_cci}
 
@@ -1407,12 +2454,11 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # Rename 'id' to 'tile_id' to match base admin parquet structure
     # Note: In base admin parquet, admin IDs are stored in 'tile_id' column
     cci_admin_view = agg.rename(columns={'id':'tile_id'})
-    ### add names ###
+ 
     # Add admin names if needed (currently commented out, but structure is ready)
-    #d_admin = gdf_admin.set_index('tile_id')['name'].to_dict()
-    #cci_admin_view['name'] = cci_admin_view['tile_id'].map(d_admin)
+    # d_admin = gdf_admin.set_index('tile_id')['name'].to_dict()
+    # cci_admin_view['name'] = cci_admin_view['tile_id'].map(d_admin)
     save_cci_admin(cci_admin_view, country, storm, date)
-    #######
 
     # Tracks
     logger.info(f"    Processing tracks...")
@@ -1424,9 +2470,13 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     df_tracks = get_snowflake_tracks(date, storm)
     gdf_tracks = convert_to_geodataframe(df_tracks)
 
-    json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date)
+    json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date, wind_shelter_views=wind_shelter_views, wind_wash_views=wind_wash_views)
     save_json_report(json_report, country, storm, date)
 
+
+# =============================================================================
+# SNOWFLAKE DATA LOADING
+# =============================================================================
 def load_envelopes_from_snowflake(storm, date):
     """Load envelope data directly from Snowflake"""
     # Convert date format if needed
