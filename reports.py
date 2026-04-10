@@ -718,7 +718,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     # Validate report structure
     missing_keys = [key for key in REPORT_TEMPLATE.keys() if key not in d]
     if missing_keys:
-        logger.warning(f"Report missing keys: {', '.join(missing_keys)}")
+        logger.debug(f"Report missing keys (expected for wind thresholds not reached): {', '.join(missing_keys)}")
     
     extra_keys = [key for key in d.keys() if key not in REPORT_TEMPLATE]
     if extra_keys:

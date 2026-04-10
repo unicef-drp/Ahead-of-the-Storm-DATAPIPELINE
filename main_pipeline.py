@@ -81,7 +81,7 @@ from gigaspatial.processing import buffer_geodataframe
 
 import json
 from snowflake_utils import get_snowflake_data, get_snowflake_connection, get_countries_in_range
-from country_utils import get_active_countries_from_snowflake
+from country_utils import get_active_countries_from_snowflake, add_country_to_snowflake
 
 
 # =============================================================================
@@ -215,8 +215,8 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
                     logger.info(f"  {country}: Not affected (skipping)")
         
         if not affected_countries:
-            logger.error("Envelopes do not intersect with any of the specified countries (within 1500km buffer)")
-            return {"success": False, "error": "No intersection with countries"}
+            logger.info("Envelopes do not intersect with any of the specified countries (within 1500km buffer) — skipping")
+            return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Processing {len(affected_countries)} affected country/countries: {', '.join(affected_countries)}")
         
@@ -340,10 +340,13 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
                 stats.countries_processed = analysis_result["countries_processed"]
                 stats.views_created = analysis_result["total_views_created"]
                 stats.affected_countries = analysis_result["affected_countries"]
-                logger.info(f"Impact analysis completed successfully")
-                logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
-                logger.info(f"   Countries processed: {stats.countries_processed}")
-                logger.info(f"   Views created: {stats.views_created}")
+                if analysis_result.get("skipped"):
+                    logger.info("Impact analysis skipped — storm not in range of any country")
+                else:
+                    logger.info(f"Impact analysis completed successfully")
+                    logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
+                    logger.info(f"   Countries processed: {stats.countries_processed}")
+                    logger.info(f"   Views created: {stats.views_created}")
             else:
                 stats.analysis_success = False
                 stats.errors.append(f"Analysis failed: {analysis_result['error']}")
@@ -379,20 +382,34 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
 def initialize_pipeline(countries, zoom, rewrite):
     """
     Initialize the data pipeline by creating base mercator and admin views.
-    
+
     This function creates the foundational geospatial data layers needed for impact
     analysis, including mercator tiles with demographic data and admin-level boundaries.
     The data is cached after first creation to avoid redundant downloads.
-    
+
+    If DATA_PIPELINE_DB=SNOWFLAKE and a country is not yet in PIPELINE_COUNTRIES,
+    it is automatically added with ACTIVE=TRUE before initialization proceeds.
+
     Args:
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         zoom: Zoom level for mercator tiles (typically 14)
         rewrite: If 1, regenerate existing views; if 0, skip if they exist
-    
+
     Returns:
         ImpactPipelineStats: Statistics object with analysis_success=True
     """
     stats = ImpactPipelineStats()
+
+    if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        for country in countries:
+            added = add_country_to_snowflake(
+                country_code=country,
+                country_name=country,  # placeholder name — update via GitHub Actions workflow if needed
+                zoom_level=zoom,
+            )
+            if added:
+                logger.info(f"{country}: auto-added to PIPELINE_COUNTRIES (no map config set — update CENTER_LAT/CENTER_LON/VIEW_ZOOM via 'Update Country Map Config' workflow)")
+
     save_mercator_and_admin_views(countries, zoom, rewrite)
     stats.analysis_success = True
     return stats
@@ -450,7 +467,7 @@ def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_writt
     cur.execute("""
         INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_COMPLETE_LOG
             (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS)
-        VALUES (PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS')
+        SELECT PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS'
     """, (
         json.dumps(storm_ids),
         json.dumps(countries),
@@ -543,7 +560,10 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
             time_str = forecast_time.replace(':', '')
             forecast_datetime_str = f"{date_str}{time_str}00"
 
-            if (storm not in d['storms'] or forecast_datetime_str not in d['storms'][storm]) or rewrite==1:
+            # Key includes countries so different country sets are tracked independently
+            countries_key = ','.join(sorted(countries))
+            storm_key = f"{storm}|{countries_key}"
+            if (storm_key not in d['storms'] or forecast_datetime_str not in d['storms'][storm_key]) or rewrite==1:
                 storms_processed = True
                 loop_stats = run_hurricane_pipeline(
                     storm=storm,
@@ -554,13 +574,16 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                     zoom=zoom
                 )
                 if loop_stats.analysis_success:
-                    logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
+                    if loop_stats.countries_processed == 0:
+                        logger.info(f"Storm {storm} at {forecast_datetime_str} — not in range of any country, skipped")
+                    else:
+                        logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
                     stats.countries_processed += loop_stats.countries_processed
                     stats.views_created += loop_stats.views_created
                     stats.affected_countries.extend(loop_stats.affected_countries)
-                    if storm not in d['storms']:
-                        d['storms'][storm] = []
-                    d['storms'][storm].append(forecast_datetime_str)
+                    if storm_key not in d['storms']:
+                        d['storms'][storm_key] = []
+                    d['storms'][storm_key].append(forecast_datetime_str)
                     completed_storm_ids.append(storm)
                     completed_countries.update(loop_stats.affected_countries)
                     total_files_written += loop_stats.views_created
@@ -569,8 +592,8 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                     stats.analysis_success = False
                     stats.errors.extend(loop_stats.errors)
             else:
-                # Storm already processed and rewrite=0, so skip
-                logger.info(f"Storm {storm} at {forecast_datetime_str} already processed (use --rewrite 1 to reprocess)")
+                # Storm already processed for these countries and rewrite=0, so skip
+                logger.info(f"Storm {storm} at {forecast_datetime_str} already processed for {countries_key} (use --rewrite 1 to reprocess)")
         else:
             logger.debug(f"Forecast date {forecast_date} outside time delta ({time_delta} days)")
 
