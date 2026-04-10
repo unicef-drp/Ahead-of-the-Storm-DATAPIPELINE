@@ -79,7 +79,7 @@ filtering by level can be applied downstream.
 | `school_name` | No | string | School name |
 | `school_data_source` | No | string | e.g. `government`, `ministry_of_education` |
 
-> **Extra columns:** Any additional columns (e.g. `school_name`, `school_data_source`, `education_level`) are preserved in the parquet cache (`school_views/<COUNTRY>_schools.parquet`) and available for downstream use. They are not used in impact calculations.
+> **Extra columns:** Any additional columns (e.g. `school_name`, `school_data_source`, `education_level`) are preserved in the parquet cache (`school_views/<COUNTRY>_schools.parquet`) and available for downstream use. They are not used in impact calculations. See `schema_schools.md` for canonical column names.
 
 See `template_schools.csv` for a header-only template and `example_schools.csv` for sample rows.
 
@@ -102,7 +102,7 @@ Included by default: `hospital`, `clinic`, `doctors` (see `HC_FACILITY_TYPES` in
 | `amenity` | Yes | string | HealthSites.io/OSM amenity tag. Documented values: `hospital`, `clinic`, `doctors`, `dentist`, `pharmacy`. Only `hospital`, `clinic`, `doctors` are included in impact calculations by default. |
 | `name` | No | string | Facility name |
 
-> **Extra columns:** Any additional columns (e.g. `name`) are preserved in the parquet cache (`hc_views/<COUNTRY>_hcs.parquet`) and available for downstream use. They are not used in impact calculations.
+> **Extra columns:** Any additional columns are preserved in the parquet cache (`hc_views/<COUNTRY>_health_centers.parquet`) and available for downstream use. They are not used in impact calculations. See `schema_health_centers.md` for canonical column names.
 
 See `template_health_centers.csv` and `example_health_centers.csv`.
 
@@ -125,7 +125,7 @@ All facilities in this file enter impact calculations (no type filtering is appl
 | `shelter_type` | No | string | e.g. `evacuation_centre`, `refugee_shelter`, `community_hall` |
 | `capacity` | No | int | Maximum occupancy if known |
 
-> **Extra columns:** Any additional columns (e.g. `name`, `shelter_type`, `capacity`) are preserved in the parquet cache (`shelter_views/<COUNTRY>_shelters.parquet`) and available for downstream use. They are not used in impact calculations.
+> **Extra columns:** Any additional columns are preserved in the parquet cache (`shelter_views/<COUNTRY>_shelters.parquet`) and available for downstream use. They are not used in impact calculations. See `schema_shelters.md` for canonical column names.
 
 See `template_shelters.csv` and `example_shelters.csv`.
 
@@ -150,7 +150,7 @@ the type). Accepted values match those fetched from OSM via `WASH_LOCATION_TYPES
 | `wash_type` | Yes | string | Facility type. Values: `drinking_water`, `water_point`, `toilets`, `shower`, `water_well`, `water_tap`, `water_works`, `pumping_station`, `wastewater_treatment_plant` |
 | `name` | No | string | Facility name |
 
-> **Extra columns:** Any additional columns (e.g. `name`) are preserved in the parquet cache (`wash_views/<COUNTRY>_wash.parquet`) and available for downstream use. They are not used in impact calculations.
+> **Extra columns:** Any additional columns are preserved in the parquet cache (`wash_views/<COUNTRY>_wash.parquet`) and available for downstream use. They are not used in impact calculations. See `schema_wash.md` for canonical column names.
 
 See `template_wash.csv` and `example_wash.csv`.
 
