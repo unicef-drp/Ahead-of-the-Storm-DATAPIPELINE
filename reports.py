@@ -533,7 +533,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         d_rows_admins_pop_total["cci"] = int(admin_cci['E_CCI_pop'].sum())
         d_rows_admins_school["cci"] = int(admin_cci['E_CCI_school_age'].sum())
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())
-        d_rows_admins_adolescent["cci"] = int(admin_cci['E_CCI_adolescent'].sum())
+        d_rows_admins_adolescent["cci"] = int(admin_cci['E_CCI_adolescents'].sum())
 
         rows_admins_pop_total.append(d_rows_admins_pop_total)
         rows_admins_school.append(d_rows_admins_school)
@@ -634,7 +634,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     d['expected_cci_pop'] = int(cci_tiles_view['E_CCI_pop'].sum())
     d['expected_cci_school'] = int(cci_tiles_view['E_CCI_school_age'].sum())
     d['expected_cci_infant'] = int(cci_tiles_view['E_CCI_infants'].sum())
-    d['expected_cci_adolescent'] = int(cci_tiles_view['E_CCI_adolescent'].sum())
+    d['expected_cci_adolescent'] = int(cci_tiles_view['E_CCI_adolescents'].sum())
     
     # Calculate children change from previous forecast
     children_change = _calculate_children_change(d['expected_children'], d_previous)

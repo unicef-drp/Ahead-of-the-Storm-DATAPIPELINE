@@ -69,6 +69,25 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
 7. **Snowflake Tables** must exist:
    - `TC_TRACKS` - Hurricane track data
    - `TC_ENVELOPES_COMBINED` - Hurricane envelope data
+   - `TC_PIPELINE_COMPLETE_LOG` - Completion signal table (see below)
+
+## Completion Signal & Event-Driven Refresh
+
+`TC_PIPELINE_COMPLETE_LOG` is the handshake between DATAPIPELINE and the `*_MAT` table refresh.
+
+**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the `AOTS_ANALYSIS` stage, something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready — it can only poll on a fixed cron.
+
+**The chain:**
+```
+DATAPIPELINE finishes writing Parquet to stage
+    → INSERT into TC_PIPELINE_COMPLETE_LOG   (signal_pipeline_complete())
+    → TC_PIPELINE_COMPLETE_STREAM detects the new row
+    → TRIGGER_REFRESH_TASK fires within 5 min
+    → CALL REFRESH_MATERIALIZED_VIEWS()      (reloads all *_MAT tables from stage)
+    → Dash app and AI agent see fresh data
+```
+
+Without it, the only alternative is `TRIGGER_REFRESH_INTERIM` — a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
 
 8. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
    
