@@ -38,3 +38,4 @@ snowflake/data_sharing/
 download_tc_tracks.py
 geosight/
 test-scripts/
+snowflake/COST_ESTIMATION.md

@@ -89,6 +89,22 @@ DATAPIPELINE finishes writing Parquet to stage
 
 Without it, the only alternative is `TRIGGER_REFRESH_INTERIM` — a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
 
+**Table schema:**
+```sql
+CREATE TABLE IF NOT EXISTS TC_PIPELINE_COMPLETE_LOG (
+    LOG_ID               NUMBER AUTOINCREMENT PRIMARY KEY,
+    RUN_TIMESTAMP        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    STORM_IDS            VARIANT,   -- JSON array of storm names processed
+    COUNTRIES_PROCESSED  VARIANT,   -- JSON array of ISO3 country codes
+    FILES_WRITTEN        NUMBER,    -- total Parquet/CSV files PUT to stage
+    STATUS               VARCHAR(20),
+    RUNTIME_SECONDS      NUMBER,    -- wall-clock seconds for the full update run
+    NOTES                VARCHAR
+);
+```
+
+`RUNTIME_SECONDS` is populated by `signal_pipeline_complete()` in `main_pipeline.py`.
+
 8. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
    
    The stage must be created in the same database and schema where the pipeline is running:

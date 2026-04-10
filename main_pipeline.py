@@ -457,7 +457,7 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
 # =============================================================================
 # COMPLETION SIGNAL
 # =============================================================================
-def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_written: int):
+def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_written: int, runtime_seconds: int = None):
     """
     Insert a completion record into TC_PIPELINE_COMPLETE_LOG.
     This triggers the stream-based refresh of *_MAT tables in Snowflake.
@@ -466,12 +466,13 @@ def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_writt
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_COMPLETE_LOG
-            (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS)
-        SELECT PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS'
+            (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS, RUNTIME_SECONDS)
+        SELECT PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS', %s
     """, (
         json.dumps(storm_ids),
         json.dumps(countries),
-        files_written
+        files_written,
+        runtime_seconds
     ))
     conn.commit()
     cur.close()
@@ -516,6 +517,7 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     d = load_json_storms()
     stats = ImpactPipelineStats()
     stats.analysis_success = True  # assume success; flip to False on any failure
+    update_start_time = datetime.now()
 
     storms_df = get_snowflake_data()
     storms_df['DATE'] = pd.to_datetime(storms_df['FORECAST_TIME']).dt.date
@@ -610,15 +612,17 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     # Signal completion to Snowflake so *_MAT tables refresh via stream trigger
     if completed_storm_ids:
         try:
+            runtime_seconds = int((datetime.now() - update_start_time).total_seconds())
             conn = get_snowflake_connection()
             signal_pipeline_complete(
                 conn=conn,
                 storm_ids=completed_storm_ids,
                 countries=list(completed_countries),
-                files_written=total_files_written
+                files_written=total_files_written,
+                runtime_seconds=runtime_seconds
             )
             conn.close()
-            logger.info(f"Signalled pipeline completion to Snowflake for storms: {completed_storm_ids}")
+            logger.info(f"Signalled pipeline completion to Snowflake for storms: {completed_storm_ids} (runtime: {runtime_seconds}s)")
         except Exception as e:
             logger.warning(f"Could not write completion signal to Snowflake: {e}")
 
