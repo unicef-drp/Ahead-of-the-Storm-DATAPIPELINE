@@ -947,9 +947,9 @@ def save_mercator_view(gdf, country, zoom_level):
 
 def admins_overlay(gdf_admins1, gdf_mercator):
     """
-    Assign admin level 1 IDs to mercator tiles.
+    Assign admin boundary IDs to mercator tiles.
 
-    Three-step assignment, applied in order:
+    Works for any admin level (1, 2, …). Three-step assignment, applied in order:
 
     1. Centroid-within: each tile is assigned to the admin region that contains its
        centroid (projected to equal-area CRS for accuracy). Handles most tiles.
@@ -969,11 +969,11 @@ def admins_overlay(gdf_admins1, gdf_mercator):
     passing gdf_admins1 (see add_admin_ids).
 
     Args:
-        gdf_admins1: GeoDataFrame with admin level 1 boundaries. Must have 'id' column.
+        gdf_admins1: GeoDataFrame with admin boundaries (any level). Must have 'id' column.
         gdf_mercator: GeoDataFrame with mercator tiles. Must have 'tile_id' column.
 
     Returns:
-        gpd.GeoDataFrame: Mercator tiles with an added 'id' column (admin level 1 ID).
+        gpd.GeoDataFrame: Mercator tiles with an added 'id' column (admin boundary ID).
     """
     # Step 1: centroid-based assignment (primary)
     # Project to equal-area CRS for accurate centroid computation
@@ -1026,33 +1026,45 @@ def admins_overlay(gdf_admins1, gdf_mercator):
     return gpd.GeoDataFrame(result, geometry="geometry", crs=gdf_mercator.crs)
 
 
-def add_admin_ids(view, country):
+def add_admin_ids(view, country, admin_level=1, strict=False):
     """
-    Add admin level 1 IDs to a mercator tile view.
+    Add admin-level IDs to a mercator tile view.
 
-    Fetches admin level 1 boundaries from GeoRepo and assigns each tile to the
-    admin boundary with the largest intersection area (via admins_overlay).
+    Fetches admin boundaries at the requested level from GeoRepo and assigns each
+    tile to the admin boundary with the largest intersection area (via admins_overlay).
+    Unless strict=True, falls back to admin level 0 (whole country) if the requested
+    level is unavailable.
 
     Args:
         view: GeoDataFrame containing mercator tiles (must have 'tile_id' column)
         country: ISO3 country code
+        admin_level: Admin level to use for boundary assignment (default: 1)
+        strict: If True, raise ValueError instead of falling back to admin 0 when
+                the requested level is unavailable (default: False)
 
     Returns:
-        tuple: (combined_view, gdf_admins1) where:
-            - combined_view: GeoDataFrame with tiles and 'id' column (admin level 1 ID)
-            - gdf_admins1: GeoDataFrame with admin level 1 boundaries
+        tuple: (combined_view, gdf_admins) where:
+            - combined_view: GeoDataFrame with tiles and 'id' column (admin boundary ID)
+            - gdf_admins: GeoDataFrame with admin boundaries at the requested level
+
+    Raises:
+        ValueError: If strict=True and the requested admin level is unavailable
     """
     try:
-        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=1).to_geodataframe()
+        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=admin_level).to_geodataframe()
         # giga-spatial 0.9.x AdminBoundaries.to_geodataframe() returns 'boundary_id';
         # older versions returned 'id'. Normalise to 'id' so downstream code is consistent.
         if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
             gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
         if gdf_admins1.empty or "id" not in gdf_admins1.columns:
-            raise ValueError("Admin level 1 boundaries empty or missing 'id' column")
+            raise ValueError(f"Admin level {admin_level} boundaries empty or missing 'id' column")
     except Exception as e:
+        if strict:
+            raise ValueError(
+                f"{country}: Admin level {admin_level} not available in GeoRepo ({e})"
+            ) from e
         logger.warning(
-            f"{country}: Admin level 1 boundaries unavailable ({e}) — "
+            f"{country}: Admin level {admin_level} boundaries unavailable ({e}) — "
             "falling back to admin level 0 (whole country as single region)"
         )
         gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=0).to_geodataframe()
@@ -1064,6 +1076,28 @@ def add_admin_ids(view, country):
             gdf_admins1["id"] = country
     combined_view = admins_overlay(gdf_admins1, view)
     return combined_view, gdf_admins1
+
+
+def get_initialized_admin_levels(country):
+    """
+    Return the list of admin levels that have base parquets initialized for a country.
+
+    Probes for admin1 through admin5 parquets. This determines which admin-level
+    storm views are produced during --type update.
+
+    Args:
+        country: ISO3 country code
+
+    Returns:
+        list[int]: Admin levels with existing base parquets (e.g. [1, 2])
+    """
+    found = []
+    for level in range(1, 6):
+        file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views',
+                                 f"{country}_admin{level}.parquet")
+        if data_store.file_exists(file_path):
+            found.append(level)
+    return found
 
 
 def write_country_boundary(country: str):
@@ -1122,6 +1156,9 @@ def patch_country_layer(country, zoom_level, columns):
         hcs                    — re-fetches health center locations and recomputes counts (updates num_hcs column)
         shelters               — re-fetches shelter locations from OSM or custom CSV and recomputes counts (updates num_shelters column)
         wash                   — re-fetches WASH facility locations from OSM or custom CSV and recomputes counts (updates num_wash column)
+        admin<N>               — creates a new base admin parquet for level N (e.g. admin2). Does not modify
+                                 the mercator parquet. Fails with a clear error if GeoRepo has no level-N
+                                 boundaries for the country.
 
     Population columns are patched individually — use this when a new WorldPop dataset is
     available without needing to re-fetch schools, HCs, or raster data for other columns.
@@ -1138,16 +1175,28 @@ def patch_country_layer(country, zoom_level, columns):
         FileNotFoundError: If no base mercator parquet exists for the country (run init first)
         ValueError: If an unsupported column is requested
     """
+    import re as _re
     PATCHABLE = {
         'population', 'school_age_population', 'infant_population', 'adolescent_population',
         'built_surface_m2', 'smod_class', 'smod_class_l1', 'rwi',
         'schools', 'hcs', 'shelters', 'wash',
     }
+    # Separate admin-level columns (e.g. 'admin2', 'admin3') from regular columns
+    admin_patch_levels = []
+    regular_columns = []
+    for col in columns:
+        m = _re.fullmatch(r'admin(\d+)', col)
+        if m:
+            admin_patch_levels.append(int(m.group(1)))
+        else:
+            regular_columns.append(col)
+    columns = regular_columns
+
     unsupported = set(columns) - PATCHABLE
     if unsupported:
         raise ValueError(
             f"{country}: Unsupported columns {unsupported}. "
-            f"Patchable columns: {sorted(PATCHABLE)}"
+            f"Patchable columns: {sorted(PATCHABLE)} or admin<N> (e.g. admin2)"
         )
 
     # Normalise: smod_class_l1 is always derived from smod_class
@@ -1160,7 +1209,8 @@ def patch_country_layer(country, zoom_level, columns):
                                 f"Run --type initialize first.")
 
     gdf = read_dataset(data_store, file_path)
-    logger.info(f"{country}: Patching columns {columns} in existing mercator parquet ({len(gdf)} tiles)")
+    patching_desc = columns + [f"admin{n}" for n in admin_patch_levels]
+    logger.info(f"{country}: Patching {patching_desc} in existing parquet ({len(gdf)} tiles)")
 
     # Temporary MercatorViewGenerator seeded from existing tile geometries
     from gigaspatial.generators import MercatorViewGenerator as _MVG
@@ -1283,108 +1333,156 @@ def patch_country_layer(country, zoom_level, columns):
         gdf['num_wash'] = gdf['tile_id'].map(wash_pts)
         logger.info(f"{country}: Patched num_wash")
 
-    write_dataset(gdf, data_store, file_path)
-    logger.info(f"{country}: Patch complete — saved updated mercator parquet")
+    if columns:
+        write_dataset(gdf, data_store, file_path)
+        logger.info(f"{country}: Patch complete — saved updated mercator parquet")
 
-    # Re-aggregate the admin parquet so baseline admin-level counts stay in sync.
-    # Only possible if the mercator parquet has the 'id' column (admin assignment).
-    admin_file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', f"{country}_admin1.parquet")
-    if 'id' not in gdf.columns:
-        logger.warning(f"{country}: Mercator parquet has no 'id' column — skipping admin parquet update "
-                       f"(run --type initialize to add admin assignments)")
-    elif not data_store.file_exists(admin_file_path):
-        logger.warning(f"{country}: No admin parquet found — skipping admin update "
-                       f"(run --type initialize to create it)")
-    else:
-        gdf_admin = read_dataset(data_store, admin_file_path)
-        agg_dict = {col: "sum" for col in sum_cols_admin if col in gdf.columns}
-        agg_dict.update({col: "mean" for col in avg_cols_admin if col in gdf.columns})
-        agg = gdf.groupby("id").agg(agg_dict).reset_index()
-        agg = agg.rename(columns={'id': 'tile_id'})
-        # Restore names and geometries from the existing admin parquet
-        d_name = gdf_admin.set_index('tile_id')['name'].to_dict() if 'name' in gdf_admin.columns else {}
-        d_geo = gdf_admin.set_index('tile_id')['geometry'].to_dict()
-        agg['name'] = agg['tile_id'].map(d_name)
-        agg['geometry'] = agg['tile_id'].map(d_geo)
-        agg = convert_to_geodataframe(agg)
-        save_admin_view(agg, country)
-        logger.info(f"{country}: Updated admin parquet with patched columns")
+        # Re-aggregate all existing admin parquets so baseline counts stay in sync.
+        if 'id' not in gdf.columns:
+            logger.warning(f"{country}: Mercator parquet has no 'id' column — skipping admin parquet sync "
+                           f"(run --type initialize to add admin assignments)")
+        else:
+            for existing_level in get_initialized_admin_levels(country):
+                admin_file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views',
+                                               f"{country}_admin{existing_level}.parquet")
+                gdf_admin = read_dataset(data_store, admin_file_path)
+                if existing_level == 1:
+                    # admin1 IDs are already in the mercator parquet's 'id' column
+                    src = gdf
+                    group_col = 'id'
+                else:
+                    # For other levels, temporarily remap tile IDs via spatial join
+                    src, _ = add_admin_ids(gdf.drop(columns=['id'], errors='ignore'),
+                                           country, admin_level=existing_level, strict=True)
+                    group_col = 'id'
+                agg_dict = {col: "sum" for col in sum_cols_admin if col in src.columns}
+                agg_dict.update({col: "mean" for col in avg_cols_admin if col in src.columns})
+                agg = src.groupby(group_col).agg(agg_dict).reset_index()
+                agg = agg.rename(columns={group_col: 'tile_id'})
+                d_name = gdf_admin.set_index('tile_id')['name'].to_dict() if 'name' in gdf_admin.columns else {}
+                d_geo = gdf_admin.set_index('tile_id')['geometry'].to_dict()
+                agg['name'] = agg['tile_id'].map(d_name)
+                agg['geometry'] = agg['tile_id'].map(d_geo)
+                agg = convert_to_geodataframe(agg)
+                save_admin_view(agg, country, admin_level=existing_level)
+                logger.info(f"{country}: Synced admin{existing_level} parquet with patched columns")
+
+    # Create new admin parquets for levels requested via --columns adminN
+    if admin_patch_levels:
+        for admin_level in admin_patch_levels:
+            try:
+                # Use raw mercator tiles (without admin1 'id') as input for arbitrary levels
+                src = gdf.drop(columns=['id'], errors='ignore') if admin_level != 1 else gdf
+                admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
+                save_admin_view(admin_view, country, admin_level=admin_level)
+                logger.info(f"{country}: Created admin{admin_level} parquet")
+            except ValueError as e:
+                logger.error(f"{country}: Cannot create admin{admin_level} — {e}")
 
 
-def save_mercator_and_admin_views(countries,zoom_level,rewrite):
+def _build_admin_view_from_mercator(view, country, admin_level):
+    """
+    Aggregate mercator tiles to admin boundaries and return a GeoDataFrame.
+
+    Internal helper used by save_mercator_and_admin_views to avoid duplicating
+    the aggregation logic across the new/rewrite branches.
+
+    Args:
+        view: Mercator tile GeoDataFrame (must have 'tile_id' column)
+        country: ISO3 country code
+        admin_level: Admin level to aggregate to
+
+    Returns:
+        gpd.GeoDataFrame with one row per admin boundary and all demographic columns
+    """
+    combined_view, gdf_admins = add_admin_ids(view, country, admin_level=admin_level, strict=True)
+    d = gdf_admins.set_index('id')['name'].to_dict()
+    d_geo = gdf_admins.set_index('id')['geometry'].to_dict()
+
+    agg_dict = {col: "sum" for col in sum_cols_admin if col in combined_view.columns}
+    agg_dict.update({col: "mean" for col in avg_cols_admin if col in combined_view.columns})
+    agg = combined_view.groupby("id").agg(agg_dict).reset_index()
+    # Ensure all admin regions appear even if no tiles were assigned to them
+    all_ids = gdf_admins[['id']].copy()
+    agg = all_ids.merge(agg, on='id', how='left')
+    for col in list(sum_cols_admin) + list(avg_cols_admin):
+        if col in agg.columns:
+            agg[col] = agg[col].fillna(0)
+    admin_view = agg.rename(columns={'id': 'tile_id'})
+    admin_view['name'] = admin_view['tile_id'].map(d)
+    admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
+    return convert_to_geodataframe(admin_view)
+
+
+def save_mercator_and_admin_views(countries, zoom_level, rewrite, admin_levels=None):
     """
     Generates and saves all country mercator views and admin views.
     Automatically tracks initialization in Snowflake after successful completion.
+
+    Args:
+        countries: List of ISO3 country codes
+        zoom_level: Zoom level for mercator tiles
+        rewrite: If 1, regenerate existing views; if 0, skip if they exist
+        admin_levels: List of admin levels to generate (default: [1])
     """
+    if admin_levels is None:
+        admin_levels = [1]
+
     for country in countries:
         file_name = f"{country}_{zoom_level}.parquet"
         file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
         initialized = False
-        
+
         if not data_store.file_exists(file_path):
             view = create_mercator_country_layer(country, zoom_level, rewrite)
-            combined_view, gdf_admins1 = add_admin_ids(view, country)
-            d = gdf_admins1.set_index('id')['name'].to_dict()
-            d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
+            # Admin level 1 is always used for the mercator tile 'id' assignment
+            # (stored in the mercator parquet for backward-compatibility)
+            combined_view, gdf_admins1 = add_admin_ids(view, country, admin_level=1)
             save_mercator_view(combined_view, country, zoom_level)
-            
-            #### Aggregate by admin ####
-            # Define aggregation dictionary
-            agg_dict = {col: "sum" for col in sum_cols_admin}
-            agg_dict.update({col: "mean" for col in avg_cols_admin})
 
-            # Group by large_id and aggregate
-            agg = combined_view.groupby("id").agg(agg_dict).reset_index()
-            # Ensure all admin regions appear even if no tiles were assigned to them
-            # (e.g. very small regions like NCR whose border tiles all overlap more with neighbours)
-            all_ids = gdf_admins1[['id']].copy()
-            agg = all_ids.merge(agg, on='id', how='left')
-            for col in list(sum_cols_admin) + list(avg_cols_admin):
-                if col in agg.columns:
-                    agg[col] = agg[col].fillna(0)
-            admin_view = agg.rename(columns={'id':'tile_id'})
-            ### add names ###
-            admin_view['name'] = admin_view['tile_id'].map(d)
-            admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
-            admin_view = convert_to_geodataframe(admin_view)
-            save_admin_view(admin_view,country)
-      
+            for admin_level in admin_levels:
+                try:
+                    src = combined_view if admin_level == 1 else view
+                    admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
+                    save_admin_view(admin_view, country, admin_level=admin_level)
+                except ValueError as e:
+                    logger.error(f"{country}: Skipping admin{admin_level} — {e}")
+
             initialized = True
         elif rewrite:
             # When rewrite=1, regenerate the entire mercator view from scratch
             view = create_mercator_country_layer(country, zoom_level, rewrite)
-            combined_view, gdf_admins1 = add_admin_ids(view, country)
-            d = gdf_admins1.set_index('id')['name'].to_dict()
-            d_geo = gdf_admins1.set_index('id')['geometry'].to_dict()
+            combined_view, gdf_admins1 = add_admin_ids(view, country, admin_level=1)
             save_mercator_view(combined_view, country, zoom_level)
-            #### Aggregate by admin ####
-            
-            # Define aggregation dictionary
-            agg_dict = {col: "sum" for col in sum_cols_admin}
-            agg_dict.update({col: "mean" for col in avg_cols_admin})
 
-            # Group by large_id and aggregate
-            agg = combined_view.groupby("id").agg(agg_dict).reset_index()
-            # Ensure all admin regions appear even if no tiles were assigned to them
-            # (e.g. very small regions like NCR whose border tiles all overlap more with neighbours)
-            all_ids = gdf_admins1[['id']].copy()
-            agg = all_ids.merge(agg, on='id', how='left')
-            for col in list(sum_cols_admin) + list(avg_cols_admin):
-                if col in agg.columns:
-                    agg[col] = agg[col].fillna(0)
-            admin_view = agg.rename(columns={'id':'tile_id'})
-            ### add names ###
-            admin_view['name'] = admin_view['tile_id'].map(d)
-            admin_view['geometry'] = admin_view['tile_id'].map(d_geo)
-            admin_view = convert_to_geodataframe(admin_view)
-            save_admin_view(admin_view,country)
-            
+            for admin_level in admin_levels:
+                try:
+                    src = combined_view if admin_level == 1 else view
+                    admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
+                    save_admin_view(admin_view, country, admin_level=admin_level)
+                except ValueError as e:
+                    logger.error(f"{country}: Skipping admin{admin_level} — {e}")
+
             initialized = True
         else:
-            # File already exists and rewrite=0
-            # This means it was initialized before, so ensure it's tracked
-            logger.info(f"File already exists for {country} at zoom {zoom_level}, ensuring tracking is up to date")
-            initialized = True  # Mark as initialized since file exists
+            # Mercator file already exists and rewrite=0 — skip regeneration.
+            # Still create any admin parquets for levels not yet initialized.
+            logger.info(f"Mercator file already exists for {country} at zoom {zoom_level}, ensuring tracking is up to date")
+            view = read_dataset(data_store, file_path)
+            for admin_level in admin_levels:
+                admin_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views',
+                                          f"{country}_admin{admin_level}.parquet")
+                if not data_store.file_exists(admin_path):
+                    try:
+                        src = view if admin_level == 1 else view.drop(columns=['id'], errors='ignore')
+                        admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
+                        save_admin_view(admin_view, country, admin_level=admin_level)
+                        logger.info(f"{country}: Created admin{admin_level} parquet")
+                    except ValueError as e:
+                        logger.error(f"{country}: Skipping admin{admin_level} — {e}")
+                else:
+                    logger.info(f"{country}: admin{admin_level} already exists — skipping")
+            initialized = True
         
         # Automatically track initialization and write boundary to Snowflake
         # Both are safe to call even if already tracked / already populated
@@ -2109,14 +2207,14 @@ def wash_exist(country):
 # =============================================================================
 # ADMIN COUNTRY LAYER
 # Logically part of Base Layer Initialization but placed here for historical
-# reasons. Mirrors create_mercator_country_layer but aggregates at admin level 1.
+# reasons. Mirrors create_mercator_country_layer but aggregates at admin level N.
 # =============================================================================
-def create_admin_country_layer(country, rewrite=0):
+def create_admin_country_layer(country, rewrite=0, admin_level=1):
     """
-    Create admin level 1 layer with demographic and infrastructure data for a country.
+    Create an admin-level layer with demographic and infrastructure data for a country.
 
     Fallback used during `--type update` when the base admin parquet is missing. Produces
-    one row per admin level 1 boundary with all data columns aggregated to that level.
+    one row per admin boundary with all data columns aggregated to that level.
     Applies the same data requirements as create_mercator_country_layer():
 
     Data requirements — **hard failures** (aborts if unavailable):
@@ -2138,9 +2236,10 @@ def create_admin_country_layer(country, rewrite=0):
         country: ISO3 country code
         rewrite: If 1, re-fetch school, HC, shelter, and WASH location caches from API/OSM;
                  if 0, use cached parquets if available
+        admin_level: Admin level to use for boundary aggregation (default: 1)
 
     Returns:
-        gpd.GeoDataFrame: GeoDataFrame with admin level 1 boundaries and all demographic/
+        gpd.GeoDataFrame: GeoDataFrame with admin boundaries and all demographic/
                          infrastructure columns. 'zone_id' renamed to 'tile_id'.
     """
     # Fetch facility locations — custom data priority handled inside fetch_*
@@ -2152,7 +2251,7 @@ def create_admin_country_layer(country, rewrite=0):
     # Note: AdminBoundariesViewGenerator uses admin boundary IDs (not quadkeys), so
     # custom tile-level CSVs (population_z<N>, built_surface_z<N>, etc.) do not apply here.
     # Custom point data is handled above via fetch_schools/fetch_health_centers/fetch_shelters/fetch_wash.
-    tiles_viewer = AdminBoundariesViewGenerator(country=country, admin_level=1, data_store=data_store)
+    tiles_viewer = AdminBoundariesViewGenerator(country=country, admin_level=admin_level, data_store=data_store)
 
     # Population — hard requirements, raises on failure
     tiles_viewer.map_wp_pop(
@@ -2260,22 +2359,23 @@ def create_admin_country_layer(country, rewrite=0):
 # Save / load functions for per-storm tile impact views, CCI views, admin
 # aggregated views, and track views.
 # =============================================================================
-def save_admin_view(gdf, country):
-    """Save base admin1 infrastructure view for country"""
-    file_name = f"{country}_admin1.parquet"
+def save_admin_view(gdf, country, admin_level=1):
+    """Save base admin infrastructure view for country"""
+    file_name = f"{country}_admin{admin_level}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
-def save_admin_views(countries, rewrite=0):
+def save_admin_views(countries, rewrite=0, admin_level=1):
     """
-    Generates and saves all country admin1 views
-    
+    Generates and saves all country admin views for a given admin level.
+
     Args:
         countries: List of country codes
         rewrite: If 1, replace existing files; if 0, skip if exists
+        admin_level: Admin level to generate views for (default: 1)
     """
     for country in countries:
-        view = create_admin_country_layer(country, rewrite)
-        save_admin_view(view, country)
+        view = create_admin_country_layer(country, rewrite, admin_level=admin_level)
+        save_admin_view(view, country, admin_level=admin_level)
 
 def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level):
     """
@@ -2299,30 +2399,31 @@ def save_cci_tiles(gdf, country, storm, date, zoom_level):
     file_name = f"{country}_{storm}_{date}_{zoom_level}_cci.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
 
-def save_admin_tiles_view(gdf, country, storm, date, wind_th):
+def save_admin_tiles_view(gdf, country, storm, date, wind_th, admin_level=1):
     """
     Saves admin tiles views
     """
-    file_name = f"{country}_{storm}_{date}_{wind_th}_admin1.csv"
+    file_name = f"{country}_{storm}_{date}_{wind_th}_admin{admin_level}.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
 
-def save_cci_admin(gdf, country, storm, date):
+def save_cci_admin(gdf, country, storm, date, admin_level=1):
     """
     Saves Child Cyclone Index (CCI) admin-level views to storage.
-    
+
     Args:
         gdf: GeoDataFrame containing CCI values aggregated by admin level
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
+        admin_level: Admin level these views correspond to (default: 1)
     """
-    file_name = f"{country}_{storm}_{date}_admin1_cci.csv"
+    file_name = f"{country}_{storm}_{date}_admin{admin_level}_cci.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
-def load_admin_view(country):
+def load_admin_view(country, admin_level=1):
     """Load admin view for country"""
-    file_name = f"{country}_admin1.parquet"
+    file_name = f"{country}_admin{admin_level}.parquet"
     return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
 
 
@@ -2523,7 +2624,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
 def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom):
     """
     Create and save all impact views for a country from hurricane envelopes.
-    
+
     This is the main orchestration function that processes a single country for a given
     storm forecast. It creates and saves:
     - School impact views (probability per wind threshold)
@@ -2531,22 +2632,27 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     - Shelter impact views (probability per wind threshold)
     - WASH facility impact views (probability per wind threshold)
     - Tile impact views (expected impacts per tile per wind threshold)
-    - Admin level impact views (aggregated by admin level 1)
+    - Admin level impact views (for every admin level that has a base parquet)
     - Child Cyclone Index (CCI) views (both tile and admin level)
     - Track views (severity metrics per ensemble member)
     - JSON impact report
-    
+
     Args:
         country: ISO3 country code
         storm: Storm name (e.g., 'FUNG-WONG')
         date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
         gdf_envelopes: GeoDataFrame containing hurricane envelope geometries
         zoom: Zoom level for mercator tiles
-    
+
     Note:
         Base data (mercator tiles, admin views) are loaded if available, or created
-        on-the-fly if missing. Admin IDs are automatically added if missing.
+        on-the-fly if missing. Admin levels are detected from existing base parquets
+        created during --type initialize. Add new levels with --type patch --columns adminN.
     """
+    admin_levels = get_initialized_admin_levels(country)
+    if not admin_levels:
+        # Fallback: ensure admin1 is always processed (creates on-the-fly if missing)
+        admin_levels = [1]
     logger.info(f"  Processing {country}...")
 
     # Schools
@@ -2608,36 +2714,57 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
     save_cci_tiles(cci_tiles_view, country, storm, date, zoom)
 
-    # Admins
-    logger.info(f"    Processing admins...")
+    # Admins — one pass per requested admin level
+    logger.info(f"    Processing admins (levels: {admin_levels})...")
+    for admin_level in admin_levels:
+        try:
+            gdf_admin = load_admin_view(country, admin_level=admin_level)
+            logger.info(f"    Loaded existing admin{admin_level}: {len(gdf_admin)} regions")
+        except Exception as e:
+            logger.info(f"    Creating base admin{admin_level} for {country}... ({e})")
+            gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=admin_level)
+            save_admin_view(gdf_admin, country, admin_level=admin_level)
+            logger.info(f"    Created and saved base admin{admin_level}: {len(gdf_admin)} regions")
+
+        # For admin level 1, gdf_tiles already has 'id' = admin1 IDs (from mercator parquet).
+        # For other levels, derive the tile mapping from the already-loaded admin parquet
+        # (which stores boundary geometries) — avoids a redundant GeoRepo API call.
+        if admin_level == 1:
+            gdf_tiles_for_admin = gdf_tiles
+        else:
+            gdf_admin_boundaries = gdf_admin[['tile_id', 'geometry']].rename(columns={'tile_id': 'id'})
+            gdf_tiles_for_admin = admins_overlay(gdf_admin_boundaries,
+                                                 gdf_tiles.drop(columns=['id'], errors='ignore'))
+
+        wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles_for_admin, gdf_envelopes)
+        for wind_th in wind_admin_views:
+            save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th,
+                                  admin_level=admin_level)
+        logger.info(f"    Created {len(wind_admin_views)} admin{admin_level} views")
+
+        # CCI for this admin level
+        agg_dict = {col: "sum" for col in sum_cols_cci}
+        agg = cci_tiles_view.copy()
+        if admin_level != 1:
+            # Map tile IDs to this admin level's IDs
+            id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
+            agg['id'] = agg['id'].map(lambda x: id_map.get(x, x))
+        agg = agg.groupby("id").agg(agg_dict).reset_index()
+        cci_admin_view = agg.rename(columns={'id': 'tile_id'})
+        save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level)
+
+    # Keep a reference to admin1 for the JSON report (always in admin_levels or generated above)
     try:
-        gdf_admin = load_admin_view(country)
-        logger.info(f"    Loaded existing admin: {len(gdf_admin)} tiles")
-    except Exception as e:
-        logger.info(f"    Creating base admin for {country}... ({e})")
-        gdf_admin = create_admin_country_layer(country, rewrite=0)
-        save_admin_view(gdf_admin, country)
-        logger.info(f"    Created and saved base admin tiles: {len(gdf_admin)} tiles")
+        gdf_admin = load_admin_view(country, admin_level=1)
+    except Exception:
+        gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=1)
 
-    wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes)
-    for wind_th in wind_admin_views:
-        save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th)
-    logger.info(f"    Created {len(wind_admin_views)} admin views")
-
-    # CCI for admin
-    # Define aggregation dictionary
     agg_dict = {col: "sum" for col in sum_cols_cci}
-
-    # Group by admin id and aggregate (creates admin-level CCI data)
     agg = cci_tiles_view.groupby("id").agg(agg_dict).reset_index()
-    # Rename 'id' to 'tile_id' to match base admin parquet structure
-    # Note: In base admin parquet, admin IDs are stored in 'tile_id' column
-    cci_admin_view = agg.rename(columns={'id':'tile_id'})
- 
-    # Add admin names if needed (currently commented out, but structure is ready)
-    # d_admin = gdf_admin.set_index('tile_id')['name'].to_dict()
-    # cci_admin_view['name'] = cci_admin_view['tile_id'].map(d_admin)
-    save_cci_admin(cci_admin_view, country, storm, date)
+    cci_admin_view = agg.rename(columns={'id': 'tile_id'})
+
+    # Re-load admin1 wind views for the report (already saved above)
+    wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes)
 
     # Tracks
     logger.info(f"    Processing tracks...")

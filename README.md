@@ -72,10 +72,11 @@ python main_pipeline.py --type initialize
 - `--zoom` (default: 14): Zoom level for mercator tiles
 - `--rewrite` (default: 0): Set to 1 to rewrite existing views, 0 to skip if they exist
 - `--countries`: List of country codes (e.g., `TWN` for Taiwan, or `DOM VNM` for multiple countries)
+- `--admin` (default: 1): Admin levels to initialize, space-separated (e.g., `--admin 1 2` to create both admin1 and admin2 base parquets). Logs an error and skips gracefully if a requested level is unavailable in GeoRepo.
 
 **What it does:**
 - Creates mercator tiles for each country at specified zoom level
-- Creates admin level 1 views for each country
+- Creates admin level views for each country (default: admin1; use `--admin 1 2` for admin1 + admin2)
 - Downloads and aggregates demographic data (WorldPop: total population, school-age, infants, adolescent (15–19y))
 - Downloads and aggregates infrastructure data (GHSL built surface, SMOD settlement)
 - Fetches school locations (via GIGA API)
@@ -195,10 +196,11 @@ Backfills one or more optional columns in existing mercator and admin parquets w
 python main_pipeline.py --type patch --countries PNG --columns shelters wash
 ```
 
-**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`
+**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`, `admin<N>` (e.g. `admin2` — adds a new admin level base parquet without re-initializing)
 
 **Notes:**
-- Patching any column updates both the mercator parquet and the admin parquet (re-aggregated automatically)
+- Patching any regular column updates both the mercator parquet and all initialized admin parquets (re-aggregated automatically for every admin level found)
+- Patching `admin<N>` (e.g. `--columns admin2`) creates a new admin level base parquet from the existing mercator tiles — useful when a country was initialized with admin1 only and admin2 data is now needed
 - `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache (OSM or custom CSV) and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Custom CSVs in `geodb/custom/` take priority over raster/API re-processing in patch mode too
@@ -234,6 +236,9 @@ The pipeline uses **per-country filtering** with a **1500km buffer** to determin
 # 1. Initialize base data for a country (one-time setup, takes 30-60 min)
 python main_pipeline.py --type initialize --countries TWN
 
+# 1b. Initialize with admin1 + admin2 (for countries with good sub-provincial data)
+python main_pipeline.py --type initialize --countries TWN --admin 1 2
+
 # 2. Process storms (run regularly to update with new storm data)
 python main_pipeline.py --type update --countries TWN
 
@@ -242,6 +247,9 @@ python main_pipeline.py --type update --countries TWN --date 2025-11-10 --storm 
 
 # 4. Backfill optional columns after data becomes available (no full re-init needed)
 python main_pipeline.py --type patch --countries PNG --columns shelters wash
+
+# 5. Add admin2 to a country that was previously initialized with admin1 only
+python main_pipeline.py --type patch --countries PNG --columns admin2
 ```
 
 

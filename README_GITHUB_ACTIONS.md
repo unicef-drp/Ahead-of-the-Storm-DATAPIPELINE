@@ -79,6 +79,7 @@ This will set Vietnam to inactive, so it won't be processed by the pipeline.
    - **Center Lat**: Latitude for map center (e.g., `23.50`)
    - **Center Lon**: Longitude for map center (e.g., `121.00`)
    - **View Zoom**: Zoom level for visualization map (e.g., `8`)
+   - **Admin Levels**: Space-separated admin levels to initialize (default: `1`). Use `1 2` to also create admin2 base parquets. Logs an error and skips gracefully if a requested level is unavailable in GeoRepo.
    - **Rewrite**: `0` to skip existing, `1` to overwrite
 5. Click **"Run workflow"**
 
@@ -95,6 +96,7 @@ Zoom Level: 14
 Center Lat: 23.50
 Center Lon: 121.00
 View Zoom: 8
+Admin Levels: 1 2
 Rewrite: 0
 ```
 
@@ -224,11 +226,13 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | `hcs` | HealthSites API → updates `num_hcs` column |
 | `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
 | `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
+| `admin<N>` (e.g. `admin2`) | Adds a new admin level base parquet without re-initializing |
 
 **Notes:**
 - `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
-- All patches update both the mercator parquet and the admin parquet (re-aggregated automatically)
+- Patching any regular column updates the mercator parquet and **all initialized admin parquets** (re-aggregated automatically for every admin level found)
+- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles — no GeoRepo re-fetch of existing levels needed
 - Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
 - The country must already be initialized (base mercator parquet must exist)
 - Population columns can be patched individually — useful when a new WorldPop dataset is released

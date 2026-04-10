@@ -30,18 +30,18 @@ The pipeline uses environment variables to configure base directories:
 - **Created by:** `create_mercator_country_layer()` via `save_mercator_and_admin_views()`
 - **Note:** One file per country per zoom level
 
-### 2. Base Admin Views (per country)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_admin1.parquet`
-- **Example:** `geodb/aos_views/admin_views/DOM_admin1.parquet`
+### 2. Base Admin Views (per country, per admin level)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_admin{N}.parquet`
+- **Example:** `geodb/aos_views/admin_views/DOM_admin1.parquet`, `geodb/aos_views/admin_views/PNG_admin2.parquet`
 - **Format:** Parquet (GeoDataFrame)
-- **Content:** Administrative level 1 boundaries with aggregated:
+- **Content:** Administrative level N boundaries with aggregated:
   - Population totals: `population`, `school_age_population`, `infant_population`, `adolescent_population`
   - Built surface total: `built_surface_m2`
   - Facility counts: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Average wealth/settlement: `rwi`, `smod_class`, `smod_class_l1`
   - Administrative names and geometries
 - **Created by:** `create_admin_country_layer()` via `save_mercator_and_admin_views()`
-- **Note:** One file per country, created during initialize
+- **Note:** One file per country per admin level. Default is admin1; use `--admin 1 2` during initialize (or `--type patch --columns admin2`) to create admin2.
 
 ### 3. School Locations (per country, cached)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_schools.parquet`
@@ -139,11 +139,11 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_cci_tiles()`
 - **Note:** One file per storm (aggregates all wind thresholds)
 
-### 13. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_{wind_threshold}_admin1.csv`
-- **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_34_admin1.csv`
+### 13. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold, per admin level)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_{wind_threshold}_admin{N}.csv`
+- **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_34_admin1.csv`, `geodb/aos_views/admin_views/PNG_FUNG-WONG_20251110120000_34_admin2.csv`
 - **Format:** CSV (DataFrame, no geometry)
-- **Content:** Expected impact values aggregated by admin level 1:
+- **Content:** Expected impact values aggregated by admin level N:
   - `E_population`, `E_school_age_population`, `E_infant_population`, `E_adolescent_population`
   - `E_built_surface_m2`
   - `E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`
@@ -151,15 +151,15 @@ For each storm/forecast combination processed, the following files are created:
   - `probability`
   - `name` (admin name)
 - **Created by:** `save_admin_tiles_view()`
-- **Note:** Multiple files per storm (one per wind threshold)
+- **Note:** Multiple files per storm per wind threshold per initialized admin level. Auto-detected from existing base admin parquets — no configuration needed at update time.
 
-### 14. CCI Admin Views (per country, per storm, per forecast)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin1_cci.csv`
-- **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_admin1_cci.csv`
+### 14. CCI Admin Views (per country, per storm, per forecast, per admin level)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin{N}_cci.csv`
+- **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_admin1_cci.csv`, `geodb/aos_views/admin_views/PNG_FUNG-WONG_20251110120000_admin2_cci.csv`
 - **Format:** CSV (DataFrame)
-- **Content:** Child Cyclone Index (CCI) values aggregated by admin level 1
+- **Content:** Child Cyclone Index (CCI) values aggregated by admin level N
 - **Created by:** `save_cci_admin()`
-- **Note:** One file per storm
+- **Note:** One file per storm per initialized admin level
 
 ### 15. Track Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
@@ -282,9 +282,9 @@ These files are downloaded automatically by the GigaSpatial library and stored i
     │   ├── {country}_{storm}_{date}_{wind}_{zoom}.csv  # Impact tile views
     │   └── {country}_{storm}_{date}_{zoom}_cci.csv     # CCI tile views
     ├── admin_views/
-    │   ├── {country}_admin1.parquet                     # Base admin views
-    │   ├── {country}_{storm}_{date}_{wind}_admin1.csv   # Impact admin views
-    │   └── {country}_{storm}_{date}_admin1_cci.csv      # CCI admin views
+    │   ├── {country}_admin{N}.parquet                     # Base admin views (one per initialized level)
+    │   ├── {country}_{storm}_{date}_{wind}_admin{N}.csv   # Impact admin views (per level)
+    │   └── {country}_{storm}_{date}_admin{N}_cci.csv      # CCI admin views (per level)
     ├── school_views/
     │   ├── {country}_schools.parquet                    # Cached school locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # School impact views

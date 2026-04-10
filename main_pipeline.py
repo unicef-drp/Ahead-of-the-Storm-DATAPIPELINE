@@ -116,17 +116,19 @@ def setup_logging(log_level="INFO"):
 def run_complete_impact_analysis(storm, date, countries, logger, zoom):
     """
     Complete impact analysis orchestration.
-    
+
     Loads hurricane envelope data from Snowflake, checks which countries are affected
     (using 1500km buffer per country), and creates impact views for affected countries.
-    
+    Admin levels are determined automatically by which base admin parquets exist for each
+    country (created during --type initialize).
+
     Args:
         storm: Storm name (e.g., 'FUNG-WONG', 'JERRY')
         date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         logger: Logger instance for logging
         zoom: Zoom level for mercator tiles (default: 14)
-    
+
     Returns:
         dict: Summary of analysis results with keys:
             - success (bool): Whether analysis completed successfully
@@ -284,11 +286,11 @@ class ImpactPipelineStats:
 def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=False, log_level="INFO", zoom=14):
     """
     Run the complete hurricane impact analysis pipeline for a single storm/forecast.
-    
+
     This function orchestrates the impact analysis process, including data loading,
     geospatial processing, and view generation. It tracks execution statistics
     and handles errors gracefully.
-    
+
     Args:
         storm: Storm name (e.g., 'FUNG-WONG', 'JERRY')
         forecast_time: Forecast time in YYYYMMDDHHMMSS format or 'YYYY-MM-DD HH:MM:SS' format
@@ -379,7 +381,7 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
 # =============================================================================
 # INITIALIZATION FUNCTIONS
 # =============================================================================
-def initialize_pipeline(countries, zoom, rewrite):
+def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
     """
     Initialize the data pipeline by creating base mercator and admin views.
 
@@ -394,10 +396,13 @@ def initialize_pipeline(countries, zoom, rewrite):
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         zoom: Zoom level for mercator tiles (typically 14)
         rewrite: If 1, regenerate existing views; if 0, skip if they exist
+        admin_levels: List of admin levels to generate base admin views for (default: [1])
 
     Returns:
         ImpactPipelineStats: Statistics object with analysis_success=True
     """
+    if admin_levels is None:
+        admin_levels = [1]
     stats = ImpactPipelineStats()
 
     if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
@@ -410,7 +415,7 @@ def initialize_pipeline(countries, zoom, rewrite):
             if added:
                 logger.info(f"{country}: auto-added to PIPELINE_COUNTRIES (no map config set — update CENTER_LAT/CENTER_LON/VIEW_ZOOM via 'Update Country Map Config' workflow)")
 
-    save_mercator_and_admin_views(countries, zoom, rewrite)
+    save_mercator_and_admin_views(countries, zoom, rewrite, admin_levels=admin_levels)
     stats.analysis_success = True
     return stats
 
@@ -428,7 +433,8 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
     - Re-derives smod_class_l1 whenever smod_class is patched
 
     Supported columns: population, school_age_population, infant_population, adolescent_population,
-    built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash
+    built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash,
+    admin<N> (e.g. admin2 — creates a new base admin parquet for that level)
 
     Args:
         countries: List of ISO3 country codes (e.g., ['PNG', 'FJI'])
@@ -484,14 +490,17 @@ def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_writt
 def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta, target_date=None, target_storm=None):
     """
     Update pipeline: Process hurricane data from Snowflake for matching storms.
-    
+
     This function:
     1. Fetches storm data from Snowflake
     2. Filters by date and/or storm name if specified
     3. Processes each matching storm/forecast combination
     4. Skips already-processed storms unless rewrite=1
     5. Tracks processing status in JSON file
-    
+
+    Admin levels processed are determined automatically by which base admin parquets
+    exist for each country (initialized with --type initialize [--admin N ...]).
+
     Args:
         countries: List of ISO3 country codes to process
         skip_analysis: If True, skip the analysis step (for testing)
@@ -645,8 +654,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
     Examples:
-    # Initialize base data for Taiwan
+    # Initialize base data for Taiwan (admin1 only — default)
     python main_pipeline.py --type initialize --countries TWN --zoom 14
+
+    # Initialize with admin1 + admin2 (for countries with good sub-provincial data)
+    python main_pipeline.py --type initialize --countries PNG --zoom 14 --admin 1 2
 
     # Force re-initialization (regenerates all data from scratch)
     python main_pipeline.py --type initialize --countries PNG --rewrite 1
@@ -662,6 +674,9 @@ def main():
 
     # Backfill optional columns without full re-init
     python main_pipeline.py --type patch --countries PNG --columns built_surface_m2 rwi
+
+    # Add admin2 to a country already initialized with admin1
+    python main_pipeline.py --type patch --countries PNG --columns admin2
 
     # Update population data when a new WorldPop dataset is available
     python main_pipeline.py --type patch --countries PNG --columns population adolescent_population
@@ -727,6 +742,15 @@ def main():
         choices=[0, 1],
         help="Rewrite existing data: 1=regenerate existing views, 0=skip if already exists (default: 0)"
     )
+
+    parser.add_argument(
+        "--admin",
+        nargs="+",
+        type=int,
+        default=[1],
+        metavar="LEVEL",
+        help="Admin levels to generate views for (default: 1). E.g. --admin 1 2 generates both admin1 and admin2 views."
+    )
     
     # ========== Filtering Arguments (for update mode) ==========
     parser.add_argument(
@@ -790,7 +814,7 @@ def main():
     if args.hazard == "hurricane":
 
         if args.type == "initialize":
-            stats = initialize_pipeline(args.countries, args.zoom, args.rewrite)
+            stats = initialize_pipeline(args.countries, args.zoom, args.rewrite, admin_levels=args.admin)
         elif args.type == "update":
             stats = update_storms(
                 countries=args.countries,

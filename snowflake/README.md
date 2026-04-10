@@ -201,7 +201,7 @@ docker run --rm \
   -e SNOWFLAKE_SCHEMA='your_schema' \
   -e SNOWFLAKE_STAGE_NAME='your_stage' \
   impact-analysis-pipeline:latest \
-  --type initialize --countries TWN --zoom 14
+  --type initialize --countries TWN --zoom 14 --admin 1
 ```
 
 **Note:** This uses password authentication to connect to Snowflake. The container runs locally but writes to Snowflake stage, allowing testing of the full pipeline before deploying to SPCS.
@@ -357,11 +357,12 @@ The pipeline accepts command-line arguments:
 - `--type`: Pipeline mode (`initialize`, `update`, or `patch`)
 - `--countries`: Space-separated list of country codes (e.g., `TWN DOM VNM`)
 - `--zoom`: Zoom level for tiles (default: `14`)
+- `--admin`: Admin levels to initialize, space-separated (default: `1`; use `1 2` for admin1 + admin2). Only applies to `--type initialize`. Logs an error and skips gracefully if a level is unavailable in GeoRepo.
 - `--rewrite`: Set to `1` to force reprocessing (default: `0`)
 - `--time_delta`: Number of days in the past to consider storms (default: `9`)
 - `--date`: Process only storms on a specific date (YYYY-MM-DD format)
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
-- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi num_shelters`)
+- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet)
 
 ## Example: Initialize Pipeline for Taiwan
 
@@ -394,6 +395,8 @@ EXECUTE JOB SERVICE
          - "TWN"
          - "--zoom"
          - "14"
+         - "--admin"
+         - "1"
          - "--rewrite"
          - "0"
    $$;
