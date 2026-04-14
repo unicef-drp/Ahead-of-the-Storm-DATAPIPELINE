@@ -1919,7 +1919,7 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
     return wind_views
 
 
-def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member'):
+def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=None, gdf_wash=None):
     """Create tracks impact views from envelopes"""
     wind_views = {}
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
@@ -1927,7 +1927,7 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
 
         tracks_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_envelopes_wth, zone_id_column=index_column)
-        
+
         # Schools
         schools = tracks_viewer.map_points(points=gdf_schools)
         tracks_viewer.add_variable_to_view(schools, "severity_schools")
@@ -1936,21 +1936,33 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         hcs = tracks_viewer.map_points(points=gdf_hcs)
         tracks_viewer.add_variable_to_view(hcs, "severity_hcs")
 
+        # Shelters
+        shelters = tracks_viewer.map_points(points=gdf_shelters)
+        tracks_viewer.add_variable_to_view(shelters, "severity_num_shelters")
+
+        # WASH facilities
+        wash_pts = tracks_viewer.map_points(points=gdf_wash)
+        tracks_viewer.add_variable_to_view(wash_pts, "severity_num_wash")
+
         # Tiles
+        tile_value_columns = ["population", "school_age_population", "infant_population", "built_surface_m2"]
+        if "adolescent_population" in gdf_tiles.columns:
+            tile_value_columns.append("adolescent_population")
         try:
-            overlays = tracks_viewer.map_polygons(polygons=gdf_tiles, value_columns=["population","school_age_population","infant_population",'built_surface_m2'], aggregation="sum")
+            overlays = tracks_viewer.map_polygons(polygons=gdf_tiles, value_columns=tile_value_columns, aggregation="sum")
             tracks_viewer.add_variable_to_view(overlays['population'], "severity_population")
+            tracks_viewer.add_variable_to_view(overlays['adolescent_population'], "severity_adolescent_population")
             tracks_viewer.add_variable_to_view(overlays['school_age_population'], "severity_school_age_population")
             tracks_viewer.add_variable_to_view(overlays['infant_population'], "severity_infant_population")
-            tracks_viewer.add_variable_to_view(overlays['built_surface_m2'], "severity_built_surface_m2")
+            tracks_viewer.add_variable_to_view(overlays['built_surface_m2'], "severity_built_surface_m2") 
         except Exception as e:
             logger.warning(f"Track severity overlay failed, defaulting to zeros: {e}")
             zeros = {k: 0 for k in gdf_envelopes_wth[index_column].unique()}
             tracks_viewer.add_variable_to_view(zeros, "severity_population")
+            tracks_viewer.add_variable_to_view(zeros, "severity_adolescent_population")
             tracks_viewer.add_variable_to_view(zeros, "severity_school_age_population")
             tracks_viewer.add_variable_to_view(zeros, "severity_infant_population")
             tracks_viewer.add_variable_to_view(zeros, "severity_built_surface_m2")
-        
 
         gdf_view = tracks_viewer.to_geodataframe()
         wind_views[wind_th] = gdf_view
@@ -2768,7 +2780,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
 
     # Tracks
     logger.info(f"    Processing tracks...")
-    wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member')
+    wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=gdf_shelters, gdf_wash=gdf_wash)
     for wind_th in wind_tracks_views:
         save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th)
     logger.info(f"    Created {len(wind_tracks_views)} track views")
