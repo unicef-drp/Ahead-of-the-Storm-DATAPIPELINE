@@ -240,50 +240,58 @@ def get_lines_from_points(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 def get_expected_landfall(gdf_tracks: gpd.GeoDataFrame, date: str, country: str) -> str:
     """
-    Calculate expected landfall time based on deterministic track (ensemble member 51).
-    
+    Calculate expected landfall using all ensemble members.
+
+    For each member, check whether the track enters the country boundary (point
+    within or line segment crossing).  Reports the median landfall lead-time and
+    the fraction of members that make landfall, e.g.
+    "April 10, 2026 06:00 UTC (35% of members)".
+
     Args:
-        gdf_tracks: GeoDataFrame containing storm track points
+        gdf_tracks: GeoDataFrame containing storm track points for all members
         date: Current forecast date in YYYYMMDDHHMMSS format
         country: ISO3 country code
-    
+
     Returns:
-        str: Expected landfall time as formatted string, or "Unknown" if cannot be determined
+        str: Expected landfall string, or "Unknown" if no members make landfall
     """
     if gdf_tracks.empty:
         return "Unknown"
-    
-    # Use deterministic track (ensemble member 51)
-    gdf_det = gdf_tracks[gdf_tracks.ENSEMBLE_MEMBER == 51]
-    
-    if gdf_det.empty:
-        return "Unknown"
-    
+
     try:
-        # Get country boundary
         boundary = AdminBoundaries.create(country_code=country, admin_level=0)
         polygon = boundary.to_geodataframe().geometry.iloc[0]
-        
-        # Check if any points are within the country
-        inside_rows = gdf_det[gdf_det.within(polygon)]
-        
-        if inside_rows.empty:
-            # Points may land outside country but track crosses boundary
-            # Convert points to lines and check intersections
-            gdf_det_lines = get_lines_from_points(gdf_det)
-            inside_rows_lines = gdf_det_lines[gdf_det_lines.intersects(polygon)]
-            
-            if inside_rows_lines.empty:
-                return "Unknown"
-            
-            lead_time = int(inside_rows_lines.iloc[0]["LEAD_TIME"])
-        else:
-            lead_time = int(inside_rows.iloc[0]["LEAD_TIME"])
-        
-        if lead_time == 0:
+
+        landfall_lead_times = []
+        n_total = gdf_tracks['ENSEMBLE_MEMBER'].nunique()
+
+        for _, gdf_member in gdf_tracks.groupby('ENSEMBLE_MEMBER'):
+            # Check track points inside country
+            inside_rows = gdf_member[gdf_member.within(polygon)]
+            if not inside_rows.empty:
+                landfall_lead_times.append(int(inside_rows.iloc[0]["LEAD_TIME"]))
+                continue
+            # Check whether track line crosses the boundary
+            gdf_lines = get_lines_from_points(gdf_member)
+            inside_lines = gdf_lines[gdf_lines.intersects(polygon)]
+            if not inside_lines.empty:
+                landfall_lead_times.append(int(inside_lines.iloc[0]["LEAD_TIME"]))
+
+        if not landfall_lead_times:
+            return "Unknown"
+
+        pct = round(100 * len(landfall_lead_times) / n_total)
+        earliest = min(landfall_lead_times)
+        latest = max(landfall_lead_times)
+
+        if latest == 0:
             return "Already landed"
-        
-        return get_future_date(date, lead_time)
+
+        if earliest == latest:
+            return get_future_date(date, earliest)
+
+        return f"{get_future_date(date, earliest)} – {get_future_date(date, latest)}"
+
     except Exception as e:
         logger.warning(f"Error calculating expected landfall for {country}: {e}")
         return "Unknown"
@@ -622,15 +630,16 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
 
     # Calculate expected totals
     expected_tiles = wind_tiles_views[expected_wind]
-    d['expected_school_age'] = int(expected_tiles['E_school_age_population'].sum())
-    d['expected_infants'] = int(expected_tiles['E_infant_population'].sum())
-    d['expected_adolescent'] = int(expected_tiles['E_adolescent_population'].sum())
-    d['expected_children'] = int(d['expected_school_age'] + d['expected_infants'])
-    d['expected_pop'] = int(expected_tiles['E_population'].sum())
-    d['expected_schools'] = int(expected_tiles['E_num_schools'].sum())
-    d['expected_hcs'] = int(expected_tiles['E_num_hcs'].sum())
-    d['expected_shelters'] = int(expected_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in expected_tiles.columns else 0
-    d['expected_wash'] = int(expected_tiles['E_num_wash'].sum()) if 'E_num_wash' in expected_tiles.columns else 0
+    import math as _math
+    d['expected_school_age'] = _math.ceil(expected_tiles['E_school_age_population'].sum())
+    d['expected_infants'] = _math.ceil(expected_tiles['E_infant_population'].sum())
+    d['expected_adolescent'] = _math.ceil(expected_tiles['E_adolescent_population'].sum())
+    d['expected_children'] = d['expected_school_age'] + d['expected_infants']
+    d['expected_pop'] = _math.ceil(expected_tiles['E_population'].sum())
+    d['expected_schools'] = _math.ceil(expected_tiles['E_num_schools'].sum())
+    d['expected_hcs'] = _math.ceil(expected_tiles['E_num_hcs'].sum())
+    d['expected_shelters'] = _math.ceil(expected_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in expected_tiles.columns else 0
+    d['expected_wash'] = _math.ceil(expected_tiles['E_num_wash'].sum()) if 'E_num_wash' in expected_tiles.columns else 0
     d['expected_cci_pop'] = int(cci_tiles_view['E_CCI_pop'].sum())
     d['expected_cci_school'] = int(cci_tiles_view['E_CCI_school_age'].sum())
     d['expected_cci_infant'] = int(cci_tiles_view['E_CCI_infants'].sum())
@@ -646,15 +655,15 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
             continue
         
         wind_tiles = wind_tiles_views[wind]
-        d[f"expected_pop_{wind}"] = int(wind_tiles['E_population'].sum())
-        d[f"expected_school_{wind}"] = int(wind_tiles['E_school_age_population'].sum())
-        d[f"expected_infant_{wind}"] = int(wind_tiles['E_infant_population'].sum())
-        d[f"expected_adolescent_{wind}"] = int(wind_tiles['E_adolescent_population'].sum())
-        d[f"expected_children_{wind}"] = int(d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"])
-        d[f"expected_schools_{wind}"] = int(wind_tiles['E_num_schools'].sum())
-        d[f"expected_hcs_{wind}"] = int(wind_tiles['E_num_hcs'].sum())
-        d[f"expected_shelters_{wind}"] = int(wind_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in wind_tiles.columns else 0
-        d[f"expected_wash_{wind}"] = int(wind_tiles['E_num_wash'].sum()) if 'E_num_wash' in wind_tiles.columns else 0
+        d[f"expected_pop_{wind}"] = _math.ceil(wind_tiles['E_population'].sum())
+        d[f"expected_school_{wind}"] = _math.ceil(wind_tiles['E_school_age_population'].sum())
+        d[f"expected_infant_{wind}"] = _math.ceil(wind_tiles['E_infant_population'].sum())
+        d[f"expected_adolescent_{wind}"] = _math.ceil(wind_tiles['E_adolescent_population'].sum())
+        d[f"expected_children_{wind}"] = d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"]
+        d[f"expected_schools_{wind}"] = _math.ceil(wind_tiles['E_num_schools'].sum())
+        d[f"expected_hcs_{wind}"] = _math.ceil(wind_tiles['E_num_hcs'].sum())
+        d[f"expected_shelters_{wind}"] = _math.ceil(wind_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in wind_tiles.columns else 0
+        d[f"expected_wash_{wind}"] = _math.ceil(wind_tiles['E_num_wash'].sum()) if 'E_num_wash' in wind_tiles.columns else 0
 
         # Calculate changes from previous forecast
         if not d_previous:
