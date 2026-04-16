@@ -2469,7 +2469,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     
     Returns:
         DataFrame: CCI tile view with columns:
-            - CCI_children: Child Cyclone Index for children (school-age + infants)
+            - CCI_children: Child Cyclone Index for children (0–19: infants + school-age + adolescents)
             - E_CCI_children: Expected CCI for children
             - CCI_school_age: CCI for school-age population
             - E_CCI_school_age: Expected CCI for school-age population
@@ -2507,23 +2507,23 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
             gdf_tiles_index[pop_col] = np.nan
     cci_tiles_view = pd.DataFrame(index=gdf_tiles_index.index)
 
-    # Children cci
+    # Children cci (0–19: school_age 5–14 + infants 0–4 + adolescents 15–19)
     for i in range(k-1):
         wind = winds[i]
-        cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
+        cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'] + gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'] + gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)
     wind = winds[-1]
-    cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
+    cci_tiles_view[f"{wind}"] = (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'] + gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[k-1]['probability']>0)
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['CCI_children'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children']]
 
-    # Children e cci
+    # Children e cci (0–19: school_age 5–14 + infants 0–4 + adolescents 15–19)
     for i in range(k-1):
         wind = winds[i]
-        cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_school_age_population'] + sorted_wind_views_indexed[i]['E_infant_population']) - (sorted_wind_views_indexed[i+1]['E_school_age_population'] + sorted_wind_views_indexed[i+1]['E_infant_population'])
+        cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[i]['E_school_age_population'] + sorted_wind_views_indexed[i]['E_infant_population'] + sorted_wind_views_indexed[i]['E_adolescent_population']) - (sorted_wind_views_indexed[i+1]['E_school_age_population'] + sorted_wind_views_indexed[i+1]['E_infant_population'] + sorted_wind_views_indexed[i+1]['E_adolescent_population'])
     wind = winds[-1]
-    cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_school_age_population'] + sorted_wind_views_indexed[k-1]['E_infant_population'])
+    cci_tiles_view[f"{wind}"] = (sorted_wind_views_indexed[k-1]['E_school_age_population'] + sorted_wind_views_indexed[k-1]['E_infant_population'] + sorted_wind_views_indexed[k-1]['E_adolescent_population'])
     wcols = [cci_tiles_view[col] * math.pow(int(col), 2) * CCI_WEIGHT_MULTIPLIER 
              for col in cci_tiles_view.columns if col not in cci_cols]
     cci_tiles_view['E_CCI_children'] = sum(wcols)
