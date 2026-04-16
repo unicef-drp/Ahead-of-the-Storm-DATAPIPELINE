@@ -634,7 +634,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     d['expected_school_age'] = _math.ceil(expected_tiles['E_school_age_population'].sum())
     d['expected_infants'] = _math.ceil(expected_tiles['E_infant_population'].sum())
     d['expected_adolescent'] = _math.ceil(expected_tiles['E_adolescent_population'].sum())
-    d['expected_children'] = d['expected_school_age'] + d['expected_infants']
+    d['expected_children'] = d['expected_school_age'] + d['expected_infants'] + d['expected_adolescent']
     d['expected_pop'] = _math.ceil(expected_tiles['E_population'].sum())
     d['expected_schools'] = _math.ceil(expected_tiles['E_num_schools'].sum())
     d['expected_hcs'] = _math.ceil(expected_tiles['E_num_hcs'].sum())
@@ -659,7 +659,7 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         d[f"expected_school_{wind}"] = _math.ceil(wind_tiles['E_school_age_population'].sum())
         d[f"expected_infant_{wind}"] = _math.ceil(wind_tiles['E_infant_population'].sum())
         d[f"expected_adolescent_{wind}"] = _math.ceil(wind_tiles['E_adolescent_population'].sum())
-        d[f"expected_children_{wind}"] = d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"]
+        d[f"expected_children_{wind}"] = d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"] + d[f"expected_adolescent_{wind}"]
         d[f"expected_schools_{wind}"] = _math.ceil(wind_tiles['E_num_schools'].sum())
         d[f"expected_hcs_{wind}"] = _math.ceil(wind_tiles['E_num_hcs'].sum())
         d[f"expected_shelters_{wind}"] = _math.ceil(wind_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in wind_tiles.columns else 0
