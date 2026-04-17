@@ -22,9 +22,10 @@ def get_active_countries_from_snowflake():
     try:
         conn = get_snowflake_connection()
         query = """
-            SELECT COUNTRY_CODE 
-            FROM PIPELINE_COUNTRIES 
-            WHERE ACTIVE = TRUE 
+            SELECT COUNTRY_CODE
+            FROM PIPELINE_COUNTRIES
+            WHERE ACTIVE = TRUE
+              AND (IS_REGION IS NULL OR IS_REGION = FALSE)
             ORDER BY COUNTRY_CODE
         """
         df = pd.read_sql(query, conn)
@@ -53,7 +54,7 @@ def get_all_countries_from_snowflake(include_inactive=False):
         if include_inactive:
             query = "SELECT * FROM PIPELINE_COUNTRIES ORDER BY COUNTRY_CODE"
         else:
-            query = "SELECT * FROM PIPELINE_COUNTRIES WHERE ACTIVE = TRUE ORDER BY COUNTRY_CODE"
+            query = "SELECT * FROM PIPELINE_COUNTRIES WHERE ACTIVE = TRUE AND (IS_REGION IS NULL OR IS_REGION = FALSE) ORDER BY COUNTRY_CODE"
         
         df = pd.read_sql(query, conn)
         conn.close()
@@ -299,19 +300,21 @@ def get_countries_needing_initialization(zoom_level=None):
                 LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z 
                     ON c.COUNTRY_CODE = z.COUNTRY_CODE 
                     AND c.ZOOM_LEVEL = z.ZOOM_LEVEL
-                WHERE c.ACTIVE = TRUE 
+                WHERE c.ACTIVE = TRUE
+                  AND (c.IS_REGION IS NULL OR c.IS_REGION = FALSE)
                   AND z.LAST_INITIALIZED IS NULL
                 ORDER BY c.COUNTRY_CODE
             """
         else:
             # Get countries that haven't been initialized at the specified zoom level
             query = """
-                SELECT c.COUNTRY_CODE 
+                SELECT c.COUNTRY_CODE
                 FROM PIPELINE_COUNTRIES c
-                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z 
-                    ON c.COUNTRY_CODE = z.COUNTRY_CODE 
+                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z
+                    ON c.COUNTRY_CODE = z.COUNTRY_CODE
                     AND z.ZOOM_LEVEL = %s
-                WHERE c.ACTIVE = TRUE 
+                WHERE c.ACTIVE = TRUE
+                  AND (c.IS_REGION IS NULL OR c.IS_REGION = FALSE)
                   AND z.LAST_INITIALIZED IS NULL
                 ORDER BY c.COUNTRY_CODE
             """

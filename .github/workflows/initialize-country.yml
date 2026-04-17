@@ -28,6 +28,11 @@ on:
         description: 'Zoom level for visualization map (e.g., 8)'
         required: true
         type: string
+      admin_levels:
+        description: 'Admin levels to initialize, space-separated (default: 1). E.g. "1 2" to also create admin2 base parquets. Fails gracefully per level if GeoRepo does not have that level for the country.'
+        required: false
+        default: '1'
+        type: string
       rewrite:
         description: 'Rewrite existing data (1=yes, 0=no)'
         required: false
@@ -98,6 +103,7 @@ jobs:
             --type initialize \
             --countries ${{ inputs.country_code }} \
             --zoom ${{ inputs.zoom_level }} \
+            --admin ${{ inputs.admin_levels }} \
             --rewrite ${{ inputs.rewrite }}
       
       - name: Verify initialization tracking

@@ -12,9 +12,8 @@ export DATA_PIPELINE_DB=LOCAL
 # ---------------------------
 # Output locations
 # ---------------------------
-# Bounding box and storms registry
+# Storms registry
 export RESULTS_DIR=results
-export BBOX_FILE=bbox.parquet
 export STORMS_FILE=storms.json
 
 # Base and impact views
@@ -65,3 +64,14 @@ export HEALTHSITES_API_KEY=
 # Optional: GeoRepo API credentials (for admin boundaries)
 # export GEOREPO_API_KEY=
 # export GEOREPO_USER_EMAIL=
+
+# ---------------------------
+# GeoSight (optional)
+# ---------------------------
+# Used by scripts under geosight/ for related-table uploads
+# GEOSIGHT_API_KEY should contain the full Authorization header value,
+# for example: "Token <token>"
+# GEOSIGHT_USER_EMAIL should match the owner email for the API key
+# export GEOSIGHT_BASE_URL=https://geosight.unicef.org
+# export GEOSIGHT_API_KEY=
+# export GEOSIGHT_USER_EMAIL=

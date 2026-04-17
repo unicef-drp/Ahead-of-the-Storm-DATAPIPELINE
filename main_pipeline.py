@@ -2,36 +2,45 @@
 """
 Main Impact Analysis Pipeline Orchestrator
 
-This script coordinates the complete impact analysis pipeline for hurricane impact analysis.
-It orchestrates the processing of hurricane forecast data from Snowflake and generates
-impact views for schools, health centers, population, and infrastructure.
+Coordinates the complete impact analysis pipeline for tropical cyclone early warning.
+Three operating modes: initialize, update, patch.
 
 Key Features:
-- Reads hurricane envelope data directly from Snowflake
-- Performs geospatial intersection analysis with country boundaries (1500km buffer)
-- Creates impact views for multiple wind speed thresholds
-- Generates Child Cyclone Index (CCI) values
-- Supports multiple countries and flexible storage backends (local/blob/snowflake)
-- Generates comprehensive JSON impact reports
+- initialize: builds country base layers (mercator tiles + admin views) with population,
+  built surface, settlement class, wealth index, schools, health centers, shelters, WASH
+- update: fetches active storm envelopes from Snowflake and runs geospatial intersection
+  against all initialized countries within 1,500 km; generates per-facility and tile-level
+  impact views at 8 wind thresholds (34–137 kt) plus JSON reports and CCI values
+- patch: backfills specific columns in existing mercator parquets without full
+  re-initialization (supported: population, school_age_population, infant_population,
+  adolescent_population, built_surface_m2, smod_class, smod_class_l1, rwi,
+  schools, hcs, shelters, wash)
+
+- Custom data overrides: place a CSV in geodb/custom/ to replace any API or raster source
+  for a specific country — custom files are never overwritten by the pipeline
+- Storage-backend agnostic: LOCAL, Azure Blob (ADLS), or Snowflake internal stage
 
 Usage Examples:
-    # Initialize base data for countries
+    # Initialize base data for a new country
     python main_pipeline.py --type initialize --countries TWN --zoom 14
-    
-    # Process all recent storms (last 9 days)
+
+    # Force re-initialization (regenerates all data from scratch)
+    python main_pipeline.py --type initialize --countries PNG --rewrite 1
+
+    # Process all recent storms (default: last 9 days)
     python main_pipeline.py --type update
-    
+
     # Process storms for a specific date
     python main_pipeline.py --type update --date 2025-11-10
-    
+
     # Process a specific storm on a specific date
     python main_pipeline.py --type update --date 2025-11-10 --storm FUNG-WONG
-    
-    # Process with custom countries and zoom level
-    python main_pipeline.py --type update --countries TWN DOM --zoom 14
-    
-    # Rewrite existing data
-    python main_pipeline.py --type initialize --countries TWN --rewrite 1
+
+    # Backfill optional columns without full re-init
+    python main_pipeline.py --type patch --countries PNG --columns shelters wash
+
+    # Backfill raster columns after data becomes available
+    python main_pipeline.py --type patch --countries PNG --columns built_surface_m2 rwi
 """
 
 import os
@@ -42,7 +51,6 @@ from datetime import datetime
 import pandas as pd
 import geopandas as gpd
 
-# Add the project root to Python path so we can import components
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -53,11 +61,10 @@ from dotenv import load_dotenv
 # This assumes the .env file is in the project root directory
 load_dotenv()
 
+
 # =============================================================================
 # IMPORTS
 # =============================================================================
-
-# Import our custom modules
 from impact_analysis import (
     load_envelopes_from_snowflake,
     is_envelope_in_zone,
@@ -65,22 +72,21 @@ from impact_analysis import (
     create_views_from_envelopes_in_country,
     save_mercator_and_admin_views,
     save_json_storms,
-    load_json_storms
+    load_json_storms,
+    patch_country_layer,
 )
 
 # Import gigaspatial for buffering
 from gigaspatial.processing import buffer_geodataframe
 
-from snowflake_utils import get_snowflake_data
-from country_utils import get_active_countries_from_snowflake
+import json
+from snowflake_utils import get_snowflake_data, get_snowflake_connection, get_countries_in_range
+from country_utils import get_active_countries_from_snowflake, add_country_to_snowflake
+
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-
-# Global logger, initialized in main()
-logger = None
-
 def setup_logging(log_level="INFO"):
     """
     Setup logging configuration for the pipeline.
@@ -103,24 +109,26 @@ def setup_logging(log_level="INFO"):
     logger = logging.getLogger(__name__)
     return logger
 
+
 # =============================================================================
 # IMPACT ANALYSIS FUNCTIONS
 # =============================================================================
-
 def run_complete_impact_analysis(storm, date, countries, logger, zoom):
     """
     Complete impact analysis orchestration.
-    
+
     Loads hurricane envelope data from Snowflake, checks which countries are affected
     (using 1500km buffer per country), and creates impact views for affected countries.
-    
+    Admin levels are determined automatically by which base admin parquets exist for each
+    country (created during --type initialize).
+
     Args:
         storm: Storm name (e.g., 'FUNG-WONG', 'JERRY')
         date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         logger: Logger instance for logging
         zoom: Zoom level for mercator tiles (default: 14)
-    
+
     Returns:
         dict: Summary of analysis results with keys:
             - success (bool): Whether analysis completed successfully
@@ -145,59 +153,72 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
         
-        # Check each country separately to only process affected countries
-        logger.info("Checking which countries are affected (1500km buffer per country)...")
-        country_boundaries = get_country_boundaries(countries)
-        
-        # Determine which countries are actually affected by the storm
+        # --- SQL pre-filter: ask Snowflake which countries are within 1500km ---
         affected_countries = []
-        for i, country in enumerate(countries):
-            country_boundary = country_boundaries[i]
-            country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
-            
-            # Apply 1500km buffer to this country
-            country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
-            country_buffered_geom = country_buffered.geometry.iloc[0]
-            
-            # Handle dateline crossing and fix invalid geometry
-            bounds = country_buffered_geom.bounds
-            
-            # Check for invalid bounds (inf values indicate wrapping issues)
-            if any(not (isinstance(b, (int, float)) and -1000 < b < 1000) for b in bounds):
-                logger.debug(f"Buffer geometry for {country} has invalid bounds, attempting to fix...")
-                try:
-                    country_buffered_geom = country_buffered_geom.buffer(0)
-                    bounds = country_buffered_geom.bounds
-                except:
-                    logger.debug(f"Could not fix buffer geometry for {country}, using original boundary")
-                    country_buffered_geom = country_boundary
-            
-            # Check if geometry is valid
-            if not country_buffered_geom.is_valid:
-                from shapely.validation import make_valid
-                try:
-                    country_buffered_geom = make_valid(country_buffered_geom)
-                except:
+        sql_prefilter_used = False
+        try:
+            conn_prefilter = get_snowflake_connection()
+            cursor_prefilter = conn_prefilter.cursor()
+            sql_countries = get_countries_in_range(cursor_prefilter, storm, date)
+            cursor_prefilter.close()
+            conn_prefilter.close()
+            # Trust SQL result whether empty or not — empty means confirmed out-of-range.
+            # Only fall back to Python if the query itself raises (connection/auth failure).
+            affected_countries = [c for c in sql_countries if c in countries]
+            sql_prefilter_used = True
+            if affected_countries:
+                logger.info(f"SQL pre-filter: {len(affected_countries)} country/countries in range: {', '.join(affected_countries)}")
+            else:
+                logger.info("SQL pre-filter: no countries within 1500km — skipping storm")
+        except Exception as e:
+            logger.warning(f"SQL pre-filter failed ({e}) — falling back to Python buffer check")
+
+        # --- Python fallback: 1500km buffer per country (original logic) ---
+        if not sql_prefilter_used:
+            logger.info("Checking which countries are affected (1500km buffer per country)...")
+            country_boundaries = get_country_boundaries(countries)
+
+            for i, country in enumerate(countries):
+                country_boundary = country_boundaries[i]
+                country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
+
+                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
+                country_buffered_geom = country_buffered.geometry.iloc[0]
+
+                bounds = country_buffered_geom.bounds
+                if any(not (isinstance(b, (int, float)) and -1000 < b < 1000) for b in bounds):
+                    logger.debug(f"Buffer geometry for {country} has invalid bounds, attempting to fix...")
                     try:
                         country_buffered_geom = country_buffered_geom.buffer(0)
-                    except:
-                        logger.debug(f"Could not create valid buffered geometry for {country}, using unbuffered")
+                        bounds = country_buffered_geom.bounds
+                    except Exception:
+                        logger.debug(f"Could not fix buffer geometry for {country}, using original boundary")
                         country_buffered_geom = country_boundary
-            
-            # Check if envelopes intersect this country's buffered zone
-            if is_envelope_in_zone(country_buffered_geom, gdf_envelopes):
-                affected_countries.append(country)
-                bounds = country_buffered_geom.bounds
-                if bounds[2] - bounds[0] > 180:
-                    logger.info(f"  {country}: Affected (buffer crosses dateline)")
+
+                if not country_buffered_geom.is_valid:
+                    from shapely.validation import make_valid
+                    try:
+                        country_buffered_geom = make_valid(country_buffered_geom)
+                    except Exception:
+                        try:
+                            country_buffered_geom = country_buffered_geom.buffer(0)
+                        except Exception:
+                            logger.debug(f"Could not create valid buffered geometry for {country}, using unbuffered")
+                            country_buffered_geom = country_boundary
+
+                if is_envelope_in_zone(country_buffered_geom, gdf_envelopes):  # Python fallback path
+                    affected_countries.append(country)
+                    bounds = country_buffered_geom.bounds
+                    if bounds[2] - bounds[0] > 180:
+                        logger.info(f"  {country}: Affected (buffer crosses dateline)")
+                    else:
+                        logger.info(f"  {country}: Affected")
                 else:
-                    logger.info(f"  {country}: Affected")
-            else:
-                logger.info(f"  {country}: Not affected (skipping)")
+                    logger.info(f"  {country}: Not affected (skipping)")
         
         if not affected_countries:
-            logger.error("Envelopes do not intersect with any of the specified countries (within 1500km buffer)")
-            return {"success": False, "error": "No intersection with countries"}
+            logger.info("Envelopes do not intersect with any of the specified countries (within 1500km buffer) — skipping")
+            return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Processing {len(affected_countries)} affected country/countries: {', '.join(affected_countries)}")
         
@@ -223,10 +244,10 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         logger.error(traceback.format_exc())
         return {"success": False, "error": str(e)}
 
+
 # =============================================================================
 # PIPELINE STATISTICS CLASS
 # =============================================================================
-
 class ImpactPipelineStats:
     """Track pipeline execution statistics"""
     
@@ -236,6 +257,7 @@ class ImpactPipelineStats:
         self.analysis_success = False
         self.countries_processed = 0
         self.views_created = 0
+        self.affected_countries = []
         self.errors = []
     
     def log_summary(self, logger):
@@ -257,18 +279,18 @@ class ImpactPipelineStats:
         
         logger.info("=" * 70)
 
+
 # =============================================================================
 # PIPELINE EXECUTION FUNCTIONS
 # =============================================================================
-
 def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=False, log_level="INFO", zoom=14):
     """
     Run the complete hurricane impact analysis pipeline for a single storm/forecast.
-    
+
     This function orchestrates the impact analysis process, including data loading,
     geospatial processing, and view generation. It tracks execution statistics
     and handles errors gracefully.
-    
+
     Args:
         storm: Storm name (e.g., 'FUNG-WONG', 'JERRY')
         forecast_time: Forecast time in YYYYMMDDHHMMSS format or 'YYYY-MM-DD HH:MM:SS' format
@@ -294,7 +316,7 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
     logger.info("=" * 70)
     logger.info(f"Storm: {storm}")
     logger.info(f"Forecast Time: {forecast_time}")
-    logger.info(f"Countries: {countries if countries else ['DOM', 'VNM']}")
+    logger.info(f"Countries: {countries}")
     logger.info(f"Skip Analysis: {skip_analysis}")
     logger.info("=" * 70)
     
@@ -319,10 +341,14 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
                 stats.analysis_success = True
                 stats.countries_processed = analysis_result["countries_processed"]
                 stats.views_created = analysis_result["total_views_created"]
-                logger.info(f"Impact analysis completed successfully")
-                logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
-                logger.info(f"   Countries processed: {stats.countries_processed}")
-                logger.info(f"   Views created: {stats.views_created}")
+                stats.affected_countries = analysis_result["affected_countries"]
+                if analysis_result.get("skipped"):
+                    logger.info("Impact analysis skipped — storm not in range of any country")
+                else:
+                    logger.info(f"Impact analysis completed successfully")
+                    logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
+                    logger.info(f"   Countries processed: {stats.countries_processed}")
+                    logger.info(f"   Views created: {stats.views_created}")
             else:
                 stats.analysis_success = False
                 stats.errors.append(f"Analysis failed: {analysis_result['error']}")
@@ -351,46 +377,130 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
         stats.log_summary(logger)
         return stats
 
+
 # =============================================================================
 # INITIALIZATION FUNCTIONS
 # =============================================================================
-
-def initialize_pipeline(countries, zoom, rewrite):
+def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
     """
     Initialize the data pipeline by creating base mercator and admin views.
-    
+
     This function creates the foundational geospatial data layers needed for impact
     analysis, including mercator tiles with demographic data and admin-level boundaries.
     The data is cached after first creation to avoid redundant downloads.
-    
+
+    If DATA_PIPELINE_DB=SNOWFLAKE and a country is not yet in PIPELINE_COUNTRIES,
+    it is automatically added with ACTIVE=TRUE before initialization proceeds.
+
     Args:
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         zoom: Zoom level for mercator tiles (typically 14)
         rewrite: If 1, regenerate existing views; if 0, skip if they exist
-    
+        admin_levels: List of admin levels to generate base admin views for (default: [1])
+
     Returns:
         ImpactPipelineStats: Statistics object with analysis_success=True
     """
+    if admin_levels is None:
+        admin_levels = [1]
     stats = ImpactPipelineStats()
-    save_mercator_and_admin_views(countries, zoom, rewrite)
+
+    if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        for country in countries:
+            added = add_country_to_snowflake(
+                country_code=country,
+                country_name=country,  # placeholder name — update via GitHub Actions workflow if needed
+                zoom_level=zoom,
+            )
+            if added:
+                logger.info(f"{country}: auto-added to PIPELINE_COUNTRIES (no map config set — update CENTER_LAT/CENTER_LON/VIEW_ZOOM via 'Update Country Map Config' workflow)")
+
+    save_mercator_and_admin_views(countries, zoom, rewrite, admin_levels=admin_levels)
     stats.analysis_success = True
     return stats
+
+
+# =============================================================================
+# PATCH FUNCTIONS
+# =============================================================================
+def patch_pipeline(countries, zoom, columns, log_level="INFO"):
+    """
+    Backfill specific optional columns in existing mercator parquets without full re-init.
+
+    For each country, calls patch_country_layer() which:
+    - Checks for custom CSVs in geodb/custom/ first (takes priority over raster re-processing)
+    - Re-runs raster processing for any columns without a custom CSV
+    - Re-derives smod_class_l1 whenever smod_class is patched
+
+    Supported columns: population, school_age_population, infant_population, adolescent_population,
+    built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash,
+    admin<N> (e.g. admin2 — creates a new base admin parquet for that level)
+
+    Args:
+        countries: List of ISO3 country codes (e.g., ['PNG', 'FJI'])
+        zoom: Zoom level matching the existing mercator parquet (typically 14)
+        columns: List of column names to patch
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR). Default: INFO.
+
+    Returns:
+        bool: True if all countries patched successfully, False if any failed.
+    """
+    logger = setup_logging(log_level)
+    logger.info(f"Patch mode: updating columns {columns} for countries {countries}")
+    all_ok = True
+    for country in countries:
+        try:
+            patch_country_layer(country, zoom, columns)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error(f"{country}: Patch failed — {e}")
+            all_ok = False
+        except Exception as e:
+            logger.error(f"{country}: Unexpected error during patch — {e}", exc_info=True)
+            all_ok = False
+    return all_ok
+
+
+# =============================================================================
+# COMPLETION SIGNAL
+# =============================================================================
+def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_written: int, runtime_seconds: int = None):
+    """
+    Insert a completion record into TC_PIPELINE_COMPLETE_LOG.
+    This triggers the stream-based refresh of *_MAT tables in Snowflake.
+    Only called on successful runs.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_COMPLETE_LOG
+            (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS, RUNTIME_SECONDS)
+        SELECT PARSE_JSON(%s), PARSE_JSON(%s), %s, 'SUCCESS', %s
+    """, (
+        json.dumps(storm_ids),
+        json.dumps(countries),
+        files_written,
+        runtime_seconds
+    ))
+    conn.commit()
+    cur.close()
+
 
 # =============================================================================
 # UPDATE FUNCTIONS
 # =============================================================================
-
 def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta, target_date=None, target_storm=None):
     """
     Update pipeline: Process hurricane data from Snowflake for matching storms.
-    
+
     This function:
     1. Fetches storm data from Snowflake
     2. Filters by date and/or storm name if specified
     3. Processes each matching storm/forecast combination
     4. Skips already-processed storms unless rewrite=1
     5. Tracks processing status in JSON file
-    
+
+    Admin levels processed are determined automatically by which base admin parquets
+    exist for each country (initialized with --type initialize [--admin N ...]).
+
     Args:
         countries: List of ISO3 country codes to process
         skip_analysis: If True, skip the analysis step (for testing)
@@ -406,9 +516,17 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     """
     # Initialize logger first
     logger = setup_logging(log_level)
-    
+
+    if not countries:
+        logger.error("No countries specified — nothing to process")
+        stats = ImpactPipelineStats()
+        stats.errors.append("No countries specified")
+        return stats
+
     d = load_json_storms()
-    stats = ImpactPipelineStats()  # Initialize stats at the start
+    stats = ImpactPipelineStats()
+    stats.analysis_success = True  # assume success; flip to False on any failure
+    update_start_time = datetime.now()
 
     storms_df = get_snowflake_data()
     storms_df['DATE'] = pd.to_datetime(storms_df['FORECAST_TIME']).dt.date
@@ -433,7 +551,10 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
 
     # Track if we processed any storms
     storms_processed = False
-    
+    completed_storm_ids = []
+    completed_countries = set()
+    total_files_written = 0
+
     for _,row in storms_df.iterrows():
         storm = row['TRACK_ID']
         forecast_date = row['DATE']
@@ -450,9 +571,12 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
             time_str = forecast_time.replace(':', '')
             forecast_datetime_str = f"{date_str}{time_str}00"
 
-            if (storm not in d['storms'] or forecast_datetime_str not in d['storms'][storm]) or rewrite==1:
+            # Key includes countries so different country sets are tracked independently
+            countries_key = ','.join(sorted(countries))
+            storm_key = f"{storm}|{countries_key}"
+            if (storm_key not in d['storms'] or forecast_datetime_str not in d['storms'][storm_key]) or rewrite==1:
                 storms_processed = True
-                stats = run_hurricane_pipeline(
+                loop_stats = run_hurricane_pipeline(
                     storm=storm,
                     forecast_time=forecast_datetime_str,
                     countries=countries,
@@ -460,23 +584,34 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                     log_level=log_level,
                     zoom=zoom
                 )
-                if stats.analysis_success:
-                    print(f"\nPipeline completed successfully for storm {storm} in {forecast_datetime_str}")
-                    if storm not in d['storms']:
-                        d['storms'][storm] = []
-                    d['storms'][storm].append(forecast_datetime_str)
+                if loop_stats.analysis_success:
+                    if loop_stats.countries_processed == 0:
+                        logger.info(f"Storm {storm} at {forecast_datetime_str} — not in range of any country, skipped")
+                    else:
+                        logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
+                    stats.countries_processed += loop_stats.countries_processed
+                    stats.views_created += loop_stats.views_created
+                    stats.affected_countries.extend(loop_stats.affected_countries)
+                    if storm_key not in d['storms']:
+                        d['storms'][storm_key] = []
+                    d['storms'][storm_key].append(forecast_datetime_str)
+                    if loop_stats.countries_processed > 0 and storm not in completed_storm_ids:
+                        completed_storm_ids.append(storm)
+                    completed_countries.update(loop_stats.affected_countries)
+                    total_files_written += loop_stats.views_created
                 else:
-                    print(f"\nPipeline with errors for storm {storm} in {forecast_datetime_str}")
+                    logger.error(f"Pipeline with errors for storm {storm} at {forecast_datetime_str}")
+                    stats.analysis_success = False
+                    stats.errors.extend(loop_stats.errors)
             else:
-                # Storm already processed and rewrite=0, so skip
-                logger.info(f"Storm {storm} at {forecast_datetime_str} already processed (use --rewrite 1 to reprocess)")
+                # Storm already processed for these countries and rewrite=0, so skip
+                logger.info(f"Storm {storm} at {forecast_datetime_str} already processed for {countries_key} (use --rewrite 1 to reprocess)")
         else:
-            print("Forecast date outside time delta")
-    
-    # If no storms were processed (all were already processed), mark as success
+            logger.debug(f"Forecast date {forecast_date} outside time delta ({time_delta} days)")
+
+    # If no storms were processed (all were already processed), stats.analysis_success remains True
     if not storms_processed:
         logger.info("All matching storms were already processed (use --rewrite 1 to reprocess)")
-        stats.analysis_success = True
 
     # Save processed storms tracking (may fail silently if data store is not configured)
     try:
@@ -484,38 +619,68 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     except Exception as e:
         logger.warning(f"Could not save storms tracking file: {e}")
 
+    # Signal completion to Snowflake so *_MAT tables refresh via stream trigger
+    if completed_storm_ids:
+        try:
+            runtime_seconds = int((datetime.now() - update_start_time).total_seconds())
+            conn = get_snowflake_connection()
+            signal_pipeline_complete(
+                conn=conn,
+                storm_ids=completed_storm_ids,
+                countries=list(completed_countries),
+                files_written=total_files_written,
+                runtime_seconds=runtime_seconds
+            )
+            conn.close()
+            logger.info(f"Signalled pipeline completion to Snowflake for storms: {completed_storm_ids} (runtime: {runtime_seconds}s)")
+        except Exception as e:
+            logger.warning(f"Could not write completion signal to Snowflake: {e}")
+
     return stats
+
+
 
 # =============================================================================
 # MAIN FUNCTION
 # =============================================================================
-
 def main():
     """
     Main entry point for the impact analysis pipeline.
-    
+
     Parses command-line arguments and orchestrates pipeline execution based on
-    the specified mode (initialize or update) and parameters.
+    the specified mode (initialize, update, or patch) and parameters.
     """
     parser = argparse.ArgumentParser(
         description="Hurricane Impact Analysis Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
     Examples:
-    # Initialize base data for Taiwan
+    # Initialize base data for Taiwan (admin1 only — default)
     python main_pipeline.py --type initialize --countries TWN --zoom 14
-    
+
+    # Initialize with admin1 + admin2 (for countries with good sub-provincial data)
+    python main_pipeline.py --type initialize --countries PNG --zoom 14 --admin 1 2
+
+    # Force re-initialization (regenerates all data from scratch)
+    python main_pipeline.py --type initialize --countries PNG --rewrite 1
+
     # Process all recent storms (last 9 days)
     python main_pipeline.py --type update
-    
+
     # Process storms for a specific date
     python main_pipeline.py --type update --date 2025-11-10
-    
+
     # Process a specific storm on a specific date
     python main_pipeline.py --type update --date 2025-11-10 --storm FUNG-WONG
-    
-    # Process with custom countries and rewrite existing data
-    python main_pipeline.py --type initialize --countries TWN DOM --rewrite 1
+
+    # Backfill optional columns without full re-init
+    python main_pipeline.py --type patch --countries PNG --columns built_surface_m2 rwi
+
+    # Add admin2 to a country already initialized with admin1
+    python main_pipeline.py --type patch --countries PNG --columns admin2
+
+    # Update population data when a new WorldPop dataset is available
+    python main_pipeline.py --type patch --countries PNG --columns population adolescent_population
     """
     )
     
@@ -524,8 +689,27 @@ def main():
         "--type",
         type=str,
         default="update",
-        choices=["initialize", "update"],
-        help="Pipeline mode: 'initialize' creates base data layers, 'update' processes storm data (default: update)"
+        choices=["initialize", "update", "patch"],
+        help=(
+            "Pipeline mode: "
+            "'initialize' creates base data layers, "
+            "'update' processes storm data, "
+            "'patch' backfills specific columns in existing base mercator parquets without full re-init "
+            "(use with --columns; default: update)"
+        )
+    )
+
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        metavar="COLUMN",
+        default=None,
+        help=(
+            "Columns to patch (only used with --type patch). "
+            "Supported: population, school_age_population, infant_population, adolescent_population, "
+            "built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash. "
+            "Example: --columns built_surface_m2 rwi"
+        )
     )
     
     parser.add_argument(
@@ -537,10 +721,11 @@ def main():
     )
     
     # ========== Data Configuration Arguments ==========
+    _DEFAULT_COUNTRIES = ["ATG", "JAM", "BLZ", "NIC", "DOM", "DMA", "GRD", "MSR", "KNA", "LCA", "VCT", "AIA", "VGB"]
     parser.add_argument(
         "--countries",
         nargs="+",
-        default=["ATG", "JAM", "BLZ", "NIC", "DOM", "DMA", "GRD", "MSR", "KNA", "LCA", "VCT", "AIA", "VGB"],
+        default=_DEFAULT_COUNTRIES,
         help="ISO3 country codes to process (e.g., TWN DOM). If not specified, attempts to read from Snowflake PIPELINE_COUNTRIES table. Default: Caribbean countries list."
     )
     
@@ -557,6 +742,15 @@ def main():
         default=0,
         choices=[0, 1],
         help="Rewrite existing data: 1=regenerate existing views, 0=skip if already exists (default: 0)"
+    )
+
+    parser.add_argument(
+        "--admin",
+        nargs="+",
+        type=int,
+        default=[1],
+        metavar="LEVEL",
+        help="Admin levels to generate views for (default: 1). E.g. --admin 1 2 generates both admin1 and admin2 views."
     )
     
     # ========== Filtering Arguments (for update mode) ==========
@@ -605,8 +799,7 @@ def main():
 
     # If countries not provided (using default), try to get from Snowflake table
     # This allows GitHub Actions to use Snowflake as source of truth
-    default_countries = ["ATG", "JAM", "BLZ", "NIC", "DOM", "DMA", "GRD", "MSR", "KNA", "LCA", "VCT", "AIA", "VGB"]
-    if not args.countries or args.countries == default_countries:
+    if not args.countries or args.countries == _DEFAULT_COUNTRIES:
         try:
             logger.info("No countries specified, attempting to read from Snowflake table...")
             countries_from_snowflake = get_active_countries_from_snowflake()
@@ -621,10 +814,9 @@ def main():
     # Run pipeline based on hazard type
     if args.hazard == "hurricane":
 
-        if args.type=="initialize":
-            stats = initialize_pipeline(args.countries, args.zoom, args.rewrite)
-        elif args.type=="update":
-
+        if args.type == "initialize":
+            stats = initialize_pipeline(args.countries, args.zoom, args.rewrite, admin_levels=args.admin)
+        elif args.type == "update":
             stats = update_storms(
                 countries=args.countries,
                 skip_analysis=args.skip_analysis,
@@ -635,13 +827,15 @@ def main():
                 target_date=args.date,
                 target_storm=args.storm
             )
-        else:
-            logger.error(f"Pipeline type '{args.type}' not yet implemented")
-            print(f"Error: Type '{args.type}' not yet implemented")
-            sys.exit(1)
+        elif args.type == "patch":
+            if not args.columns:
+                logger.error("--type patch requires --columns (e.g. --columns built_surface_m2 rwi)")
+                sys.exit(1)
+            ok = patch_pipeline(args.countries, args.zoom, args.columns, args.log_level)
+            stats = ImpactPipelineStats()
+            stats.analysis_success = ok
     else:
         logger.error(f"Hazard type '{args.hazard}' not yet implemented")
-        print(f"Error: Hazard type '{args.hazard}' not yet implemented")
         sys.exit(1)
     
     # Exit with appropriate code
@@ -651,8 +845,6 @@ def main():
     else:
         print("\nPipeline completed with errors!")
         sys.exit(1)
-
-
 
 
 if __name__ == "__main__":

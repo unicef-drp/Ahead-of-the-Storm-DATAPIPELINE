@@ -7,6 +7,7 @@ This document explains how to use GitHub Actions to manage countries and trigger
 GitHub Actions workflows allow you to:
 - **Add new countries** and automatically initialize them
 - **Process past storms** for historical analysis
+- **Patch specific columns** in existing country data without full re-initialization
 - **Trigger pipeline runs** without manual command-line execution
 
 ## Prerequisites
@@ -78,6 +79,7 @@ This will set Vietnam to inactive, so it won't be processed by the pipeline.
    - **Center Lat**: Latitude for map center (e.g., `23.50`)
    - **Center Lon**: Longitude for map center (e.g., `121.00`)
    - **View Zoom**: Zoom level for visualization map (e.g., `8`)
+   - **Admin Levels**: Space-separated admin levels to initialize (default: `1`). Use `1 2` to also create admin2 base parquets. Logs an error and skips gracefully if a requested level is unavailable in GeoRepo.
    - **Rewrite**: `0` to skip existing, `1` to overwrite
 5. Click **"Run workflow"**
 
@@ -94,6 +96,7 @@ Zoom Level: 14
 Center Lat: 23.50
 Center Lon: 121.00
 View Zoom: 8
+Admin Levels: 1 2
 Rewrite: 0
 ```
 
@@ -188,6 +191,69 @@ Rewrite: 0
 ```
 
 This will process all storms from November 1-10, 2025 for Taiwan and Dominican Republic.
+
+### 5. Patch Country Columns
+
+[![Patch Country Columns](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml)
+
+**Workflow:** `.github/workflows/patch-columns.yml`
+
+**Purpose:** Backfill specific columns in existing country mercator parquets without full re-initialization. Use this when a data source becomes available after a country was first initialized (e.g. new WorldPop dataset, custom shelter registry, RWI data now available for a country).
+
+**How to use:**
+1. Go to **Actions** tab in GitHub
+2. Select **"Patch Country Columns"** workflow
+3. Click **"Run workflow"**
+4. Fill in the form:
+   - **Countries**: Comma-separated (e.g., `PNG,FJI`) or leave empty for all active countries
+   - **Columns**: Space-separated column names to patch (required — see supported columns below)
+   - **Zoom Level**: Must match the existing mercator parquet (default: `14`)
+5. Click **"Run workflow"**
+
+**Supported columns:**
+
+| Column | Source |
+|--------|--------|
+| `population` | WorldPop (total, 1km) |
+| `school_age_population` | WorldPop GR2/2025 (ages 5–14, 100m) |
+| `infant_population` | WorldPop (ages 0–4, 100m) |
+| `adolescent_population` | WorldPop GR2/2025 (ages 15–19y, 100m) |
+| `built_surface_m2` | GHSL built surface |
+| `smod_class` | GHSL SMOD L2 settlement class |
+| `smod_class_l1` | Derived from `smod_class` (always updated together) |
+| `rwi` | HDX Relative Wealth Index |
+| `schools` | GIGA school location API → updates `num_schools` column |
+| `hcs` | HealthSites API → updates `num_hcs` column |
+| `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
+| `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
+| `admin<N>` (e.g. `admin2`) | Adds a new admin level base parquet without re-initializing |
+
+**Notes:**
+- `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
+- Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
+- Patching any regular column updates the mercator parquet and **all initialized admin parquets** (re-aggregated automatically for every admin level found)
+- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles — no GeoRepo re-fetch of existing levels needed
+- Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
+- The country must already be initialized (base mercator parquet must exist)
+- Population columns can be patched individually — useful when a new WorldPop dataset is released
+
+**Examples:**
+```
+# Backfill shelter and WASH data after adding custom data files
+Countries: PNG
+Columns: shelters wash
+Zoom Level: 14
+
+# Update wealth and settlement data for all active countries
+Countries: (leave empty)
+Columns: rwi smod_class
+Zoom Level: 14
+
+# Update population from a new WorldPop dataset
+Countries: TWN,DOM
+Columns: population school_age_population infant_population adolescent_population
+Zoom Level: 14
+```
 
 ## Country Management
 

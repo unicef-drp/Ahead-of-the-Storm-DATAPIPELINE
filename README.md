@@ -10,7 +10,7 @@
 ### 1. Manage Country Status
 [![Manage Country Status](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/manage-country-status.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/manage-country-status.yml)
 
-### 2. Initialize New Country (currently not working, waiting for giga-spatial PR to be merged)
+### 2. Initialize New Country
 [![Initialize New Country](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml)
 
 ### 3. Update Country Map Config
@@ -19,6 +19,9 @@
 ### 4. Process Past Storms
 [![Process Past Storms](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml)
 
+### 5. Patch Country Columns
+[![Patch Country Columns](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/patch-columns.yml)
+
 ---
 
 ## Prerequisites
@@ -26,7 +29,7 @@
 1. **Python 3.11+** installed
 2. **Virtual environment** activated (`.venv`)
 3. **Environment variables** configured in `.env` file
-   - Start from the provided example: `cp example_env.txt .env`
+   - Start from the provided example: `cp sample_env.txt .env`
    - Edit values to match the environment (Snowflake, optional Azure)
 
 ### Environment setup (recommended)
@@ -40,7 +43,7 @@ pip install -r requirements.txt
 
 ### Required environment variables
 
-- RESULTS_DIR (default: `project_results/climate/lacro_project`)
+- RESULTS_DIR (default: `results`)
 - STORMS_FILE (default: `storms.json`)
 - ROOT_DATA_DIR (default: `geodb`)
 - VIEWS_DIR (default: `aos_views`)
@@ -69,15 +72,20 @@ python main_pipeline.py --type initialize
 - `--zoom` (default: 14): Zoom level for mercator tiles
 - `--rewrite` (default: 0): Set to 1 to rewrite existing views, 0 to skip if they exist
 - `--countries`: List of country codes (e.g., `TWN` for Taiwan, or `DOM VNM` for multiple countries)
+- `--admin` (default: 1): Admin levels to initialize, space-separated (e.g., `--admin 1 2` to create both admin1 and admin2 base parquets). Logs an error and skips gracefully if a requested level is unavailable in GeoRepo.
 
 **What it does:**
 - Creates mercator tiles for each country at specified zoom level
-- Creates admin level 1 views for each country
-- Downloads and aggregates demographic data (WorldPop population, school age, infants)
+- Creates admin level views for each country (default: admin1; use `--admin 1 2` for admin1 + admin2)
+- Downloads and aggregates demographic data (WorldPop: total population, school-age, infants, adolescent (15–19y))
 - Downloads and aggregates infrastructure data (GHSL built surface, SMOD settlement)
 - Fetches school locations (via GIGA API)
-- Fetches health center locations (via HealthSites API) - cached after first fetch
+- Fetches health center locations (via HealthSites API)
+- Fetches emergency shelter locations (via OSM Overpass, `social_facility=shelter`)
+- Fetches WASH infrastructure locations (via OSM Overpass — drinking water, toilets, water works, pumping stations, etc.)
 - Saves base views to `geodb/aos_views/mercator_views/` and `geodb/aos_views/admin_views/`
+
+**Custom data overrides:** Any data source can be replaced with a custom CSV file placed at `geodb/custom/<COUNTRY>_<type>.csv` (e.g. `PNG_shelters.csv`, `PNG_health_centers.csv`). Custom files take priority over all API/raster sources and are never overwritten by the pipeline. See `custom_data/README.md` for schemas and examples.
 
 **Note:** This process can take 30-60 minutes and downloads several GB of data. It only needs to be run once, or when adding new countries.
 
@@ -96,7 +104,7 @@ python main_pipeline.py --type update
 ```
 
 **Parameters:**
-- `--type` (default: update): Pipeline mode (initialize or update)
+- `--type` (default: update): Pipeline mode (initialize, update, or patch)
 - `--time_delta` (default: 9): Number of days in the past to consider storms for analysis
 - `--date` (optional): Process only storms on a specific date (YYYY-MM-DD format, e.g., `2025-11-10`). Overrides `time_delta`.
 - `--storm` (optional): Process only a specific storm (e.g., `FUNG-WONG`). Can be combined with `--date`.
@@ -112,7 +120,8 @@ python main_pipeline.py --type update
   - Loads hurricane envelope data
   - **Per-country filtering**: Checks each country individually with a 1500km buffer
   - **Only processes affected countries**: If a storm affects Taiwan but not Vietnam, only Taiwan is processed
-  - Creates impact views for schools, health centers, tiles, tracks, and admin levels
+  - Creates per-facility impact views for schools, health centers, shelters, and WASH infrastructure
+  - Creates tile-level and admin-level impact views
   - Calculates Child Cyclone Index (CCI) values
   - Generates JSON impact reports
   - Saves views to the configured data store (local/Azure/Snowflake)
@@ -129,10 +138,9 @@ python main_pipeline.py --type update
      - Checks if storm envelopes intersect the buffered zone
      - Only processes countries that are actually affected
    - Creates impact views for each affected country:
-     - School impact views (probability per wind threshold)
-     - Health center impact views (probability per wind threshold)
-     - Tile impact views (expected impacts per tile)
-     - Admin level impact views (aggregated by admin level 1)
+     - Per-facility impact views: schools, health centers, shelters, WASH (probability per wind threshold)
+     - Tile-level impact views (expected impacts per mercator tile)
+     - Admin-level impact views (aggregated to admin level 1)
      - CCI views (Child Cyclone Index values)
      - Track views (severity metrics per ensemble member)
    - Generates JSON impact reports
@@ -179,36 +187,69 @@ Impact analysis completed successfully
 ======================================================================
 ```
 
+## Step 3 (optional): Patch Specific Columns
+
+Backfills one or more optional columns in existing mercator and admin parquets without re-running full initialization. Useful when a data source becomes available after the country was first initialized (e.g. RWI data, a custom shelter registry).
+
+**Command:**
+```bash
+python main_pipeline.py --type patch --countries PNG --columns shelters wash
+```
+
+**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`, `admin<N>` (e.g. `admin2` — adds a new admin level base parquet without re-initializing)
+
+**Notes:**
+- Patching any regular column updates both the mercator parquet and all initialized admin parquets (re-aggregated automatically for every admin level found)
+- Patching `admin<N>` (e.g. `--columns admin2`) creates a new admin level base parquet from the existing mercator tiles — useful when a country was initialized with admin1 only and admin2 data is now needed
+- `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache (OSM or custom CSV) and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
+- Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
+- Custom CSVs in `geodb/custom/` take priority over raster/API re-processing in patch mode too
+- Raises an error if no base mercator parquet exists for the country (must initialize first)
+
+**Via GitHub Actions:** Use the **"Patch Country Columns"** workflow (`.github/workflows/patch-columns.yml`) to patch columns without a local setup. See `README_GITHUB_ACTIONS.md` for details.
+
+---
+
 ## How Country Filtering Works
 
-The pipeline uses **per-country filtering** with a **1500km buffer**:
+The pipeline uses **per-country filtering** with a **1500km buffer** to determine which countries are affected by a storm. Two paths are used:
 
+**Primary: SQL pre-filter (fast)**
+- Queries Snowflake using `ST_DWITHIN` on `PIPELINE_COUNTRIES.COUNTRY_BOUNDARY` against the storm envelope
+- Returns ISO codes within 1,500 km in a single SQL call
+- Requires `COUNTRY_BOUNDARY` to be populated (run `scripts/init_country_boundaries.py` once after adding countries)
+
+**Fallback: Python buffer check (if SQL pre-filter fails)**
 1. **For each country** specified (e.g., `--countries TWN DOM VNM`):
    - Fetches the actual country boundary from UNICEF GeoRepo
    - Applies a 1500km buffer around the boundary
    - Checks if storm envelopes intersect this buffered zone
 
-2. **Only affected countries are processed**:
-   - If a storm affects Taiwan but not Vietnam, only Taiwan is processed
-   - This saves time and resources by avoiding unnecessary processing
-
-3. **Benefits**:
-   - More efficient: Only processes countries actually at risk
-   - More accurate: Uses actual country boundaries, not a bounding box
-   - Flexible: Easy to add/remove countries without file management
+**Only affected countries are processed:**
+- If a storm affects Taiwan but not Vietnam, only Taiwan is processed
+- This saves time and resources by avoiding unnecessary processing
 
 
 ## Quick Start Summary
 
 ```bash
-# 1. Initialize base data for countries (one-time setup, takes 30-60 min)
+# 1. Initialize base data for a country (one-time setup, takes 30-60 min)
 python main_pipeline.py --type initialize --countries TWN
+
+# 1b. Initialize with admin1 + admin2 (for countries with good sub-provincial data)
+python main_pipeline.py --type initialize --countries TWN --admin 1 2
 
 # 2. Process storms (run regularly to update with new storm data)
 python main_pipeline.py --type update --countries TWN
 
 # 3. Process a specific storm on a specific date
 python main_pipeline.py --type update --countries TWN --date 2025-11-10 --storm FUNG-WONG
+
+# 4. Backfill optional columns after data becomes available (no full re-init needed)
+python main_pipeline.py --type patch --countries PNG --columns shelters wash
+
+# 5. Add admin2 to a country that was previously initialized with admin1 only
+python main_pipeline.py --type patch --countries PNG --columns admin2
 ```
 
 
@@ -222,11 +263,14 @@ The pipeline supports three storage backends (configured via `DATA_PIPELINE_DB`)
 **Storage locations:**
 - **Base mercator views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/` (e.g., `geodb/aos_views/mercator_views/`)
 - **Base admin views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/` (e.g., `geodb/aos_views/admin_views/`)
-- **Impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/`, `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/`, etc.
-- **CCI views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/` and `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/` (with `_cci.csv` suffix)
+- **Per-facility impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/`, `hc_views/`, `shelter_views/`, `wash_views/`
+- **Tile impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/`
+- **Admin impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/`
+- **CCI views:** `mercator_views/` and `admin_views/` (with `_cci` suffix)
+- **Custom data overrides:** `{ROOT_DATA_DIR}/custom/` — place `<COUNTRY>_<type>.csv` here (see `custom_data/README.md`)
 - **Impact reports:** `{RESULTS_DIR}/jsons/` (JSON files per country/storm/forecast)
-- **Processed storms:** `{RESULTS_DIR}/{STORMS_FILE}` (e.g., `project_results/climate/lacro_project/storms.json`)
-- **Raw data:** `{ROOT_DATA_DIR}/bronze/` (downloaded automatically)
+- **Processed storms:** `{ROOT_DATA_DIR}/{STORMS_FILE}` (default: `geodb/storms.json`)
+- **Raw rasters:** WorldPop, GHSL, SMOD, RWI are cached internally by giga-spatial — not stored on the Snowflake stage. Their aggregated per-tile values are permanently stored in the base mercator parquet (`mercator_views/{country}_{zoom}.parquet`) and can be used directly for visualization
 
 See `FILE_STRUCTURE.md` for detailed file structure and naming conventions.
 

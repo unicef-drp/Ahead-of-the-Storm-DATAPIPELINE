@@ -20,7 +20,7 @@
 # ==============================================================================
 # This container runs the hurricane impact analysis pipeline including:
 # - Reading hurricane track and envelope data from Snowflake tables
-# - Processing geospatial impact analysis (schools, health centers, population)
+# - Processing geospatial impact analysis (schools, health centers, shelters, WASH, population)
 # - Generating impact views and reports
 # - Writing results to Snowflake internal stage
 #
@@ -34,7 +34,7 @@ FROM python:3.11-slim
 
 LABEL maintainer="Ahead of the Storm Pipeline"
 LABEL description="Hurricane Impact Analysis Pipeline with Snowflake Integration (SPCS)"
-LABEL version="1.0"
+LABEL version="1.1"
 
 # ==============================================================================
 # Install system dependencies
@@ -81,9 +81,6 @@ COPY snowflake_utils.py /app/
 COPY reports.py /app/
 COPY country_utils.py /app/
 
-# Copy gigaspatial library (local copy with multiprocessing fixes)
-COPY gigaspatial/ /app/gigaspatial/
-
 # Copy requirements
 COPY requirements.txt /app/requirements.txt
 
@@ -106,6 +103,9 @@ RUN mkdir -p /app/geodb/aos_views/mercator_views \
     /app/geodb/aos_views/track_views \
     /app/geodb/aos_views/school_views \
     /app/geodb/aos_views/hc_views \
+    /app/geodb/aos_views/shelter_views \
+    /app/geodb/aos_views/wash_views \
+    /app/geodb/custom \
     /app/results/jsons
 
 # ==============================================================================
@@ -129,7 +129,6 @@ ENV DATA_PIPELINE_DB=LOCAL
 ENV ROOT_DATA_DIR=geodb
 ENV VIEWS_DIR=aos_views
 ENV RESULTS_DIR=results
-ENV BBOX_FILE=bbox.parquet
 ENV STORMS_FILE=storms.json
 
 # Snowflake configuration

@@ -7,7 +7,7 @@ This guide explains how to deploy the Hurricane Impact Analysis Pipeline to Snow
 The Impact Analysis Pipeline processes hurricane forecast data from Snowflake tables and generates impact views and reports. When deployed to SPCS, it:
 
 - Reads hurricane track and envelope data from Snowflake tables (`TC_TRACKS`, `TC_ENVELOPES_COMBINED`)
-- Processes geospatial impact analysis (schools, health centers, population)
+- Processes geospatial impact analysis (schools, health centers, shelters, WASH, population)
 - Generates impact views and reports
 - Writes results to Snowflake internal stage
 
@@ -69,6 +69,41 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
 7. **Snowflake Tables** must exist:
    - `TC_TRACKS` - Hurricane track data
    - `TC_ENVELOPES_COMBINED` - Hurricane envelope data
+   - `TC_PIPELINE_COMPLETE_LOG` - Completion signal table (see below)
+
+## Completion Signal & Event-Driven Refresh
+
+`TC_PIPELINE_COMPLETE_LOG` is the handshake between DATAPIPELINE and the `*_MAT` table refresh.
+
+**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the `AOTS_ANALYSIS` stage, something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready — it can only poll on a fixed cron.
+
+**The chain:**
+```
+DATAPIPELINE finishes writing Parquet to stage
+    → INSERT into TC_PIPELINE_COMPLETE_LOG   (signal_pipeline_complete())
+    → TC_PIPELINE_COMPLETE_STREAM detects the new row
+    → TRIGGER_REFRESH_TASK fires within 5 min
+    → CALL REFRESH_MATERIALIZED_VIEWS()      (reloads all *_MAT tables from stage)
+    → Dash app and AI agent see fresh data
+```
+
+Without it, the only alternative is `TRIGGER_REFRESH_INTERIM` — a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
+
+**Table schema:**
+```sql
+CREATE TABLE IF NOT EXISTS TC_PIPELINE_COMPLETE_LOG (
+    LOG_ID               NUMBER AUTOINCREMENT PRIMARY KEY,
+    RUN_TIMESTAMP        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    STORM_IDS            VARIANT,   -- JSON array of storm names processed
+    COUNTRIES_PROCESSED  VARIANT,   -- JSON array of ISO3 country codes
+    FILES_WRITTEN        NUMBER,    -- total Parquet/CSV files PUT to stage
+    STATUS               VARCHAR(20),
+    RUNTIME_SECONDS      NUMBER,    -- wall-clock seconds for the full update run
+    NOTES                VARCHAR
+);
+```
+
+`RUNTIME_SECONDS` is populated by `signal_pipeline_complete()` in `main_pipeline.py`.
 
 8. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
    
@@ -166,7 +201,7 @@ docker run --rm \
   -e SNOWFLAKE_SCHEMA='your_schema' \
   -e SNOWFLAKE_STAGE_NAME='your_stage' \
   impact-analysis-pipeline:latest \
-  --type initialize --countries TWN --zoom 14
+  --type initialize --countries TWN --zoom 14 --admin 1
 ```
 
 **Note:** This uses password authentication to connect to Snowflake. The container runs locally but writes to Snowflake stage, allowing testing of the full pipeline before deploying to SPCS.
@@ -319,13 +354,15 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
 
 The pipeline accepts command-line arguments:
 
-- `--type`: Pipeline mode (`initialize` or `update`)
+- `--type`: Pipeline mode (`initialize`, `update`, or `patch`)
 - `--countries`: Space-separated list of country codes (e.g., `TWN DOM VNM`)
 - `--zoom`: Zoom level for tiles (default: `14`)
+- `--admin`: Admin levels to initialize, space-separated (default: `1`; use `1 2` for admin1 + admin2). Only applies to `--type initialize`. Logs an error and skips gracefully if a level is unavailable in GeoRepo.
 - `--rewrite`: Set to `1` to force reprocessing (default: `0`)
 - `--time_delta`: Number of days in the past to consider storms (default: `9`)
 - `--date`: Process only storms on a specific date (YYYY-MM-DD format)
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
+- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet)
 
 ## Example: Initialize Pipeline for Taiwan
 
@@ -358,6 +395,8 @@ EXECUTE JOB SERVICE
          - "TWN"
          - "--zoom"
          - "14"
+         - "--admin"
+         - "1"
          - "--rewrite"
          - "0"
    $$;
