@@ -14,7 +14,7 @@ snowflake-connector-python[pandas]>=3.0.0
 python-dotenv>=1.0.0
 
 # GigaSpatial platform integration
-giga-spatial[all]>=0.9.2
+giga-spatial[all]>=0.9.3
 psutil>=5.9.0
 
 # Optional: Unit parsing with improved disambiguation (reduces warnings)

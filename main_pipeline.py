@@ -595,7 +595,8 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                     if storm_key not in d['storms']:
                         d['storms'][storm_key] = []
                     d['storms'][storm_key].append(forecast_datetime_str)
-                    completed_storm_ids.append(storm)
+                    if loop_stats.countries_processed > 0 and storm not in completed_storm_ids:
+                        completed_storm_ids.append(storm)
                     completed_countries.update(loop_stats.affected_countries)
                     total_files_written += loop_stats.views_created
                 else:

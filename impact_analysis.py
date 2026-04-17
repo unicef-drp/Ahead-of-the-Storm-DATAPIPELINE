@@ -1208,7 +1208,7 @@ def patch_country_layer(country, zoom_level, columns):
         raise FileNotFoundError(f"No base mercator parquet found for {country} at zoom {zoom_level}. "
                                 f"Run --type initialize first.")
 
-    gdf = read_dataset(data_store, file_path)
+    gdf = read_dataset(file_path, data_store)
     patching_desc = columns + [f"admin{n}" for n in admin_patch_levels]
     logger.info(f"{country}: Patching {patching_desc} in existing parquet ({len(gdf)} tiles)")
 
@@ -1345,7 +1345,7 @@ def patch_country_layer(country, zoom_level, columns):
             for existing_level in get_initialized_admin_levels(country):
                 admin_file_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views',
                                                f"{country}_admin{existing_level}.parquet")
-                gdf_admin = read_dataset(data_store, admin_file_path)
+                gdf_admin = read_dataset(admin_file_path, data_store)
                 if existing_level == 1:
                     # admin1 IDs are already in the mercator parquet's 'id' column
                     src = gdf
@@ -1442,7 +1442,7 @@ def save_mercator_and_admin_views(countries, zoom_level, rewrite, admin_levels=N
 
             for admin_level in admin_levels:
                 try:
-                    src = combined_view if admin_level == 1 else view
+                    src = view
                     admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
                     save_admin_view(admin_view, country, admin_level=admin_level)
                 except ValueError as e:
@@ -1457,7 +1457,7 @@ def save_mercator_and_admin_views(countries, zoom_level, rewrite, admin_levels=N
 
             for admin_level in admin_levels:
                 try:
-                    src = combined_view if admin_level == 1 else view
+                    src = view
                     admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
                     save_admin_view(admin_view, country, admin_level=admin_level)
                 except ValueError as e:
@@ -1468,7 +1468,7 @@ def save_mercator_and_admin_views(countries, zoom_level, rewrite, admin_levels=N
             # Mercator file already exists and rewrite=0 — skip regeneration.
             # Still create any admin parquets for levels not yet initialized.
             logger.info(f"Mercator file already exists for {country} at zoom {zoom_level}, ensuring tracking is up to date")
-            view = read_dataset(data_store, file_path)
+            view = read_dataset(file_path, data_store)
             for admin_level in admin_levels:
                 admin_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views',
                                           f"{country}_admin{admin_level}.parquet")
@@ -1521,7 +1521,7 @@ def load_json_storms():
 def load_mercator_view(country, zoom_level=14):
     """Load mercator view for country"""
     file_name = f"{country}_{zoom_level}.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name), data_store)
 
 
 # =============================================================================
@@ -1954,7 +1954,7 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
             tracks_viewer.add_variable_to_view(overlays['adolescent_population'], "severity_adolescent_population")
             tracks_viewer.add_variable_to_view(overlays['school_age_population'], "severity_school_age_population")
             tracks_viewer.add_variable_to_view(overlays['infant_population'], "severity_infant_population")
-            tracks_viewer.add_variable_to_view(overlays['built_surface_m2'], "severity_built_surface_m2") 
+            tracks_viewer.add_variable_to_view(overlays['built_surface_m2'], "severity_built_surface_m2")
         except Exception as e:
             logger.warning(f"Track severity overlay failed, defaulting to zeros: {e}")
             zeros = {k: 0 for k in gdf_envelopes_wth[index_column].unique()}
@@ -2020,7 +2020,7 @@ def load_school_locations(country):
         gpd.GeoDataFrame: GeoDataFrame containing cached school locations
     """
     file_name = f"{country}_schools.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name), data_store)
 
 def school_exist(country):
     """
@@ -2082,7 +2082,7 @@ def load_hc_locations(country):
         gpd.GeoDataFrame: GeoDataFrame containing cached health center locations
     """
     file_name = f"{country}_health_centers.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name), data_store)
 
 def hc_exist(country):
     """
@@ -2141,7 +2141,7 @@ def load_shelter_locations(country):
         gpd.GeoDataFrame: GeoDataFrame containing cached shelter locations
     """
     file_name = f"{country}_shelters.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name), data_store)
 
 def shelter_exist(country):
     """
@@ -2200,7 +2200,7 @@ def load_wash_locations(country):
         gpd.GeoDataFrame: GeoDataFrame containing cached WASH facility locations
     """
     file_name = f"{country}_wash.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name), data_store)
 
 def wash_exist(country):
     """
@@ -2436,7 +2436,7 @@ def save_cci_admin(gdf, country, storm, date, admin_level=1):
 def load_admin_view(country, admin_level=1):
     """Load admin view for country"""
     file_name = f"{country}_admin{admin_level}.parquet"
-    return read_dataset(data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
+    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name), data_store)
 
 
 def save_tracks_view(gdf, country, storm, date, wind_th):
