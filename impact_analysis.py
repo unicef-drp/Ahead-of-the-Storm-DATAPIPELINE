@@ -1115,19 +1115,31 @@ def write_country_boundary(country: str):
         # Union all rows in case GeoRepo returns multiple polygons for admin_level=0
         geom = gdf.geometry.union_all()
         wkt = geom.wkt
+        center_lat = geom.centroid.y
+        center_lon = geom.centroid.x
+        span = max(
+            geom.bounds[3] - geom.bounds[1],  # lat span
+            geom.bounds[2] - geom.bounds[0],  # lon span
+        )
+        view_zoom = (11 if span < 0.5 else 10 if span < 1 else
+                     9 if span < 2 else 8 if span < 4 else 7)
         conn = get_snowflake_connection()
         cur = conn.cursor()
         # Use TO_GEOGRAPHY (not TRY_TO_GEOGRAPHY) so invalid WKT raises immediately
         # rather than silently writing NULL to COUNTRY_BOUNDARY.
+        # COALESCE preserves any manually-set center/zoom values.
         cur.execute("""
             UPDATE AOTS.TC_ECMWF.PIPELINE_COUNTRIES
-            SET COUNTRY_BOUNDARY = TO_GEOGRAPHY(%(wkt)s)
+            SET COUNTRY_BOUNDARY = TO_GEOGRAPHY(%(wkt)s),
+                CENTER_LAT = COALESCE(CENTER_LAT, %(lat)s),
+                CENTER_LON = COALESCE(CENTER_LON, %(lon)s),
+                VIEW_ZOOM  = COALESCE(VIEW_ZOOM,  %(zoom)s)
             WHERE COUNTRY_CODE = %(iso)s
-        """, {"wkt": wkt, "iso": country})
+        """, {"wkt": wkt, "iso": country, "lat": center_lat, "lon": center_lon, "zoom": view_zoom})
         conn.commit()
         cur.close()
         conn.close()
-        logger.info(f"{country}: COUNTRY_BOUNDARY written to Snowflake")
+        logger.info(f"{country}: COUNTRY_BOUNDARY, CENTER_LAT/LON, VIEW_ZOOM written to Snowflake")
     except Exception as e:
         logger.warning(f"{country}: Could not write COUNTRY_BOUNDARY to Snowflake: {e}")
 
