@@ -804,54 +804,65 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
             else:
                 raise ValueError(f"{country}: Custom population CSV missing required column '{col}'")
     else:
-        # Map school-age population (5–14y) — hard requirement, raises on failure
-        # GR2: uses individual 5-year age bands (_05_ = 5–9y, _10_ = 10–14y), sex='T' for combined total
-        tiles_viewer.map_wp_pop(
-            country=country,
-            resolution=WORLDPOP_RESOLUTION_LOW,
-            output_column="school_age_population",
-            school_age=False,
-            project="age_structures",
-            release="GR2",
-            constrained=True,
-            un_adjusted=False,
-            min_age=SCHOOL_AGE_MIN,
-            max_age=SCHOOL_AGE_MAX,
-            sex='T',
-        )
-        # Map infant population (0–4y) — hard requirement, raises on failure
-        # GR2: uses individual 5-year age bands (_00_ = 0–12mo, _01_ = 1–4y), sex='T' for combined total
-        tiles_viewer.map_wp_pop(
-            country=country,
-            resolution=WORLDPOP_RESOLUTION_LOW,
-            output_column="infant_population",
-            predicate='centroid_within',
-            school_age=False,
-            project="age_structures",
-            release="GR2",
-            constrained=True,
-            un_adjusted=False,
-            min_age=INFANT_AGE_MIN,
-            max_age=INFANT_AGE_MAX,
-            sex='T',
-        )
-        # Map adolescent population (15–19y) — hard requirement, raises on failure
-        # GR2: picks _15_ band only (15–19y), sex='T' for combined total — 1 file
-        tiles_viewer.map_wp_pop(
-            country=country,
-            resolution=WORLDPOP_RESOLUTION_LOW,
-            output_column="adolescent_population",
-            school_age=False,
-            project="age_structures",
-            release="GR2",
-            constrained=True,
-            un_adjusted=False,
-            min_age=ADOLESCENT_AGE_MIN,
-            max_age=ADOLESCENT_AGE_MAX,
-            sex='T',
-        )
-        # Map total population — hard requirement, raises on failure
-        tiles_viewer.map_wp_pop(country=country, resolution=100)
+        import time as _time
+        _wp_attempts = 3
+        for _wp_attempt in range(_wp_attempts):
+            try:
+                # Map school-age population (5–14y) — hard requirement, raises on failure
+                # GR2: uses individual 5-year age bands (_05_ = 5–9y, _10_ = 10–14y), sex='T' for combined total
+                tiles_viewer.map_wp_pop(
+                    country=country,
+                    resolution=WORLDPOP_RESOLUTION_LOW,
+                    output_column="school_age_population",
+                    school_age=False,
+                    project="age_structures",
+                    release="GR2",
+                    constrained=True,
+                    un_adjusted=False,
+                    min_age=SCHOOL_AGE_MIN,
+                    max_age=SCHOOL_AGE_MAX,
+                    sex='T',
+                )
+                # Map infant population (0–4y) — hard requirement, raises on failure
+                # GR2: uses individual 5-year age bands (_00_ = 0–12mo, _01_ = 1–4y), sex='T' for combined total
+                tiles_viewer.map_wp_pop(
+                    country=country,
+                    resolution=WORLDPOP_RESOLUTION_LOW,
+                    output_column="infant_population",
+                    predicate='centroid_within',
+                    school_age=False,
+                    project="age_structures",
+                    release="GR2",
+                    constrained=True,
+                    un_adjusted=False,
+                    min_age=INFANT_AGE_MIN,
+                    max_age=INFANT_AGE_MAX,
+                    sex='T',
+                )
+                # Map adolescent population (15–19y) — hard requirement, raises on failure
+                # GR2: picks _15_ band only (15–19y), sex='T' for combined total — 1 file
+                tiles_viewer.map_wp_pop(
+                    country=country,
+                    resolution=WORLDPOP_RESOLUTION_LOW,
+                    output_column="adolescent_population",
+                    school_age=False,
+                    project="age_structures",
+                    release="GR2",
+                    constrained=True,
+                    un_adjusted=False,
+                    min_age=ADOLESCENT_AGE_MIN,
+                    max_age=ADOLESCENT_AGE_MAX,
+                    sex='T',
+                )
+                # Map total population — hard requirement, raises on failure
+                tiles_viewer.map_wp_pop(country=country, resolution=100)
+                break
+            except RuntimeError as _e:
+                if _wp_attempt < _wp_attempts - 1:
+                    logger.warning(f"{country}: WorldPop download incomplete (attempt {_wp_attempt + 1}/{_wp_attempts}), retrying in 5s: {_e}")
+                    _time.sleep(5)
+                else:
+                    raise
 
     # ------------------------------------------------------------------
     # GHSL built surface — optional, NaN fallback, custom override supported
