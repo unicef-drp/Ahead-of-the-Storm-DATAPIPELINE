@@ -1306,28 +1306,28 @@ def patch_country_layer(country, zoom_level, columns):
                 logger.info(f"{country}: Patched population")
 
     if 'schools' in columns:
-        gdf_schools = fetch_schools(country, rewrite=0)
+        gdf_schools = fetch_schools(country, rewrite=1)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         schools = viewer.map_points(points=gdf_schools)
         gdf['num_schools'] = gdf['tile_id'].map(schools)
         logger.info(f"{country}: Patched num_schools")
 
     if 'hcs' in columns:
-        gdf_hcs = fetch_health_centers(country, rewrite=0)
+        gdf_hcs = fetch_health_centers(country, rewrite=1)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         hcs = viewer.map_points(points=gdf_hcs)
         gdf['num_hcs'] = gdf['tile_id'].map(hcs)
         logger.info(f"{country}: Patched num_hcs")
 
     if 'shelters' in columns:
-        gdf_shelters = fetch_shelters(country, rewrite=0)
+        gdf_shelters = fetch_shelters(country, rewrite=1)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         shelters = viewer.map_points(points=gdf_shelters)
         gdf['num_shelters'] = gdf['tile_id'].map(shelters)
         logger.info(f"{country}: Patched num_shelters")
 
     if 'wash' in columns:
-        gdf_wash = fetch_wash(country, rewrite=0)
+        gdf_wash = fetch_wash(country, rewrite=1)
         viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
         wash_pts = viewer.map_points(points=gdf_wash)
         gdf['num_wash'] = gdf['tile_id'].map(wash_pts)
