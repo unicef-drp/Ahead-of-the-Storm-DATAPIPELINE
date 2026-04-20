@@ -39,3 +39,4 @@ download_tc_tracks.py
 geosight/
 test-scripts/
 snowflake/COST_ESTIMATION.md
+snowflake/deploy_to_spcs.sh
