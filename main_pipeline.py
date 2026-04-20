@@ -409,11 +409,10 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
         for country in countries:
             added = add_country_to_snowflake(
                 country_code=country,
-                country_name=country,  # placeholder name — update via GitHub Actions workflow if needed
                 zoom_level=zoom,
             )
             if added:
-                logger.info(f"{country}: auto-added to PIPELINE_COUNTRIES (no map config set — update CENTER_LAT/CENTER_LON/VIEW_ZOOM via 'Update Country Map Config' workflow)")
+                logger.info(f"{country}: auto-added to PIPELINE_COUNTRIES (map config will be set automatically from GeoRepo boundary — override via 'Update Country Config' workflow if needed)")
 
     save_mercator_and_admin_views(countries, zoom, rewrite, admin_levels=admin_levels)
     stats.analysis_success = True
