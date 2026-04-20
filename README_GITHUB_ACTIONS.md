@@ -100,20 +100,21 @@ Admin Levels: 1 2
 Rewrite: 0
 ```
 
-### 3. Update Country Map Config
+### 3. Update Country Config
 
-[![Update Country Map Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml)
+[![Update Country Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-config.yml)
 
-**Workflow:** `.github/workflows/update-country-map-config.yml`
+**Workflow:** `.github/workflows/update-country-config.yml`
 
-**Purpose:** Update the map configuration (center coordinates and/or view zoom) for an existing country.
+**Purpose:** Update the country name and/or map configuration (center coordinates and/or view zoom) for an existing country.
 
 **How to use:**
 1. Go to **Actions** tab in GitHub
-2. Select **"Update Country Map Config"** workflow
+2. Select **"Update Country Config"** workflow
 3. Click **"Run workflow"**
 4. Fill in the form:
    - **Country Code**: ISO3 code (e.g., `TWN`, `DOM`, `VNM`) - **Required**
+   - **Country Name**: Full name override (e.g., `Taiwan`) - **Optional**
    - **Center Lat**: Latitude for map center (e.g., `23.50`) - **Optional**
    - **Center Lon**: Longitude for map center (e.g., `121.00`) - **Optional**
    - **View Zoom**: Zoom level for visualization map (e.g., `8`) - **Optional**
@@ -125,32 +126,35 @@ Rewrite: 0
 
 **Examples:**
 
+Update only the country name:
+```
+Country Code: TWN
+Country Name: Taiwan
+Center Lat: (leave empty)
+Center Lon: (leave empty)
+View Zoom: (leave empty)
+```
+
 Update only the view zoom:
 ```
 Country Code: TWN
+Country Name: (leave empty)
 Center Lat: (leave empty)
 Center Lon: (leave empty)
 View Zoom: 9
 ```
 
-Update only coordinates:
-```
-Country Code: TWN
-Center Lat: 23.50
-Center Lon: 121.00
-View Zoom: (leave empty)
-```
-
 Update all fields:
 ```
 Country Code: TWN
+Country Name: Taiwan
 Center Lat: 23.50
 Center Lon: 121.00
 View Zoom: 8
 ```
 
-**Note:** 
-- At least one field (center_lat, center_lon, or view_zoom) must be provided
+**Note:**
+- At least one field must be provided
 - Fields left empty will not be updated (existing values preserved)
 - The country must already exist in the `PIPELINE_COUNTRIES` table
 

@@ -1,4 +1,4 @@
-name: Update Country Map Config
+name: Update Country Config
 
 on:
   workflow_dispatch:
@@ -7,38 +7,42 @@ on:
         description: 'ISO3 country code (e.g., TWN, DOM, VNM)'
         required: true
         type: string
+      country_name:
+        description: 'Full country name override (e.g., Taiwan). Leave empty to skip.'
+        required: false
+        type: string
       center_lat:
-        description: 'Latitude for map center (e.g., 18.74). Leave empty to skip updating this field.'
+        description: 'Latitude for map center (e.g., 18.74). Leave empty to skip.'
         required: false
         type: string
       center_lon:
-        description: 'Longitude for map center (e.g., -70.16). Leave empty to skip updating this field.'
+        description: 'Longitude for map center (e.g., -70.16). Leave empty to skip.'
         required: false
         type: string
       view_zoom:
-        description: 'Zoom level for visualization map (e.g., 8). Leave empty to skip updating this field.'
+        description: 'Zoom level for visualization map (e.g., 8). Leave empty to skip.'
         required: false
         type: string
 
 jobs:
-  update-map-config:
+  update-country-config:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      - name: Update country map configuration
+
+      - name: Update country configuration
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
@@ -48,44 +52,36 @@ jobs:
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
         run: |
           python -c "
-          from country_utils import update_country_map_config
-          
-          # Parse inputs (empty string means None/not provided)
-          # Use len() check to handle empty strings correctly
-          center_lat_str = '${{ inputs.center_lat }}'
-          center_lon_str = '${{ inputs.center_lon }}'
-          view_zoom_str = '${{ inputs.view_zoom }}'
-          
-          center_lat = None
-          center_lon = None
-          view_zoom = None
-          
-          # Convert to float/int if provided (non-empty string)
-          if len(center_lat_str.strip()) > 0:
-              center_lat = float(center_lat_str)
-          if len(center_lon_str.strip()) > 0:
-              center_lon = float(center_lon_str)
-          if len(view_zoom_str.strip()) > 0:
-              view_zoom = int(view_zoom_str)
-          
-          # Check that at least one field is provided
-          if not any([center_lat is not None, center_lon is not None, view_zoom is not None]):
-              print('✗ Error: At least one field (center_lat, center_lon, or view_zoom) must be provided')
+          from country_utils import update_country_config
+
+          country_name_str = '${{ inputs.country_name }}'.strip()
+          center_lat_str   = '${{ inputs.center_lat }}'.strip()
+          center_lon_str   = '${{ inputs.center_lon }}'.strip()
+          view_zoom_str    = '${{ inputs.view_zoom }}'.strip()
+
+          country_name = country_name_str if country_name_str else None
+          center_lat   = float(center_lat_str) if center_lat_str else None
+          center_lon   = float(center_lon_str) if center_lon_str else None
+          view_zoom    = int(view_zoom_str)     if view_zoom_str  else None
+
+          if not any([country_name, center_lat is not None, center_lon is not None, view_zoom is not None]):
+              print('Error: at least one field must be provided')
               exit(1)
-          
-          success = update_country_map_config(
+
+          success = update_country_config(
               '${{ inputs.country_code }}',
-              center_lat,
-              center_lon,
-              view_zoom
+              country_name=country_name,
+              center_lat=center_lat,
+              center_lon=center_lon,
+              view_zoom=view_zoom,
           )
           if success:
-              print('✓ Map configuration updated successfully')
+              print('Country config updated successfully')
           else:
-              print('✗ Failed to update map configuration')
+              print('Failed to update country config')
               exit(1)
           "
-      
+
       - name: Verify update
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -98,7 +94,7 @@ jobs:
           python -c "
           from snowflake_utils import get_snowflake_connection
           import pandas as pd
-          
+
           conn = get_snowflake_connection()
           query = '''
               SELECT COUNTRY_CODE, COUNTRY_NAME, CENTER_LAT, CENTER_LON, VIEW_ZOOM
@@ -107,13 +103,13 @@ jobs:
           '''
           df = pd.read_sql(query, conn)
           conn.close()
-          
+
           if len(df) > 0:
               row = df.iloc[0]
               print(f'Country: {row[\"COUNTRY_CODE\"]} ({row[\"COUNTRY_NAME\"]})')
               print(f'Center: [{row[\"CENTER_LAT\"]}, {row[\"CENTER_LON\"]}]')
               print(f'View Zoom: {row[\"VIEW_ZOOM\"]}')
           else:
-              print('⚠ Country not found in table')
+              print('Country not found in table')
               exit(1)
           "

@@ -13,8 +13,8 @@
 ### 2. Initialize New Country
 [![Initialize New Country](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/initialize-country.yml)
 
-### 3. Update Country Map Config
-[![Update Country Map Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-map-config.yml)
+### 3. Update Country Config
+[![Update Country Config](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-config.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/update-country-config.yml)
 
 ### 4. Process Past Storms
 [![Process Past Storms](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml/badge.svg)](https://github.com/unicef-drp/Ahead-of-the-Storm-DATAPIPELINE/actions/workflows/process-past-storms.yml)
@@ -317,7 +317,7 @@ python main_pipeline.py --type initialize --countries TWN --zoom 14 --rewrite 0
 4. Fill in: Country Code, Country Name, Zoom Level, Center Lat, Center Lon, View Zoom, Rewrite
 5. Click "Run workflow"
 
-**Note:** Map configuration (center coordinates and view zoom) is required for visualization. Use the "Update Country Map Config" workflow to update these values for existing countries.
+**Note:** Map configuration (center coordinates and view zoom) is required for visualization. Use the "Update Country Config" workflow to update these values for existing countries.
 
 **Option 3: Activate/Deactivate Countries**
 ```bash

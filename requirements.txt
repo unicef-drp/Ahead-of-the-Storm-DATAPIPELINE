@@ -17,5 +17,8 @@ python-dotenv>=1.0.0
 giga-spatial[all]>=0.9.3
 psutil>=5.9.0
 
+# Country name resolution from ISO3 codes
+pycountry>=22.3.5
+
 # Optional: Unit parsing with improved disambiguation (reduces warnings)
 quantulum3[classifier]>=0.1.0

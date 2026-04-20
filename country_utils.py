@@ -8,6 +8,7 @@ including reading from Snowflake table and adding new countries.
 
 import pandas as pd
 import logging
+import pycountry
 from snowflake_utils import get_snowflake_connection
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,13 @@ def get_all_countries_from_snowflake(include_inactive=False):
         logger.error(f"Error retrieving countries from Snowflake: {e}")
         return pd.DataFrame()
 
-def add_country_to_snowflake(country_code, country_name, zoom_level=14, center_lat=None, center_lon=None, view_zoom=None, notes=None):
+def _resolve_country_name(country_code: str) -> str:
+    """Return the official country name for an ISO3 code, or the code itself if not found."""
+    entry = pycountry.countries.get(alpha_3=country_code)
+    return entry.name if entry else country_code
+
+
+def add_country_to_snowflake(country_code, country_name=None, zoom_level=14, center_lat=None, center_lon=None, view_zoom=None, notes=None):
     """
     Add a new country to the Snowflake PIPELINE_COUNTRIES table.
     
@@ -79,12 +86,15 @@ def add_country_to_snowflake(country_code, country_name, zoom_level=14, center_l
     Returns:
         bool: True if successful, False otherwise
     """
+    if country_name is None:
+        country_name = _resolve_country_name(country_code)
+
     conn = None
     cursor = None
     try:
         conn = get_snowflake_connection()
         cursor = conn.cursor()
-        
+
         # Check if country already exists
         cursor.execute("SELECT COUNTRY_CODE FROM PIPELINE_COUNTRIES WHERE COUNTRY_CODE = %s", (country_code,))
         if cursor.fetchone():
@@ -386,96 +396,109 @@ def get_countries_needing_zoom_level(country_code, zoom_level):
             except:
                 pass
 
-def update_country_map_config(country_code, center_lat=None, center_lon=None, view_zoom=None):
-    """
-    Update the map configuration (center coordinates and/or view zoom) for a country.
-    Only updates fields that are provided (not None).
-    
-    Args:
-        country_code: ISO3 country code
-        center_lat: Optional latitude for map center (None to skip update)
-        center_lon: Optional longitude for map center (None to skip update)
-        view_zoom: Optional zoom level for visualization map (None to skip update)
-    
-    Returns:
-        bool: True if successful, False otherwise
-    
-    Raises:
-        ValueError: If all parameters are None (nothing to update)
-    """
-    # Validate that at least one field is provided
-    if center_lat is None and center_lon is None and view_zoom is None:
-        raise ValueError("At least one of center_lat, center_lon, or view_zoom must be provided")
-    
+def _apply_country_update(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None):
+    """Shared implementation for updating editable country fields."""
     conn = None
     cursor = None
     try:
         conn = get_snowflake_connection()
         cursor = conn.cursor()
-        
-        # Check if country exists
+
         cursor.execute("SELECT COUNTRY_CODE FROM PIPELINE_COUNTRIES WHERE COUNTRY_CODE = %s", (country_code,))
         if not cursor.fetchone():
             logger.warning(f"Country {country_code} not found in table")
             return False
-        
-        # Build UPDATE query dynamically based on provided parameters
+
         update_fields = []
         update_values = []
-        
+
+        if country_name is not None:
+            update_fields.append("COUNTRY_NAME = %s")
+            update_values.append(country_name)
         if center_lat is not None:
             update_fields.append("CENTER_LAT = %s")
             update_values.append(center_lat)
-        
         if center_lon is not None:
             update_fields.append("CENTER_LON = %s")
             update_values.append(center_lon)
-        
         if view_zoom is not None:
             update_fields.append("VIEW_ZOOM = %s")
             update_values.append(view_zoom)
-        
-        # Add country_code for WHERE clause
+
         update_values.append(country_code)
-        
-        # Execute update
-        update_query = f"""
-            UPDATE PIPELINE_COUNTRIES
-            SET {', '.join(update_fields)}
-            WHERE COUNTRY_CODE = %s
-        """
-        
-        cursor.execute(update_query, tuple(update_values))
-        
+        cursor.execute(
+            f"UPDATE PIPELINE_COUNTRIES SET {', '.join(update_fields)} WHERE COUNTRY_CODE = %s",
+            tuple(update_values),
+        )
         conn.commit()
-        
-        # Build log message
-        updated_fields = []
-        if center_lat is not None:
-            updated_fields.append(f"center_lat={center_lat}")
-        if center_lon is not None:
-            updated_fields.append(f"center_lon={center_lon}")
-        if view_zoom is not None:
-            updated_fields.append(f"view_zoom={view_zoom}")
-        
-        logger.info(f"Updated map configuration for {country_code}: {', '.join(updated_fields)}")
+
+        updated = {k: v for k, v in [("country_name", country_name), ("center_lat", center_lat),
+                                      ("center_lon", center_lon), ("view_zoom", view_zoom)] if v is not None}
+        logger.info(f"Updated config for {country_code}: {updated}")
         return True
     except Exception as e:
-        logger.error(f"Error updating map configuration for {country_code}: {e}")
+        logger.error(f"Error updating config for {country_code}: {e}")
         if conn:
             try:
                 conn.rollback()
-            except:
+            except Exception:
                 pass
         return False
     finally:
         if cursor:
             try:
                 cursor.close()
-            except:
+            except Exception:
                 pass
         if conn:
             try:
                 conn.close()
-            except:
+            except Exception:
                 pass
+
+
+def update_country_config(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None):
+    """
+    Update editable fields (name and/or map config) for a country in PIPELINE_COUNTRIES.
+    Only updates fields that are provided (not None).
+
+    Args:
+        country_code: ISO3 country code
+        country_name: Optional full country name override
+        center_lat: Optional latitude for map center (None to skip update)
+        center_lon: Optional longitude for map center (None to skip update)
+        view_zoom: Optional zoom level for visualization map (None to skip update)
+
+    Returns:
+        bool: True if successful, False otherwise
+
+    Raises:
+        ValueError: If all parameters are None (nothing to update)
+    """
+    if all(v is None for v in [country_name, center_lat, center_lon, view_zoom]):
+        raise ValueError("At least one field must be provided")
+
+    return _apply_country_update(country_code, country_name=country_name,
+                                 center_lat=center_lat, center_lon=center_lon, view_zoom=view_zoom)
+
+
+def update_country_map_config(country_code, center_lat=None, center_lon=None, view_zoom=None):
+    """
+    Update the map configuration (center coordinates and/or view zoom) for a country.
+    Only updates fields that are provided (not None).
+
+    Args:
+        country_code: ISO3 country code
+        center_lat: Optional latitude for map center (None to skip update)
+        center_lon: Optional longitude for map center (None to skip update)
+        view_zoom: Optional zoom level for visualization map (None to skip update)
+
+    Returns:
+        bool: True if successful, False otherwise
+
+    Raises:
+        ValueError: If all parameters are None (nothing to update)
+    """
+    if center_lat is None and center_lon is None and view_zoom is None:
+        raise ValueError("At least one of center_lat, center_lon, or view_zoom must be provided")
+    return _apply_country_update(country_code, center_lat=center_lat, center_lon=center_lon, view_zoom=view_zoom)
