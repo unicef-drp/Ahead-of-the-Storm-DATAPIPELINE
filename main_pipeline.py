@@ -27,7 +27,7 @@ Usage Examples:
     # Force re-initialization (regenerates all data from scratch)
     python main_pipeline.py --type initialize --countries PNG --rewrite 1
 
-    # Process all recent storms (default: last 9 days)
+    # Process all recent storms (default: last 2 days)
     python main_pipeline.py --type update
 
     # Process storms for a specific date
@@ -460,13 +460,76 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
 
 
 # =============================================================================
+# SNOWFLAKE RUN LOGGING
+# =============================================================================
+
+def is_already_processed(conn, storm_id: str, forecast_time) -> bool:
+    """Return True if this (storm_id, forecast_time) has a SUCCESS or recent IN_PROGRESS record."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
+        WHERE STORM_ID = %s
+          AND FORECAST_TIME = %s
+          AND (
+            STATUS = 'SUCCESS'
+            OR (STATUS = 'IN_PROGRESS'
+                AND STARTED_AT > DATEADD('hour', -6, CURRENT_TIMESTAMP()))
+          )
+    """, (storm_id, forecast_time))
+    count = cur.fetchone()[0]
+    cur.close()
+    return count > 0
+
+
+def log_run_start(conn, storm_id: str, forecast_time) -> None:
+    """Insert an IN_PROGRESS marker into TC_PIPELINE_RUN_LOG."""
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
+            (STORM_ID, FORECAST_TIME, STATUS, STARTED_AT)
+        VALUES (%s, %s, 'IN_PROGRESS', CURRENT_TIMESTAMP())
+    """, (storm_id, forecast_time))
+    conn.commit()
+    cur.close()
+
+
+def log_run_complete(conn, storm_id: str, forecast_time, success: bool,
+                     countries: list = None, files_written: int = 0,
+                     error_message: str = None, started_at=None) -> None:
+    """Insert a SUCCESS or FAILURE completion record into TC_PIPELINE_RUN_LOG."""
+    runtime_seconds = None
+    if started_at:
+        runtime_seconds = (datetime.now() - started_at).total_seconds()
+    status = 'SUCCESS' if success else 'FAILURE'
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
+            (STORM_ID, FORECAST_TIME, STATUS, COUNTRIES_PROCESSED, FILES_WRITTEN,
+             ERROR_MESSAGE, STARTED_AT, COMPLETED_AT, RUNTIME_SECONDS)
+        SELECT %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, CURRENT_TIMESTAMP(), %s
+    """, (
+        storm_id,
+        forecast_time,
+        status,
+        json.dumps(countries or []),
+        files_written,
+        error_message,
+        started_at,
+        runtime_seconds,
+    ))
+    conn.commit()
+    cur.close()
+
+
+# =============================================================================
 # COMPLETION SIGNAL
 # =============================================================================
+
 def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_written: int, runtime_seconds: int = None):
     """
-    Insert a completion record into TC_PIPELINE_COMPLETE_LOG.
+    Insert a batch-completion record into TC_PIPELINE_COMPLETE_LOG.
     This triggers the stream-based refresh of *_MAT tables in Snowflake.
-    Only called on successful runs.
+    Only called when at least one storm was processed successfully.
     """
     cur = conn.cursor()
     cur.execute("""
@@ -495,7 +558,9 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     2. Filters by date and/or storm name if specified
     3. Processes each matching storm/forecast combination
     4. Skips already-processed storms unless rewrite=1
-    5. Tracks processing status in JSON file
+    5. Tracks processing status:
+         - DATA_PIPELINE_DB=SNOWFLAKE: TC_PIPELINE_RUN_LOG table (per storm_id/forecast_time)
+         - LOCAL / BLOB: JSON file (storms.json in the results directory)
 
     Admin levels processed are determined automatically by which base admin parquets
     exist for each country (initialized with --type initialize [--admin N ...]).
@@ -506,14 +571,13 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
         zoom: Zoom level for mercator tiles
         rewrite: If 1, reprocess existing storms; if 0, skip already processed
-        time_delta: Number of days in the past to consider storms (default: 9)
+        time_delta: Number of days in the past to consider storms (default: 2)
         target_date: Optional specific date to filter (YYYY-MM-DD format). Overrides time_delta.
         target_storm: Optional specific storm name to filter (e.g., 'FUNG-WONG')
-    
+
     Returns:
         ImpactPipelineStats: Statistics object with execution results
     """
-    # Initialize logger first
     logger = setup_logging(log_level)
 
     if not countries:
@@ -522,107 +586,166 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         stats.errors.append("No countries specified")
         return stats
 
-    d = load_json_storms()
+    snowflake_mode = os.environ.get('DATA_PIPELINE_DB', 'LOCAL').upper() == 'SNOWFLAKE'
+
+    # Tracking state — only one is used depending on mode
+    d = None        # JSON tracking (LOCAL / BLOB)
+    conn = None     # Snowflake connection (SNOWFLAKE mode)
+
+    if snowflake_mode:
+        try:
+            conn = get_snowflake_connection()
+        except Exception as e:
+            logger.warning(f"Could not open Snowflake connection for run logging: {e}")
+    else:
+        d = load_json_storms()
+
     stats = ImpactPipelineStats()
-    stats.analysis_success = True  # assume success; flip to False on any failure
+    stats.analysis_success = True
     update_start_time = datetime.now()
 
     storms_df = get_snowflake_data()
     storms_df['DATE'] = pd.to_datetime(storms_df['FORECAST_TIME']).dt.date
     storms_df['TIME'] = pd.to_datetime(storms_df['FORECAST_TIME']).dt.strftime('%H:%M')
 
-    # Filter by target_date if specified
     if target_date:
         target_date_obj = pd.to_datetime(target_date).date() if isinstance(target_date, str) else target_date
         storms_df = storms_df[storms_df['DATE'] == target_date_obj]
         logger.info(f"Filtering to storms on {target_date_obj} only")
-    
-    # Filter by target_storm if specified
+
     if target_storm:
         storms_df = storms_df[storms_df['TRACK_ID'] == target_storm]
         logger.info(f"Filtering to storm {target_storm} only")
 
-    # Check if any storms match the filters
     if storms_df.empty:
         logger.warning("No storms found matching the specified filters (date and/or storm name)")
-        stats.analysis_success = True  # Not an error - just no matching data
+        if conn:
+            conn.close()
         return stats
 
-    # Track if we processed any storms
     storms_processed = False
     completed_storm_ids = []
     completed_countries = set()
     total_files_written = 0
 
-    for _,row in storms_df.iterrows():
+    for _, row in storms_df.iterrows():
         storm = row['TRACK_ID']
         forecast_date = row['DATE']
-        forecast_time = row['TIME']
-
-        # Get today's date
+        forecast_time_str = row['TIME']
+        forecast_time_ts = pd.to_datetime(row['FORECAST_TIME']).to_pydatetime()
         today = datetime.today().date()
 
-        # If target_date is specified, skip time_delta check (already filtered above)
-        # Otherwise, use time_delta to filter
-        if target_date or (today - forecast_date).days < time_delta:
+        if not (target_date or (today - forecast_date).days < time_delta):
+            logger.debug(f"Forecast date {forecast_date} outside time delta ({time_delta} days)")
+            continue
 
-            date_str = str(forecast_date).replace('-', '')
-            time_str = forecast_time.replace(':', '')
-            forecast_datetime_str = f"{date_str}{time_str}00"
+        date_str = str(forecast_date).replace('-', '')
+        time_str = forecast_time_str.replace(':', '')
+        forecast_datetime_str = f"{date_str}{time_str}00"
 
-            # Key includes countries so different country sets are tracked independently
+        # --- Deduplication check ---
+        already_done = False
+        if snowflake_mode and conn:
+            try:
+                already_done = is_already_processed(conn, storm, forecast_time_ts)
+            except Exception as e:
+                logger.warning(f"Could not check TC_PIPELINE_RUN_LOG: {e}")
+        elif d is not None:
             countries_key = ','.join(sorted(countries))
             storm_key = f"{storm}|{countries_key}"
-            if (storm_key not in d['storms'] or forecast_datetime_str not in d['storms'][storm_key]) or rewrite==1:
-                storms_processed = True
-                loop_stats = run_hurricane_pipeline(
-                    storm=storm,
-                    forecast_time=forecast_datetime_str,
-                    countries=countries,
-                    skip_analysis=skip_analysis,
-                    log_level=log_level,
-                    zoom=zoom
-                )
-                if loop_stats.analysis_success:
-                    if loop_stats.countries_processed == 0:
-                        logger.info(f"Storm {storm} at {forecast_datetime_str} — not in range of any country, skipped")
-                    else:
-                        logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
-                    stats.countries_processed += loop_stats.countries_processed
-                    stats.views_created += loop_stats.views_created
-                    stats.affected_countries.extend(loop_stats.affected_countries)
-                    if storm_key not in d['storms']:
-                        d['storms'][storm_key] = []
-                    d['storms'][storm_key].append(forecast_datetime_str)
-                    if loop_stats.countries_processed > 0 and storm not in completed_storm_ids:
-                        completed_storm_ids.append(storm)
-                    completed_countries.update(loop_stats.affected_countries)
-                    total_files_written += loop_stats.views_created
-                else:
-                    logger.error(f"Pipeline with errors for storm {storm} at {forecast_datetime_str}")
-                    stats.analysis_success = False
-                    stats.errors.extend(loop_stats.errors)
-            else:
-                # Storm already processed for these countries and rewrite=0, so skip
-                logger.info(f"Storm {storm} at {forecast_datetime_str} already processed for {countries_key} (use --rewrite 1 to reprocess)")
-        else:
-            logger.debug(f"Forecast date {forecast_date} outside time delta ({time_delta} days)")
+            already_done = (
+                storm_key in d['storms']
+                and forecast_datetime_str in d['storms'][storm_key]
+            )
 
-    # If no storms were processed (all were already processed), stats.analysis_success remains True
+        if already_done and rewrite != 1:
+            logger.info(f"Storm {storm} at {forecast_datetime_str} already processed (use --rewrite 1 to reprocess)")
+            continue
+
+        # --- Log start ---
+        if snowflake_mode and conn:
+            try:
+                log_run_start(conn, storm, forecast_time_ts)
+            except Exception as e:
+                logger.warning(f"Could not log run start to TC_PIPELINE_RUN_LOG: {e}")
+
+        run_started_at = datetime.now()
+        storms_processed = True
+
+        loop_stats = run_hurricane_pipeline(
+            storm=storm,
+            forecast_time=forecast_datetime_str,
+            countries=countries,
+            skip_analysis=skip_analysis,
+            log_level=log_level,
+            zoom=zoom
+        )
+
+        if loop_stats.analysis_success:
+            if loop_stats.countries_processed == 0:
+                logger.info(f"Storm {storm} at {forecast_datetime_str} — not in range of any country, skipped")
+            else:
+                logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
+            stats.countries_processed += loop_stats.countries_processed
+            stats.views_created += loop_stats.views_created
+            stats.affected_countries.extend(loop_stats.affected_countries)
+
+            # --- Mark success ---
+            if snowflake_mode and conn:
+                try:
+                    log_run_complete(
+                        conn, storm, forecast_time_ts, success=True,
+                        countries=loop_stats.affected_countries,
+                        files_written=loop_stats.views_created,
+                        started_at=run_started_at,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not log run success to TC_PIPELINE_RUN_LOG: {e}")
+            elif d is not None:
+                countries_key = ','.join(sorted(countries))
+                storm_key = f"{storm}|{countries_key}"
+                if storm_key not in d['storms']:
+                    d['storms'][storm_key] = []
+                d['storms'][storm_key].append(forecast_datetime_str)
+
+            if loop_stats.countries_processed > 0 and storm not in completed_storm_ids:
+                completed_storm_ids.append(storm)
+            completed_countries.update(loop_stats.affected_countries)
+            total_files_written += loop_stats.views_created
+
+        else:
+            logger.error(f"Pipeline with errors for storm {storm} at {forecast_datetime_str}")
+            stats.analysis_success = False
+            stats.errors.extend(loop_stats.errors)
+
+            # --- Mark failure ---
+            if snowflake_mode and conn:
+                try:
+                    error_msg = '; '.join(loop_stats.errors) if loop_stats.errors else 'Unknown error'
+                    log_run_complete(
+                        conn, storm, forecast_time_ts, success=False,
+                        error_message=error_msg,
+                        started_at=run_started_at,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not log run failure to TC_PIPELINE_RUN_LOG: {e}")
+
     if not storms_processed:
         logger.info("All matching storms were already processed (use --rewrite 1 to reprocess)")
 
-    # Save processed storms tracking (may fail silently if data store is not configured)
-    try:
-        save_json_storms(d)
-    except Exception as e:
-        logger.warning(f"Could not save storms tracking file: {e}")
+    # Save JSON tracking for LOCAL / BLOB modes
+    if not snowflake_mode and d is not None:
+        try:
+            save_json_storms(d)
+        except Exception as e:
+            logger.warning(f"Could not save storms tracking file: {e}")
 
-    # Signal completion to Snowflake so *_MAT tables refresh via stream trigger
+    # Signal batch completion so *_MAT tables refresh via stream trigger
     if completed_storm_ids:
         try:
             runtime_seconds = int((datetime.now() - update_start_time).total_seconds())
-            conn = get_snowflake_connection()
+            if conn is None:
+                conn = get_snowflake_connection()
             signal_pipeline_complete(
                 conn=conn,
                 storm_ids=completed_storm_ids,
@@ -630,10 +753,12 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
                 files_written=total_files_written,
                 runtime_seconds=runtime_seconds
             )
-            conn.close()
             logger.info(f"Signalled pipeline completion to Snowflake for storms: {completed_storm_ids} (runtime: {runtime_seconds}s)")
         except Exception as e:
             logger.warning(f"Could not write completion signal to Snowflake: {e}")
+
+    if conn:
+        conn.close()
 
     return stats
 
@@ -772,8 +897,8 @@ def main():
     parser.add_argument(
         "--time_delta",
         type=int,
-        default=9,
-        help="Number of days in the past to consider storms for analysis (default: 9). Ignored if --date is specified."
+        default=2,
+        help="Number of days in the past to consider storms for analysis (default: 2). Ignored if --date is specified."
     )
     
     # ========== Execution Control Arguments ==========
