@@ -27,8 +27,8 @@ threshold, with these base fields:
 | `geom_id` | GeoRepo admin ucode (e.g. `TWN_0001_V2`) |
 
 Plus all impact metric columns found in the CSV (e.g. `E_population`,
-`E_num_schools`, `E_num_hcs`, CCI fields). The columns `E_rwi` and
-`E_smod_class` are intentionally excluded.
+`E_num_schools`, `E_num_hcs`). The columns `E_rwi`, `E_smod_class`, and
+`E_smod_class_l1` are intentionally excluded. CCI files are ignored entirely.
 
 ## Environment
 

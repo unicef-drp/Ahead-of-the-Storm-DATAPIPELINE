@@ -282,7 +282,7 @@ def main() -> None:
 
         print(f"Admin level {admin_level}: prepared {len(rows)} row(s).")
         all_rows.extend(rows)
-        all_desired_fields = desired_fields  # same BASE_FIELDS structure, metrics accumulate
+        all_desired_fields = merge_missing_fields(all_desired_fields, desired_fields)
 
     if not all_rows:
         print("Nothing to upload.")

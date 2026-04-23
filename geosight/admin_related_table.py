@@ -41,7 +41,6 @@ METRIC_LABELS: dict[str, str] = {
     "E_num_hcs":                 "Expected Affected Health Centers",
     "E_num_shelters":            "Expected Affected Shelters",
     "E_num_wash":                "Expected Affected WASH Facilities",
-    "E_smod_class_l1":           "Mean Settlement Class (L1)",
     "probability":               "Probability of Wind Exposure",
 }
 
