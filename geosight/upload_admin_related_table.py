@@ -183,7 +183,7 @@ def main() -> None:
 
     api_key    = os.getenv("GEOSIGHT_API_KEY")
     user_email = os.getenv("GEOSIGHT_USER_EMAIL")
-    base_url   = os.getenv("GEOSIGHT_BASE_URL", "https://geosight.unicef.org")
+    base_url   = os.getenv("GEOSIGHT_BASE_URL") or "https://geosight.unicef.org"
 
     if not api_key:
         raise ValueError("GEOSIGHT_API_KEY must be set.")
