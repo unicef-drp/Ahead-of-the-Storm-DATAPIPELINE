@@ -110,24 +110,16 @@ def download_csv(data_store, fname: str, dest_dir: Path) -> None:
         dest.write_bytes(raw if isinstance(raw, bytes) else raw.encode())
 
 
-def fetch_latest_forecast(
-    client: GeoSightClient, table_id
-) -> dict[tuple[str, str, int], str]:
+def fetch_latest_forecast_time(client: GeoSightClient, table_id) -> str:
     """
-    Scan GeoSight RT once; return latest forecast_time per
-    (country_code, storm, admin_level). ISO 8601 strings sort lexicographically.
+    Scan GeoSight RT once; return the single latest forecast_time across all rows.
+    Returns '' if the table is empty. ISO 8601 strings sort lexicographically.
     """
-    latest: dict[tuple[str, str, int], str] = {}
+    latest = ""
     for row in client.iter_related_table_rows(table_id=table_id, page_size=500):
-        props = row.get("properties", {})
-        country = props.get("country_code")
-        storm   = props.get("storm")
-        level   = props.get("admin_level")
-        ft      = props.get("forecast_time")
-        if country and storm and level is not None and ft:
-            key = (country, storm, int(level))
-            if key not in latest or ft > latest[key]:
-                latest[key] = ft
+        ft = row.get("properties", {}).get("forecast_time", "")
+        if ft > latest:
+            latest = ft
     return latest
 
 
@@ -239,12 +231,15 @@ def main() -> None:
     # 4. Fetch existing RT (used for both incremental scan and schema update)
     existing_table = client.get_related_table_by_name(TABLE_NAME)
 
-    # 5. For incremental mode: scan RT once for latest per (country, storm, admin_level)
-    latest: dict[tuple[str, str, int], str] = {}
+    # 5. For incremental mode: scan RT once for the global latest forecast_time
+    latest_forecast_time = ""
     if not args.backfill and existing_table:
-        print("Scanning GeoSight RT for latest forecasts per (country, storm, admin_level)...")
-        latest = fetch_latest_forecast(client, existing_table["id"])
-        print(f"  Found {len(latest)} (country, storm, level) pair(s) already in GeoSight.")
+        print("Scanning GeoSight RT for latest forecast time...")
+        latest_forecast_time = fetch_latest_forecast_time(client, existing_table["id"])
+        if latest_forecast_time:
+            print(f"  Latest forecast time already in GeoSight: {latest_forecast_time}")
+        else:
+            print("  GeoSight RT is empty — will upload all matching files.")
 
     # 6. Process each admin level into the single RT
     all_rows: list[dict] = []
@@ -258,8 +253,7 @@ def main() -> None:
         else:
             selected = [
                 (fname, parts) for fname, parts in files
-                if format_forecast_time(parts["forecast"])
-                   > latest.get((parts["country"], parts["storm"], admin_level), "")
+                if format_forecast_time(parts["forecast"]) > latest_forecast_time
             ]
             skipped_count = len(files) - len(selected)
             print(f"Admin level {admin_level}: {len(selected)} new file(s), {skipped_count} already up to date.")
