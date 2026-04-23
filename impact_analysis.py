@@ -2781,9 +2781,11 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         agg_dict = {col: "sum" for col in sum_cols_cci}
         agg = cci_tiles_view.copy()
         if admin_level != 1:
-            # Map tile IDs to this admin level's IDs
+            # Map quadkey tile IDs (zone_id) to this admin level's ucodes.
+            # agg['id'] holds admin1 ucodes at this point, not quadkeys, so we
+            # must re-derive from zone_id which is the original quadkey.
             id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
-            agg['id'] = agg['id'].map(lambda x: id_map.get(x, x))
+            agg['id'] = agg['zone_id'].map(id_map)
         agg = agg.groupby("id").agg(agg_dict).reset_index()
         cci_admin_view = agg.rename(columns={'id': 'tile_id'})
         save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level)
