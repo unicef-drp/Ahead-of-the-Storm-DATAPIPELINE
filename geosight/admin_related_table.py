@@ -44,7 +44,7 @@ METRIC_LABELS: dict[str, str] = {
     "probability":               "Probability of Wind Exposure",
 }
 
-EXCLUDED_METRIC_COLUMNS = {"E_rwi", "E_smod_class", "E_smod_class_l1"}
+ALLOWED_METRIC_COLUMNS = set(METRIC_LABELS.keys())
 
 
 def _resolve_geom_column(df: pd.DataFrame, requested_column: str) -> str:
@@ -148,10 +148,7 @@ def build_related_table_rows(
 
         effective_geom_col = _resolve_geom_column(df, geom_column)
 
-        metric_columns = [
-            c for c in df.columns
-            if c not in {effective_geom_col, "name"} and c not in EXCLUDED_METRIC_COLUMNS
-        ]
+        metric_columns = [c for c in df.columns if c in ALLOWED_METRIC_COLUMNS]
         for col in metric_columns:
             metric_field_types.setdefault(col, _field_type_for_series(df[col]))
 
