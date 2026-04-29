@@ -396,7 +396,7 @@ def get_countries_needing_zoom_level(country_code, zoom_level):
             except:
                 pass
 
-def _apply_country_update(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None):
+def _apply_country_update(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None, timezone=None):
     """Shared implementation for updating editable country fields."""
     conn = None
     cursor = None
@@ -424,6 +424,9 @@ def _apply_country_update(country_code, country_name=None, center_lat=None, cent
         if view_zoom is not None:
             update_fields.append("VIEW_ZOOM = %s")
             update_values.append(view_zoom)
+        if timezone is not None:
+            update_fields.append("TIMEZONE = %s")
+            update_values.append(timezone)
 
         update_values.append(country_code)
         cursor.execute(
@@ -433,7 +436,8 @@ def _apply_country_update(country_code, country_name=None, center_lat=None, cent
         conn.commit()
 
         updated = {k: v for k, v in [("country_name", country_name), ("center_lat", center_lat),
-                                      ("center_lon", center_lon), ("view_zoom", view_zoom)] if v is not None}
+                                      ("center_lon", center_lon), ("view_zoom", view_zoom),
+                                      ("timezone", timezone)] if v is not None}
         logger.info(f"Updated config for {country_code}: {updated}")
         return True
     except Exception as e:
@@ -457,9 +461,9 @@ def _apply_country_update(country_code, country_name=None, center_lat=None, cent
                 pass
 
 
-def update_country_config(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None):
+def update_country_config(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None, timezone=None):
     """
-    Update editable fields (name and/or map config) for a country in PIPELINE_COUNTRIES.
+    Update editable fields (name, map config, and/or timezone) for a country in PIPELINE_COUNTRIES.
     Only updates fields that are provided (not None).
 
     Args:
@@ -468,6 +472,7 @@ def update_country_config(country_code, country_name=None, center_lat=None, cent
         center_lat: Optional latitude for map center (None to skip update)
         center_lon: Optional longitude for map center (None to skip update)
         view_zoom: Optional zoom level for visualization map (None to skip update)
+        timezone: Optional IANA timezone name (e.g. 'America/Jamaica'). Defaults to 'UTC' in DB.
 
     Returns:
         bool: True if successful, False otherwise
@@ -475,11 +480,12 @@ def update_country_config(country_code, country_name=None, center_lat=None, cent
     Raises:
         ValueError: If all parameters are None (nothing to update)
     """
-    if all(v is None for v in [country_name, center_lat, center_lon, view_zoom]):
+    if all(v is None for v in [country_name, center_lat, center_lon, view_zoom, timezone]):
         raise ValueError("At least one field must be provided")
 
     return _apply_country_update(country_code, country_name=country_name,
-                                 center_lat=center_lat, center_lon=center_lon, view_zoom=view_zoom)
+                                 center_lat=center_lat, center_lon=center_lon,
+                                 view_zoom=view_zoom, timezone=timezone)
 
 
 def update_country_map_config(country_code, center_lat=None, center_lon=None, view_zoom=None):

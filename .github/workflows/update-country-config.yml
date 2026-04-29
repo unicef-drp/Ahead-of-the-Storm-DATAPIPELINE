@@ -23,6 +23,10 @@ on:
         description: 'Zoom level for visualization map (e.g., 8). Leave empty to skip.'
         required: false
         type: string
+      timezone:
+        description: 'IANA timezone name for local time display in alerts (e.g., America/Jamaica). Leave empty to skip. Defaults to UTC.'
+        required: false
+        type: string
 
 jobs:
   update-country-config:
@@ -58,13 +62,15 @@ jobs:
           center_lat_str   = '${{ inputs.center_lat }}'.strip()
           center_lon_str   = '${{ inputs.center_lon }}'.strip()
           view_zoom_str    = '${{ inputs.view_zoom }}'.strip()
+          timezone_str     = '${{ inputs.timezone }}'.strip()
 
           country_name = country_name_str if country_name_str else None
           center_lat   = float(center_lat_str) if center_lat_str else None
           center_lon   = float(center_lon_str) if center_lon_str else None
           view_zoom    = int(view_zoom_str)     if view_zoom_str  else None
+          timezone     = timezone_str           if timezone_str   else None
 
-          if not any([country_name, center_lat is not None, center_lon is not None, view_zoom is not None]):
+          if not any([country_name, center_lat is not None, center_lon is not None, view_zoom is not None, timezone]):
               print('Error: at least one field must be provided')
               exit(1)
 
@@ -74,6 +80,7 @@ jobs:
               center_lat=center_lat,
               center_lon=center_lon,
               view_zoom=view_zoom,
+              timezone=timezone,
           )
           if success:
               print('Country config updated successfully')
@@ -97,7 +104,7 @@ jobs:
 
           conn = get_snowflake_connection()
           query = '''
-              SELECT COUNTRY_CODE, COUNTRY_NAME, CENTER_LAT, CENTER_LON, VIEW_ZOOM
+              SELECT COUNTRY_CODE, COUNTRY_NAME, CENTER_LAT, CENTER_LON, VIEW_ZOOM, TIMEZONE
               FROM PIPELINE_COUNTRIES
               WHERE COUNTRY_CODE = '${{ inputs.country_code }}'
           '''
@@ -109,6 +116,7 @@ jobs:
               print(f'Country: {row[\"COUNTRY_CODE\"]} ({row[\"COUNTRY_NAME\"]})')
               print(f'Center: [{row[\"CENTER_LAT\"]}, {row[\"CENTER_LON\"]}]')
               print(f'View Zoom: {row[\"VIEW_ZOOM\"]}')
+              print(f'Timezone: {row[\"TIMEZONE\"]}')
           else:
               print('Country not found in table')
               exit(1)
