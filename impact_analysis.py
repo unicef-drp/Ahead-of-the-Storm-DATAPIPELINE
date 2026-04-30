@@ -172,6 +172,10 @@ INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0–12mo) and _01_ (1–4y) band
 ADOLESCENT_AGE_MIN = 15  # GR2 min_age: picks _15_ (15–19y) band
 ADOLESCENT_AGE_MAX = 15  # GR2 max_age: picks _15_ (15–19y) band — 1 file only
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
+# Full ECMWF ensemble size: 50 perturbed members + 1 control (member 51 = GRIB number 0).
+# Hard-coded so probability denominators stay correct even when individual members fail
+# to produce wind polygons or are missing from GRIB files.
+FULL_ENSEMBLE_SIZE = 51
 
 
 #==============================================================================
@@ -1601,12 +1605,11 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
+    num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            num_ensembles = len(list(gdf_envelopes_wth.ensemble_member.unique()))
-
             schools_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_schools_buff, zone_id_column='school_id_giga')
             try:
                 new_col = schools_viewer.map_polygons(gdf_envelopes_wth)
@@ -1676,12 +1679,11 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
+    num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            num_ensembles = len(list(gdf_envelopes_wth.ensemble_member.unique()))
-
             hcs_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_hcs_buff, zone_id_column='osm_id')
             try:
                 new_col = hcs_viewer.map_polygons(gdf_envelopes_wth)
@@ -1726,10 +1728,10 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
 
     gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
+    num_ensembles = FULL_ENSEMBLE_SIZE
     for wind_th in gdf_envelopes.wind_threshold.unique():
         gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_env_wth.empty:
-            num_ensembles = len(gdf_env_wth.ensemble_member.unique())
             viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_shelters_buff, zone_id_column='osm_id')
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
@@ -1773,10 +1775,10 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
 
     gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
+    num_ensembles = FULL_ENSEMBLE_SIZE
     for wind_th in gdf_envelopes.wind_threshold.unique():
         gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_env_wth.empty:
-            num_ensembles = len(gdf_env_wth.ensemble_member.unique())
             viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_wash_buff, zone_id_column='osm_id')
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
@@ -1792,25 +1794,24 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
 def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
     """
     Create mercator tile impact views from hurricane envelopes.
-    
+
     For each wind speed threshold, calculates expected impacts (E_*) for each tile,
     where expected impact = base value * probability of impact.
-    
+
     Args:
         gdf_tiles: GeoDataFrame containing mercator tiles with demographic/infrastructure data
         gdf_envelopes: GeoDataFrame containing hurricane envelope geometries with wind_threshold column
-    
+
     Returns:
         dict: Dictionary mapping wind threshold (int) to DataFrame with tile impact data.
               Each DataFrame contains probability and E_* columns for expected impacts.
     """
     wind_views = {}
+    num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            num_ensembles = len(list(gdf_envelopes_wth.ensemble_member.unique()))
-
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
@@ -1829,7 +1830,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
                     logger.debug(f"Column '{col}' missing from tile data — E_{col} set to NaN (re-initialize country to populate)")
 
             df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
-            
+
             # Reset index to make zone_id a column (needed for calculate_ccis)
             # Check if 'zone_id' already exists as a column
             if 'zone_id' in df_view.columns:
@@ -1854,14 +1855,17 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
 
 
 def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
-    d = gdf_admin.set_index('tile_id')['name'].to_dict()
+    if 'name' in gdf_admin.columns:
+        d = gdf_admin.set_index('tile_id')['name'].to_dict()
+    else:
+        logger.warning("Admin GeoDataFrame missing 'name' column — admin region names will be NaN")
+        d = {}
     wind_views = {}
+    num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes.wind_threshold.unique())
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            num_ensembles = len(list(gdf_envelopes_wth.ensemble_member.unique()))
-
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
                 new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
@@ -1936,6 +1940,9 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             
             ### add names ###
             df_view['name'] = df_view['tile_id'].map(d)
+            missing_names = df_view['name'].isna().sum()
+            if missing_names > 0:
+                logger.warning(f"  {missing_names} admin region(s) at {wind_th}kt have no name mapping (tile_id not in admin GeoDataFrame)")
 
             wind_views[wind_th] = df_view
 
@@ -2688,6 +2695,24 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     if not admin_levels:
         # Fallback: ensure admin1 is always processed (creates on-the-fly if missing)
         admin_levels = [1]
+
+    # Remove all existing output files for this country/storm/forecast run before writing
+    # new ones. This prevents stale threshold files (e.g. from a run where 137kt had a
+    # few envelope members that have since been cleaned up) from persisting on the stage.
+    prefix = f"{country}_{storm}_{date}_"
+    for view_dir in ('school_views', 'hc_views', 'shelter_views', 'wash_views',
+                     'mercator_views', 'admin_views', 'track_views'):
+        dir_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, view_dir)
+        try:
+            existing = data_store.list_files(dir_path)
+            for f in existing:
+                fname = os.path.basename(f)
+                if fname.startswith(prefix):
+                    data_store.remove(f)
+                    logger.debug(f"Removed stale file: {f}")
+        except Exception as e:
+            logger.warning(f"Could not clean up {view_dir} for {country}/{storm}/{date}: {e}")
+
     logger.info(f"  Processing {country}...")
 
     # Schools

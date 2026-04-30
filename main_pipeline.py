@@ -532,6 +532,10 @@ def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_writt
     Only called when at least one storm was processed successfully.
     """
     cur = conn.cursor()
+    # Force the stage directory table to sync before signalling completion.
+    # Without this, AOTS_ANALYSIS_FILE_STREAM may not yet reflect newly PUT
+    # files when the refresh task fires, causing a silent missed refresh.
+    cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
     cur.execute("""
         INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_COMPLETE_LOG
             (STORM_IDS, COUNTRIES_PROCESSED, FILES_WRITTEN, STATUS, RUNTIME_SECONDS)
