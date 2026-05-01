@@ -14,7 +14,7 @@ snowflake-connector-python[pandas]>=3.0.0
 python-dotenv>=1.0.0
 
 # GigaSpatial platform integration
-giga-spatial[all]>=0.9.3
+giga-spatial[all]>=0.9.4
 psutil>=5.9.0
 
 # Country name resolution from ISO3 codes

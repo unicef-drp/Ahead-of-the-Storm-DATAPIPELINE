@@ -20,9 +20,24 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
+import math as _math
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import LineString
+
+
+def _optional_ceil(df, col):
+    """Sum a column and ceiling-round it, but return None if column is missing or all-NaN."""
+    if col not in df.columns or df[col].isna().all():
+        return None
+    return _math.ceil(df[col].sum())
+
+
+def _optional_int(df, col):
+    """Sum a column as int, returning None if column is missing or all-NaN."""
+    if col not in df.columns or df[col].isna().all():
+        return None
+    return int(df[col].sum())
 
 # Import GigaSpatial components
 from gigaspatial.handlers import AdminBoundaries
@@ -385,17 +400,18 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
     Returns:
         dict: Dictionary with vulnerability metrics
     """
+    # Default to None: 0 = confirmed zero, None = no data available (N/A in report)
     result = {
-        'expected_pop_urban': 0, 'expected_pop_rural': 0,
-        'expected_school_urban': 0, 'expected_school_rural': 0,
-        'expected_infant_urban': 0, 'expected_infant_rural': 0,
-        'expected_adolescent_urban': 0, 'expected_adolescent_rural': 0,
-        'expected_pop_poverty': 0, 'expected_pop_severe': 0,
-        'expected_school_poverty': 0, 'expected_school_severe': 0,
-        'expected_infant_poverty': 0, 'expected_infant_severe': 0,
-        'expected_adolescent_poverty': 0, 'expected_adolescent_severe': 0,
+        'expected_pop_urban': None, 'expected_pop_rural': None,
+        'expected_school_urban': None, 'expected_school_rural': None,
+        'expected_infant_urban': None, 'expected_infant_rural': None,
+        'expected_adolescent_urban': None, 'expected_adolescent_rural': None,
+        'expected_pop_poverty': None, 'expected_pop_severe': None,
+        'expected_school_poverty': None, 'expected_school_severe': None,
+        'expected_infant_poverty': None, 'expected_infant_severe': None,
+        'expected_adolescent_poverty': None, 'expected_adolescent_severe': None,
     }
-    
+
     # Urban/Rural classification based on SMOD
     tiles_smod = tiles_df.dropna(subset=['E_smod_class'])
     if not tiles_smod.empty:
@@ -410,17 +426,15 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
             urban_tiles = tiles_with_prob[urban_mask]
             rural_tiles = tiles_with_prob[rural_mask]
             
-            if not urban_tiles.empty:
-                result['expected_pop_urban'] = int(urban_tiles['E_population'].sum())
-                result['expected_school_urban'] = int(urban_tiles['E_school_age_population'].sum())
-                result['expected_infant_urban'] = int(urban_tiles['E_infant_population'].sum())
-                result['expected_adolescent_urban'] = int(urban_tiles['E_adolescent_population'].sum())
-            
-            if not rural_tiles.empty:
-                result['expected_pop_rural'] = int(rural_tiles['E_population'].sum())
-                result['expected_school_rural'] = int(rural_tiles['E_school_age_population'].sum())
-                result['expected_infant_rural'] = int(rural_tiles['E_infant_population'].sum())
-                result['expected_adolescent_rural'] = int(rural_tiles['E_adolescent_population'].sum())
+            # SMOD data exists — set to actual counts (0 = confirmed no urban/rural population)
+            result['expected_pop_urban'] = int(urban_tiles['E_population'].sum()) if not urban_tiles.empty else 0
+            result['expected_school_urban'] = int(urban_tiles['E_school_age_population'].sum()) if not urban_tiles.empty else 0
+            result['expected_infant_urban'] = int(urban_tiles['E_infant_population'].sum()) if not urban_tiles.empty else 0
+            result['expected_adolescent_urban'] = int(urban_tiles['E_adolescent_population'].sum()) if not urban_tiles.empty else 0
+            result['expected_pop_rural'] = int(rural_tiles['E_population'].sum()) if not rural_tiles.empty else 0
+            result['expected_school_rural'] = int(rural_tiles['E_school_age_population'].sum()) if not rural_tiles.empty else 0
+            result['expected_infant_rural'] = int(rural_tiles['E_infant_population'].sum()) if not rural_tiles.empty else 0
+            result['expected_adolescent_rural'] = int(rural_tiles['E_adolescent_population'].sum()) if not rural_tiles.empty else 0
     
     # Poverty/Severe classification based on RWI
     tiles_rwi = tiles_df.dropna(subset=['E_rwi'])
@@ -435,17 +449,15 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
             poverty_tiles = tiles_with_prob[poverty_mask]
             severe_tiles = tiles_with_prob[severe_mask]
             
-            if not poverty_tiles.empty:
-                result['expected_pop_poverty'] = int(poverty_tiles['E_population'].sum())
-                result['expected_school_poverty'] = int(poverty_tiles['E_school_age_population'].sum())
-                result['expected_infant_poverty'] = int(poverty_tiles['E_infant_population'].sum())
-                result['expected_adolescent_poverty'] = int(poverty_tiles['E_adolescent_population'].sum())
-            
-            if not severe_tiles.empty:
-                result['expected_pop_severe'] = int(severe_tiles['E_population'].sum())
-                result['expected_school_severe'] = int(severe_tiles['E_school_age_population'].sum())
-                result['expected_infant_severe'] = int(severe_tiles['E_infant_population'].sum())
-                result['expected_adolescent_severe'] = int(severe_tiles['E_adolescent_population'].sum())
+            # RWI data exists — set to actual counts (0 = confirmed no poverty/severe population)
+            result['expected_pop_poverty'] = int(poverty_tiles['E_population'].sum()) if not poverty_tiles.empty else 0
+            result['expected_school_poverty'] = int(poverty_tiles['E_school_age_population'].sum()) if not poverty_tiles.empty else 0
+            result['expected_infant_poverty'] = int(poverty_tiles['E_infant_population'].sum()) if not poverty_tiles.empty else 0
+            result['expected_adolescent_poverty'] = int(poverty_tiles['E_adolescent_population'].sum()) if not poverty_tiles.empty else 0
+            result['expected_pop_severe'] = int(severe_tiles['E_population'].sum()) if not severe_tiles.empty else 0
+            result['expected_school_severe'] = int(severe_tiles['E_school_age_population'].sum()) if not severe_tiles.empty else 0
+            result['expected_infant_severe'] = int(severe_tiles['E_infant_population'].sum()) if not severe_tiles.empty else 0
+            result['expected_adolescent_severe'] = int(severe_tiles['E_adolescent_population'].sum()) if not severe_tiles.empty else 0
     
     return result
 
@@ -496,15 +508,15 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         # Calculate values for each wind threshold
         for wind in STORM_CATEGORIES.keys():
             if wind not in wind_admin_views:
-                # Set to 0 if wind threshold not present
+                # Wind threshold has no impact data — use 0 for required fields, None for optional
                 d_rows_admins_pop_total[f"{wind}"] = 0
                 d_rows_admins_school[f"{wind}"] = 0
                 d_rows_admins_infant[f"{wind}"] = 0
                 d_rows_admins_adolescent[f"{wind}"] = 0
-                d_rows_schools_winds[f"{wind}"] = 0
-                d_rows_hcs_winds[f"{wind}"] = 0
-                d_rows_shelters_winds[f"{wind}"] = 0
-                d_rows_wash_winds[f"{wind}"] = 0
+                d_rows_schools_winds[f"{wind}"] = None
+                d_rows_hcs_winds[f"{wind}"] = None
+                d_rows_shelters_winds[f"{wind}"] = None
+                d_rows_wash_winds[f"{wind}"] = None
             else:
                 # Filter admin view for this admin ID and sum values
                 admin_view = wind_admin_views[wind][wind_admin_views[wind]['tile_id'] == admin_id]
@@ -512,11 +524,10 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_school[f"{wind}"] = int(admin_view['E_school_age_population'].sum())
                 d_rows_admins_infant[f"{wind}"] = int(admin_view['E_infant_population'].sum())
                 d_rows_admins_adolescent[f"{wind}"] = int(admin_view['E_adolescent_population'].sum())
-                d_rows_schools_winds[f"{wind}"] = int(admin_view['E_num_schools'].sum())
-                d_rows_hcs_winds[f"{wind}"] = int(admin_view['E_num_hcs'].sum())
-                # Guard against older parquets that pre-date shelters/WASH columns
-                d_rows_shelters_winds[f"{wind}"] = int(admin_view['E_num_shelters'].sum()) if 'E_num_shelters' in admin_view.columns else 0
-                d_rows_wash_winds[f"{wind}"] = int(admin_view['E_num_wash'].sum()) if 'E_num_wash' in admin_view.columns else 0
+                d_rows_schools_winds[f"{wind}"] = _optional_int(admin_view, 'E_num_schools')
+                d_rows_hcs_winds[f"{wind}"] = _optional_int(admin_view, 'E_num_hcs')
+                d_rows_shelters_winds[f"{wind}"] = _optional_int(admin_view, 'E_num_shelters')
+                d_rows_wash_winds[f"{wind}"] = _optional_int(admin_view, 'E_num_wash')
 
             # Calculate changes from previous forecast
             if not d_previous:
@@ -636,10 +647,10 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     d['expected_adolescent'] = _math.ceil(expected_tiles['E_adolescent_population'].sum())
     d['expected_children'] = d['expected_school_age'] + d['expected_infants'] + d['expected_adolescent']
     d['expected_pop'] = _math.ceil(expected_tiles['E_population'].sum())
-    d['expected_schools'] = _math.ceil(expected_tiles['E_num_schools'].sum())
-    d['expected_hcs'] = _math.ceil(expected_tiles['E_num_hcs'].sum())
-    d['expected_shelters'] = _math.ceil(expected_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in expected_tiles.columns else 0
-    d['expected_wash'] = _math.ceil(expected_tiles['E_num_wash'].sum()) if 'E_num_wash' in expected_tiles.columns else 0
+    d['expected_schools'] = _optional_ceil(expected_tiles, 'E_num_schools')
+    d['expected_hcs'] = _optional_ceil(expected_tiles, 'E_num_hcs')
+    d['expected_shelters'] = _optional_ceil(expected_tiles, 'E_num_shelters')
+    d['expected_wash'] = _optional_ceil(expected_tiles, 'E_num_wash')
     d['expected_cci_pop'] = int(cci_tiles_view['E_CCI_pop'].sum())
     d['expected_cci_school'] = int(cci_tiles_view['E_CCI_school_age'].sum())
     d['expected_cci_infant'] = int(cci_tiles_view['E_CCI_infants'].sum())
@@ -660,28 +671,36 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
         d[f"expected_infant_{wind}"] = _math.ceil(wind_tiles['E_infant_population'].sum())
         d[f"expected_adolescent_{wind}"] = _math.ceil(wind_tiles['E_adolescent_population'].sum())
         d[f"expected_children_{wind}"] = d[f"expected_school_{wind}"] + d[f"expected_infant_{wind}"] + d[f"expected_adolescent_{wind}"]
-        d[f"expected_schools_{wind}"] = _math.ceil(wind_tiles['E_num_schools'].sum())
-        d[f"expected_hcs_{wind}"] = _math.ceil(wind_tiles['E_num_hcs'].sum())
-        d[f"expected_shelters_{wind}"] = _math.ceil(wind_tiles['E_num_shelters'].sum()) if 'E_num_shelters' in wind_tiles.columns else 0
-        d[f"expected_wash_{wind}"] = _math.ceil(wind_tiles['E_num_wash'].sum()) if 'E_num_wash' in wind_tiles.columns else 0
+        d[f"expected_schools_{wind}"] = _optional_ceil(wind_tiles, 'E_num_schools')
+        d[f"expected_hcs_{wind}"] = _optional_ceil(wind_tiles, 'E_num_hcs')
+        d[f"expected_shelters_{wind}"] = _optional_ceil(wind_tiles, 'E_num_shelters')
+        d[f"expected_wash_{wind}"] = _optional_ceil(wind_tiles, 'E_num_wash')
 
         # Calculate changes from previous forecast
         if not d_previous:
             d[f"change_school_{wind}"] = d[f"expected_school_{wind}"]
             d[f"change_infant_{wind}"] = d[f"expected_infant_{wind}"]
             d[f"change_children_{wind}"] = d[f"expected_children_{wind}"]
-            d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"]
-            d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"]
-            d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"]
-            d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"]
+            if d[f"expected_schools_{wind}"] is not None:
+                d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"]
+            if d[f"expected_hcs_{wind}"] is not None:
+                d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"]
+            if d[f"expected_shelters_{wind}"] is not None:
+                d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"]
+            if d[f"expected_wash_{wind}"] is not None:
+                d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"]
         else:
             d[f"change_school_{wind}"] = d[f"expected_school_{wind}"] - d_previous.get(f"expected_school_{wind}", 0)
             d[f"change_infant_{wind}"] = d[f"expected_infant_{wind}"] - d_previous.get(f"expected_infant_{wind}", 0)
             d[f"change_children_{wind}"] = d[f"expected_children_{wind}"] - d_previous.get(f"expected_children_{wind}", 0)
-            d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"] - d_previous.get(f"expected_schools_{wind}", 0)
-            d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"] - d_previous.get(f"expected_hcs_{wind}", 0)
-            d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"] - d_previous.get(f"expected_shelters_{wind}", 0)
-            d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"] - d_previous.get(f"expected_wash_{wind}", 0)
+            if d[f"expected_schools_{wind}"] is not None:
+                d[f"change_schools_{wind}"] = d[f"expected_schools_{wind}"] - (d_previous.get(f"expected_schools_{wind}") or 0)
+            if d[f"expected_hcs_{wind}"] is not None:
+                d[f"change_hcs_{wind}"] = d[f"expected_hcs_{wind}"] - (d_previous.get(f"expected_hcs_{wind}") or 0)
+            if d[f"expected_shelters_{wind}"] is not None:
+                d[f"change_shelters_{wind}"] = d[f"expected_shelters_{wind}"] - (d_previous.get(f"expected_shelters_{wind}") or 0)
+            if d[f"expected_wash_{wind}"] is not None:
+                d[f"change_wash_{wind}"] = d[f"expected_wash_{wind}"] - (d_previous.get(f"expected_wash_{wind}") or 0)
     
     # Get top at-risk facilities
     if wind_school_views:
@@ -719,10 +738,39 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     # Calculate vulnerability metrics
     vulnerability_metrics = _calculate_vulnerability_metrics(expected_tiles)
     d.update(vulnerability_metrics)
-    
+
     # Calculate administrative-level impact rows
     admin_rows = _calculate_admin_rows(wind_admin_views, cci_admin_view, gdf_admin, d_previous)
     d.update(admin_rows)
+
+    # Post-process facility counts: if no named at-risk facilities exist for a type,
+    # treat all expected counts as None (N/A) rather than 0.
+    # 0 = confirmed zero impact; None = no data available for this country.
+    no_school_data = not any(d.get(f'school_name_{i}') for i in range(1, TOP_FACILITIES_COUNT + 1))
+    no_hc_data = not any(d.get(f'hc_name_{i}') for i in range(1, TOP_FACILITIES_COUNT + 1))
+    no_shelter_data = not any(d.get(f'shelter_name_{i}') for i in range(1, TOP_FACILITIES_COUNT + 1))
+    no_wash_data = not (
+        any(d.get(f'wash_name_{i}') for i in range(1, TOP_FACILITIES_COUNT + 1)) or
+        any(isinstance(d.get(f'wash_prob_{i}'), float) and d[f'wash_prob_{i}'] > 0
+            for i in range(1, TOP_FACILITIES_COUNT + 1))
+    )
+    _no_data_map = [
+        (no_school_data,  'expected_schools',  'change_schools',  'rows_schools_winds'),
+        (no_hc_data,      'expected_hcs',      'change_hcs',      'rows_hcs_winds'),
+        (no_shelter_data, 'expected_shelters', 'change_shelters', 'rows_shelters_winds'),
+        (no_wash_data,    'expected_wash',     'change_wash',     'rows_wash_winds'),
+    ]
+    for no_data, expected_prefix, change_prefix, rows_key in _no_data_map:
+        if not no_data:
+            continue
+        for key in list(d.keys()):
+            if (key.startswith(expected_prefix) or key.startswith(change_prefix)) and d[key] in (0, None):
+                d[key] = None
+        for row in d.get(rows_key, []):
+            for wind in STORM_CATEGORIES:
+                wind_key = str(wind)
+                if wind_key in row and row[wind_key] in (0, None):
+                    row[wind_key] = None
 
     # Validate report structure
     missing_keys = [key for key in REPORT_TEMPLATE.keys() if key not in d]

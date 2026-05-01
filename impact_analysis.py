@@ -147,6 +147,16 @@ sum_cols_admin = [
     'num_shelters',
     'num_wash',
 ]
+
+# Columns where all-NaN means "no data" and should remain NaN (not sum to 0).
+_OPTIONAL_SUM_COLS = {
+    'num_shelters', 'num_wash', 'E_num_shelters', 'E_num_wash',
+    'num_schools',  'num_hcs',  'E_num_schools',  'E_num_hcs',
+}
+
+def _optional_sum(s):
+    """Sum that preserves NaN when all values are NaN (no-data semantics)."""
+    return s.sum() if s.notna().any() else float('nan')
 avg_cols_admin = [
     'smod_class',       # Mean SMOD L2 class across tiles in admin unit
     'smod_class_l1',    # Mean SMOD L1 class
@@ -910,17 +920,34 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
         )
 
     # Schools, health centers, shelters, WASH
-    schools = tiles_viewer.map_points(points=gdf_schools)
-    tiles_viewer.add_variable_to_view(schools, "num_schools")
-    
-    hcs = tiles_viewer.map_points(points=gdf_hcs)
-    tiles_viewer.add_variable_to_view(hcs, "num_hcs")
-    
-    shelters = tiles_viewer.map_points(points=gdf_shelters)
-    tiles_viewer.add_variable_to_view(shelters, "num_shelters")
-    
-    wash_pts = tiles_viewer.map_points(points=gdf_wash)
-    tiles_viewer.add_variable_to_view(wash_pts, "num_wash")
+    # If the fetch returned empty (API failure, rate limit, etc.) store NaN so the
+    # tile parquet records "data unavailable" rather than silently writing 0.
+    # Use --type patch --columns <col> to backfill once data is available.
+    _nan_tiles = {k: np.nan for k in tiles_viewer.view.index.unique()}
+
+    if gdf_schools.empty:
+        logger.warning(f"{country}: No school data — num_schools set to NaN. Backfill with --type patch --columns schools")
+        tiles_viewer.add_variable_to_view(_nan_tiles, "num_schools")
+    else:
+        tiles_viewer.add_variable_to_view(tiles_viewer.map_points(points=gdf_schools), "num_schools")
+
+    if gdf_hcs.empty:
+        logger.warning(f"{country}: No health center data — num_hcs set to NaN. Backfill with --type patch --columns hcs")
+        tiles_viewer.add_variable_to_view(_nan_tiles, "num_hcs")
+    else:
+        tiles_viewer.add_variable_to_view(tiles_viewer.map_points(points=gdf_hcs), "num_hcs")
+
+    if gdf_shelters.empty:
+        logger.warning(f"{country}: No shelter data — num_shelters set to NaN. Backfill with --type patch --columns shelters")
+        tiles_viewer.add_variable_to_view(_nan_tiles, "num_shelters")
+    else:
+        tiles_viewer.add_variable_to_view(tiles_viewer.map_points(points=gdf_shelters), "num_shelters")
+
+    if gdf_wash.empty:
+        logger.warning(f"{country}: No WASH data — num_wash set to NaN. Backfill with --type patch --columns wash")
+        tiles_viewer.add_variable_to_view(_nan_tiles, "num_wash")
+    else:
+        tiles_viewer.add_variable_to_view(tiles_viewer.map_points(points=gdf_wash), "num_wash")
 
     # ------------------------------------------------------------------
     # RWI — optional, NaN fallback, custom override supported
@@ -1246,36 +1273,39 @@ def patch_country_layer(country, zoom_level, columns):
         custom = _load_custom_tiles_csv(country, 'built_surface', zoom_level)
         if custom is not None and 'built_surface_m2' in custom.columns:
             gdf['built_surface_m2'] = gdf['tile_id'].map(custom['built_surface_m2'])
+            logger.info(f"{country}: Patched built_surface_m2 from custom CSV")
         else:
             viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
             try:
                 viewer.map_built_s()
                 v = viewer.to_geodataframe().set_index('zone_id')['built_surface_m2']
                 gdf['built_surface_m2'] = gdf['tile_id'].map(v.to_dict())
+                logger.info(f"{country}: Patched built_surface_m2")
             except Exception as e:
-                logger.warning(f"{country}: GHSL built surface still unavailable during patch: {e}")
-        logger.info(f"{country}: Patched built_surface_m2")
+                logger.warning(f"{country}: GHSL built surface still unavailable during patch — column not updated: {e}")
 
     if 'smod_class' in columns:
         custom = _load_custom_tiles_csv(country, 'smod', zoom_level)
         if custom is not None and 'smod_class' in custom.columns:
             gdf['smod_class'] = gdf['tile_id'].map(custom['smod_class'])
+            gdf['smod_class_l1'] = gdf['smod_class'].map(SMOD_L2_TO_L1)
+            logger.info(f"{country}: Patched smod_class + smod_class_l1 from custom CSV")
         else:
             viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
             try:
                 viewer.map_smod()
                 v = viewer.to_geodataframe().set_index('zone_id')['smod_class']
                 gdf['smod_class'] = gdf['tile_id'].map(v.to_dict())
+                gdf['smod_class_l1'] = gdf['smod_class'].map(SMOD_L2_TO_L1)
+                logger.info(f"{country}: Patched smod_class + smod_class_l1")
             except Exception as e:
-                logger.warning(f"{country}: GHSL SMOD still unavailable during patch: {e}")
-        # Always re-derive L1 when L2 is patched
-        gdf['smod_class_l1'] = gdf['smod_class'].map(SMOD_L2_TO_L1)
-        logger.info(f"{country}: Patched smod_class + smod_class_l1")
+                logger.warning(f"{country}: GHSL SMOD still unavailable during patch — column not updated: {e}")
 
     if 'rwi' in columns:
         custom = _load_custom_tiles_csv(country, 'rwi', zoom_level)
         if custom is not None and 'rwi' in custom.columns:
             gdf['rwi'] = gdf['tile_id'].map(custom['rwi'])
+            logger.info(f"{country}: Patched rwi from custom CSV")
         else:
             try:
                 handler = RWIHandler(data_store=data_store)
@@ -1286,9 +1316,9 @@ def patch_country_layer(country, zoom_level, columns):
                 viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
                 rwi_vals = viewer.map_points(rwi_gdf, value_columns='rwi', aggregation='mean')
                 gdf['rwi'] = gdf['tile_id'].map(rwi_vals)
+                logger.info(f"{country}: Patched rwi")
             except Exception as e:
-                logger.warning(f"{country}: RWI still unavailable during patch: {e}")
-        logger.info(f"{country}: Patched rwi")
+                logger.warning(f"{country}: RWI still unavailable during patch — column not updated: {e}")
 
     pop_cols_requested = [c for c in ['population', 'school_age_population', 'infant_population', 'adolescent_population'] if c in columns]
     if pop_cols_requested:
@@ -1334,31 +1364,59 @@ def patch_country_layer(country, zoom_level, columns):
 
     if 'schools' in columns:
         gdf_schools = fetch_schools(country, rewrite=1)
-        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
-        schools = viewer.map_points(points=gdf_schools)
-        gdf['num_schools'] = gdf['tile_id'].map(schools)
-        logger.info(f"{country}: Patched num_schools")
+        if gdf_schools.empty and school_exist(country):
+            logger.warning(f"{country}: School API re-fetch returned empty — falling back to existing cache")
+            gdf_schools = load_school_locations(country)
+        if gdf_schools.empty:
+            logger.warning(f"{country}: No school data available — num_schools set to NaN")
+            gdf['num_schools'] = float('nan')
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            schools = viewer.map_points(points=gdf_schools)
+            gdf['num_schools'] = gdf['tile_id'].map(schools)
+            logger.info(f"{country}: Patched num_schools ({len(gdf_schools)} schools)")
 
     if 'hcs' in columns:
         gdf_hcs = fetch_health_centers(country, rewrite=1)
-        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
-        hcs = viewer.map_points(points=gdf_hcs)
-        gdf['num_hcs'] = gdf['tile_id'].map(hcs)
-        logger.info(f"{country}: Patched num_hcs")
+        if gdf_hcs.empty and hc_exist(country):
+            logger.warning(f"{country}: HC API re-fetch returned empty — falling back to existing cache")
+            gdf_hcs = load_hc_locations(country)
+        if gdf_hcs.empty:
+            logger.warning(f"{country}: No HC data available — num_hcs set to NaN")
+            gdf['num_hcs'] = float('nan')
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            hcs = viewer.map_points(points=gdf_hcs)
+            gdf['num_hcs'] = gdf['tile_id'].map(hcs)
+            logger.info(f"{country}: Patched num_hcs ({len(gdf_hcs)} HCs)")
 
     if 'shelters' in columns:
         gdf_shelters = fetch_shelters(country, rewrite=1)
-        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
-        shelters = viewer.map_points(points=gdf_shelters)
-        gdf['num_shelters'] = gdf['tile_id'].map(shelters)
-        logger.info(f"{country}: Patched num_shelters")
+        if gdf_shelters.empty and shelter_exist(country):
+            logger.warning(f"{country}: Shelter data re-fetch returned empty — falling back to existing cache")
+            gdf_shelters = load_shelter_locations(country)
+        if gdf_shelters.empty:
+            logger.warning(f"{country}: No shelter data available — num_shelters set to NaN")
+            gdf['num_shelters'] = float('nan')
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            shelters = viewer.map_points(points=gdf_shelters)
+            gdf['num_shelters'] = gdf['tile_id'].map(shelters)
+            logger.info(f"{country}: Patched num_shelters ({len(gdf_shelters)} shelters)")
 
     if 'wash' in columns:
         gdf_wash = fetch_wash(country, rewrite=1)
-        viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
-        wash_pts = viewer.map_points(points=gdf_wash)
-        gdf['num_wash'] = gdf['tile_id'].map(wash_pts)
-        logger.info(f"{country}: Patched num_wash")
+        if gdf_wash.empty and wash_exist(country):
+            logger.warning(f"{country}: WASH data re-fetch returned empty — falling back to existing cache")
+            gdf_wash = load_wash_locations(country)
+        if gdf_wash.empty:
+            logger.warning(f"{country}: No WASH data available — num_wash set to NaN")
+            gdf['num_wash'] = float('nan')
+        else:
+            viewer = _MVG(source=country, zoom_level=zoom_level, data_store=data_store)
+            wash_pts = viewer.map_points(points=gdf_wash)
+            gdf['num_wash'] = gdf['tile_id'].map(wash_pts)
+            logger.info(f"{country}: Patched num_wash ({len(gdf_wash)} WASH points)")
 
     if columns:
         write_dataset(gdf, data_store, file_path)
@@ -1382,7 +1440,8 @@ def patch_country_layer(country, zoom_level, columns):
                     src, _ = add_admin_ids(gdf.drop(columns=['id'], errors='ignore'),
                                            country, admin_level=existing_level, strict=True)
                     group_col = 'id'
-                agg_dict = {col: "sum" for col in sum_cols_admin if col in src.columns}
+                agg_dict = {col: (_optional_sum if col in _OPTIONAL_SUM_COLS else "sum")
+                            for col in sum_cols_admin if col in src.columns}
                 agg_dict.update({col: "mean" for col in avg_cols_admin if col in src.columns})
                 agg = src.groupby(group_col).agg(agg_dict).reset_index()
                 agg = agg.rename(columns={group_col: 'tile_id'})
@@ -1426,14 +1485,16 @@ def _build_admin_view_from_mercator(view, country, admin_level):
     d = gdf_admins.set_index('id')['name'].to_dict()
     d_geo = gdf_admins.set_index('id')['geometry'].to_dict()
 
-    agg_dict = {col: "sum" for col in sum_cols_admin if col in combined_view.columns}
+    agg_dict = {col: (_optional_sum if col in _OPTIONAL_SUM_COLS else "sum")
+                for col in sum_cols_admin if col in combined_view.columns}
     agg_dict.update({col: "mean" for col in avg_cols_admin if col in combined_view.columns})
     agg = combined_view.groupby("id").agg(agg_dict).reset_index()
-    # Ensure all admin regions appear even if no tiles were assigned to them
+    # Ensure all admin regions appear even if no tiles were assigned to them.
+    # Only fill non-optional columns with 0; optional ones stay NaN to signal no-data.
     all_ids = gdf_admins[['id']].copy()
     agg = all_ids.merge(agg, on='id', how='left')
     for col in list(sum_cols_admin) + list(avg_cols_admin):
-        if col in agg.columns:
+        if col in agg.columns and col not in _OPTIONAL_SUM_COLS:
             agg[col] = agg[col].fillna(0)
     admin_view = agg.rename(columns={'id': 'tile_id'})
     admin_view['name'] = admin_view['tile_id'].map(d)
@@ -1922,8 +1983,9 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             # Group by admin id and aggregate (this creates admin-level data, not tile-level)
             # This should result in one row per admin region, not one row per tile
             
-            # Define aggregation dictionary
-            agg_dict = {col: "sum" for col in sum_cols}
+            # Define aggregation dictionary (optional cols preserve NaN when all-NaN)
+            agg_dict = {col: (_optional_sum if col in _OPTIONAL_SUM_COLS else "sum")
+                        for col in sum_cols}
             agg_dict.update({col: "mean" for col in avg_cols})
 
             # Group by admin id and aggregate (this creates admin-level data, not tile-level)
@@ -1967,12 +2029,17 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         tracks_viewer.add_variable_to_view(hcs, "severity_hcs")
 
         # Shelters
-        shelters = tracks_viewer.map_points(points=gdf_shelters)
-        tracks_viewer.add_variable_to_view(shelters, "severity_num_shelters")
+        _nan_members = {m: float('nan') for m in gdf_envelopes_wth[index_column].unique()}
+        if gdf_shelters is None or gdf_shelters.empty:
+            tracks_viewer.add_variable_to_view(_nan_members, "severity_num_shelters")
+        else:
+            tracks_viewer.add_variable_to_view(tracks_viewer.map_points(points=gdf_shelters), "severity_num_shelters")
 
         # WASH facilities
-        wash_pts = tracks_viewer.map_points(points=gdf_wash)
-        tracks_viewer.add_variable_to_view(wash_pts, "severity_num_wash")
+        if gdf_wash is None or gdf_wash.empty:
+            tracks_viewer.add_variable_to_view(_nan_members, "severity_num_wash")
+        else:
+            tracks_viewer.add_variable_to_view(tracks_viewer.map_points(points=gdf_wash), "severity_num_wash")
 
         # Tiles
         tile_value_columns = ["population", "school_age_population", "infant_population", "built_surface_m2"]
