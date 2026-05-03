@@ -38,7 +38,6 @@ test_files/
 *.md
 
 # Utility scripts
-country_utils.py
 verify_tables.py
 impact-report-template.html
 sample_env.txt

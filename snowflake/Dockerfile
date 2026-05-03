@@ -94,6 +94,36 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Patch giga-spatial classmethod typo (self → cls in CountryMercatorTiles.create).
+# Bug present in v0.9.3 and v0.9.4; remove this block once upstream fixes it.
+RUN python3 -c "\
+import pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.11/site-packages/gigaspatial/grid/mercator_tiles.py'); \
+p.write_text(p.read_text().replace('def create(\n        self,\n        country', 'def create(\n        cls,\n        country'))"
+
+# Patch giga-spatial HealthSitesFetcher._convert_country to bypass Overpass API.
+# overpass-api.de returns 406 (rate-limited); the Overpass call only resolves the
+# ISO3 country code to an English name, which pycountry can provide directly.
+# Known pycountry/OSM name mismatches are handled via _OVERRIDES.
+# Remove this block once upstream giga-spatial fixes the Overpass dependency.
+RUN python3 -c "\
+import pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.11/site-packages/gigaspatial/handlers/healthsites.py'); \
+old = '''    def _convert_country(self, country: str) -> str:\n        \"\"\"Resolve any country identifier to its OSM English name.\"\"\"\n        try:\n            iso3 = pycountry.countries.lookup(country).alpha_3\n        except LookupError:\n            raise ValueError(f\"Invalid country code: {country}\")\n\n        return self._fetch_osm_country_name(iso3, country)'''; \
+new = '''    def _convert_country(self, country: str) -> str:\n        _OVERRIDES = {\"TWN\": \"Taiwan\", \"VGB\": \"British Virgin Islands\", \"VNM\": \"Vietnam\"}\n        try:\n            c = pycountry.countries.lookup(country)\n        except LookupError:\n            raise ValueError(f\"Invalid country code: {country}\")\n        return _OVERRIDES.get(c.alpha_3, c.name)'''; \
+p.write_text(p.read_text().replace(old, new))"
+
+# Patch giga-spatial OSMLocationFetcher._make_request to use User-Agent curl/7.88.1.
+# overpass-api.de returns 406 for python-requests default User-Agent (and Chrome UAs)
+# but accepts curl/7.88.1. Also adds overpass.osm.ch as last-attempt fallback.
+# Remove this block once upstream giga-spatial fixes the User-Agent issue.
+RUN python3 -c "\
+import pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.11/site-packages/gigaspatial/handlers/osm.py'); \
+old = '                response = requests.get(\n                    self.base_url, params={\"data\": query}, timeout=self.timeout\n                )'; \
+new = '                _headers = {\"User-Agent\": \"curl/7.88.1\"}\n                _url = \"https://overpass.osm.ch/api/interpreter\" if attempt == self.max_retries - 1 else self.base_url\n                response = requests.get(\n                    _url, params={\"data\": query}, timeout=self.timeout, headers=_headers\n                )'; \
+p.write_text(p.read_text().replace(old, new))"
+
 # ==============================================================================
 # Create directories for data (if using local storage as fallback)
 # ==============================================================================

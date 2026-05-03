@@ -29,6 +29,7 @@ CLAUDE.md
 !custom_data/templates/*.csv
 
 geodb/
+scripts
 project_results/
 test_files/
 test_spcs_job.sql

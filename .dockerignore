@@ -1,0 +1,18 @@
+# Exclude everything by default, then whitelist only what the Dockerfile COPYs.
+# The Dockerfile uses explicit COPY for specific files only — no COPY . . — so
+# this ignore list exists to keep the build context small and keep .env out of
+# the Docker daemon.
+
+# Ignore everything...
+*
+
+# ...except the files explicitly COPY'd in snowflake/Dockerfile:
+!main_pipeline.py
+!impact_analysis.py
+!config.py
+!data_store_utils.py
+!snowflake_utils.py
+!reports.py
+!country_utils.py
+!requirements.txt
+!snowflake/start.sh
