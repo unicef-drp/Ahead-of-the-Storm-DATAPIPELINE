@@ -1875,8 +1875,20 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
         if not gdf_envelopes_wth.empty:
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
-                new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
-                probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
+                # Use tiles-left, envelopes-right sjoin (same direction as
+                # create_tracks_view_from_envelopes) so boundary tiles are
+                # treated identically in the probability raster and per-member
+                # track view. The old approach (envelopes-left, tiles-right)
+                # triggered a CRS reprojection in the opposite direction, causing
+                # borderline tiles to be missed in one view but caught in the other.
+                tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
+                envs_geom = gdf_envelopes_wth[['geometry']].copy()
+                if tiles_geom.crs != envs_geom.crs:
+                    tiles_geom = tiles_geom.to_crs(envs_geom.crs)
+                joined = gpd.sjoin(tiles_geom, envs_geom, how='inner', predicate='intersects')
+                tile_counts = joined.groupby('tile_id').size()
+                all_tile_ids = gdf_tiles['tile_id']
+                probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
             except Exception as e:
                 logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
@@ -1929,8 +1941,20 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
         if not gdf_envelopes_wth.empty:
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
-                new_col = tiles_viewer.map_polygons(gdf_envelopes_wth)
-                probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
+                # Use tiles-left, envelopes-right sjoin (same direction as
+                # create_tracks_view_from_envelopes) so boundary tiles are
+                # treated identically in the probability raster and per-member
+                # track view. The old approach (envelopes-left, tiles-right)
+                # triggered a CRS reprojection in the opposite direction, causing
+                # borderline tiles to be missed in one view but caught in the other.
+                tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
+                envs_geom = gdf_envelopes_wth[['geometry']].copy()
+                if tiles_geom.crs != envs_geom.crs:
+                    tiles_geom = tiles_geom.to_crs(envs_geom.crs)
+                joined = gpd.sjoin(tiles_geom, envs_geom, how='inner', predicate='intersects')
+                tile_counts = joined.groupby('tile_id').size()
+                all_tile_ids = gdf_tiles['tile_id']
+                probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
             except Exception as e:
                 logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
