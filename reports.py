@@ -466,16 +466,18 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
 def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                           cci_admin_view: pd.DataFrame,
                           gdf_admin: gpd.GeoDataFrame,
-                          d_previous: Dict[str, Any]) -> Dict[str, list]:
+                          d_previous: Dict[str, Any],
+                          vuln_tiles_view: Optional[pd.DataFrame] = None) -> Dict[str, list]:
     """
     Calculate administrative-level impact rows for the report.
-    
+
     Args:
         wind_admin_views: Dictionary mapping wind thresholds to admin-level views
         cci_admin_view: DataFrame with CCI values per admin
         gdf_admin: GeoDataFrame with admin boundaries
         d_previous: Previous report dictionary for change calculations
-    
+        vuln_tiles_view: Optional tile-level vulnerability view (zone_id, id, E_*_in_need)
+
     Returns:
         dict: Dictionary with keys 'rows_admins_pop_total', 'rows_admins_school',
               'rows_admins_infant', 'rows_schools_winds', 'rows_hcs_winds',
@@ -555,6 +557,24 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         d_rows_admins_school["cci"] = int(admin_cci['E_CCI_school_age'].sum())
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())
         d_rows_admins_adolescent["cci"] = int(admin_cci['E_CCI_adolescents'].sum())
+
+        # Vulnerability in-need values for this admin (None when country not patched)
+        if vuln_tiles_view is not None and 'id' in vuln_tiles_view.columns:
+            admin_vuln = vuln_tiles_view[vuln_tiles_view['id'] == admin_id]
+            def _vuln_sum(col):
+                if col not in admin_vuln.columns:
+                    return None
+                total = admin_vuln[col].sum(min_count=1)
+                return int(total) if not pd.isna(total) else None
+            d_rows_admins_pop_total["people_in_need"] = _vuln_sum('E_people_in_need')
+            d_rows_admins_school["people_in_need"]    = _vuln_sum('E_school_age_in_need')
+            d_rows_admins_infant["people_in_need"]    = _vuln_sum('E_infant_in_need')
+            d_rows_admins_adolescent["people_in_need"] = _vuln_sum('E_adolescent_in_need')
+        else:
+            d_rows_admins_pop_total["people_in_need"] = None
+            d_rows_admins_school["people_in_need"]    = None
+            d_rows_admins_infant["people_in_need"]    = None
+            d_rows_admins_adolescent["people_in_need"] = None
 
         rows_admins_pop_total.append(d_rows_admins_pop_total)
         rows_admins_school.append(d_rows_admins_school)
@@ -756,7 +776,8 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
                 d[key] = int(total) if not pd.isna(total) else None
 
     # Calculate administrative-level impact rows
-    admin_rows = _calculate_admin_rows(wind_admin_views, cci_admin_view, gdf_admin, d_previous)
+    admin_rows = _calculate_admin_rows(wind_admin_views, cci_admin_view, gdf_admin, d_previous,
+                                       vuln_tiles_view=vulnerability_tiles_view)
     d.update(admin_rows)
 
     # Post-process facility counts: if no named at-risk facilities exist for a type,
