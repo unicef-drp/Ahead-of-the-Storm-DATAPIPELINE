@@ -2072,6 +2072,13 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
                     # Index has no name, explicitly name it 'zone_id'
                     df_view = df_view.reset_index(names=['zone_id'])
 
+            # Keep poverty columns last so CSV positions $2–$16 are identical
+            # to the 16-column format. The procedure's IFF($13 IS NULL) detection
+            # continues to work; $17/$18 are ignored by the current INSERT.
+            _pov_cols = [c for c in ['moderate_poverty_prob', 'severe_poverty_prob'] if c in df_view.columns]
+            if _pov_cols:
+                df_view = df_view[[c for c in df_view.columns if c not in _pov_cols] + _pov_cols]
+
             wind_views[wind_th] = df_view
 
     return wind_views
