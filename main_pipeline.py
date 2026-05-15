@@ -416,6 +416,20 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
 
     save_mercator_and_admin_views(countries, zoom, rewrite, admin_levels=admin_levels)
     stats.analysis_success = True
+
+    if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        try:
+            conn = get_snowflake_connection()
+            signal_pipeline_complete(
+                conn=conn,
+                storm_ids=["INITIALIZE"],
+                countries=countries,
+                files_written=0,
+            )
+            logger.info(f"Signalled pipeline completion to trigger MAT refresh for: {countries}")
+        except Exception as e:
+            logger.warning(f"Could not signal pipeline completion after initialize: {e}")
+
     return stats
 
 
