@@ -2762,6 +2762,27 @@ def save_tracks_view(gdf, country, storm, date, wind_th):
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name))
 
 
+def save_vulnerability_tracks(df, country, storm, date, zoom_level):
+    """
+    Save per-ensemble-member vulnerability (people/children in need) view.
+
+    One file per storm/date. Contains per-member summed vulnerability values across
+    all tiles covered by that member's wind envelopes.
+
+    Filename pattern: {CC}_{STORM}_{DATETIME}_{ZOOM}_vulnerability_tracks.parquet
+    Saved alongside the per-threshold track parquets in track_views/.
+
+    Args:
+        df: DataFrame with one row per ensemble member (zone_id = member number)
+            and severity_* vulnerability columns.
+        country: ISO3 country code
+        storm: Storm name
+        date: Forecast date in YYYYMMDDHHMMSS format
+        zoom_level: Zoom level for tiles
+    """
+    file_name = f"{country}_{storm}_{date}_{zoom_level}_vulnerability_tracks.parquet"
+    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name))
+
 
 # =============================================================================
 # CCI CALCULATION
@@ -3067,6 +3088,176 @@ def calculate_vulnerability_view(wind_tiles_views, gdf_tiles):
     return result[['zone_id', 'id'] + sum_cols_vulnerability]
 
 
+def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
+    """
+    Calculate per-ensemble-member vulnerability (people/children in need).
+
+    Mirrors calculate_vulnerability_view but produces one row per ensemble member
+    instead of one row per tile. For each member, applies the same wind-band
+    vulnerability rate logic — but using the member's own wind coverage (binary
+    yes/no) rather than ensemble-probability weights.
+
+    For each tile the member covers, the effective vulnerability rate is determined
+    by the *highest* wind band that member's envelope reaches over that tile:
+      - Highest band < 50 kt  → rate = severe_poverty_prob
+      - Highest band 50–96 kt → rate linearly interpolates moderate_poverty_prob → 1.0
+      - Highest band ≥ 96 kt  → rate = 1.0
+
+    The per-member sum across all covered tiles gives the severity_* columns,
+    analogous to severity_population in the existing per-threshold track parquets.
+
+    Args:
+        gdf_envelopes: GeoDataFrame with columns ensemble_member, wind_threshold,
+                       geometry — as loaded from Snowflake TC_ENVELOPES_COMBINED.
+        gdf_tiles: GeoDataFrame — base mercator tiles including moderate_poverty_prob,
+                   severe_poverty_prob, and population demographics.
+
+    Returns:
+        DataFrame with one row per ensemble member and columns:
+            zone_id                    — ensemble member number
+            severity_people_in_need    — total PIN for tiles this member affects
+            severity_children_in_need  — CHIN (infants + school-age + adolescents)
+            severity_infant_in_need    — infants (0–4)
+            severity_school_age_in_need— school age (5–14)
+            severity_adolescent_in_need— adolescents (15–19)
+        All severity_* columns are NaN when no vulnerability data has been
+        patched for the country (same guard as calculate_vulnerability_view).
+    """
+    has_vuln_data = (
+        'moderate_poverty_prob' in gdf_tiles.columns
+        and 'severe_poverty_prob' in gdf_tiles.columns
+        and gdf_tiles['moderate_poverty_prob'].notna().any()
+    )
+
+    members = sorted(gdf_envelopes['ensemble_member'].unique())
+    winds = sorted(gdf_envelopes['wind_threshold'].unique())
+
+    out_cols = [
+        'severity_people_in_need',
+        'severity_children_in_need',
+        'severity_infant_in_need',
+        'severity_school_age_in_need',
+        'severity_adolescent_in_need',
+    ]
+
+    if not has_vuln_data:
+        logger.warning(
+            "No vulnerability probability data found — vulnerability_tracks will be all NaN. "
+            "Run vulnerability/fetch_vulnerability_probs.py then "
+            "'--type patch --columns vulnerability' to populate."
+        )
+        result = pd.DataFrame({'zone_id': members})
+        for col in out_cols:
+            result[col] = np.nan
+        return result
+
+    # Build a lookup: tile_id → {moderate_poverty_prob, severe_poverty_prob, pop cols}
+    tile_index = gdf_tiles.set_index('tile_id')
+    tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
+
+    # For each wind threshold, build a per-member tile mask via sjoin.
+    # member_tiles_at[wind] = dict(member → set of tile_ids covered)
+    member_tiles_at = {}
+    for wind in winds:
+        envs_w = gdf_envelopes[gdf_envelopes['wind_threshold'] == int(wind)][
+            ['ensemble_member', 'geometry']
+        ].copy()
+        if envs_w.empty:
+            member_tiles_at[wind] = {}
+            continue
+        if tiles_geom.crs != envs_w.crs:
+            tiles_geom_proj = tiles_geom.to_crs(envs_w.crs)
+        else:
+            tiles_geom_proj = tiles_geom
+        try:
+            joined = gpd.sjoin(tiles_geom_proj, envs_w, how='inner', predicate='intersects')
+            # joined has tile_id (index or column) and ensemble_member
+            if 'tile_id' not in joined.columns:
+                joined = joined.reset_index()
+            grp = joined.groupby('ensemble_member')['tile_id'].apply(set).to_dict()
+        except Exception as e:
+            logger.warning(f"vulnerability_tracks sjoin failed at {wind}kt: {e}")
+            grp = {}
+        member_tiles_at[wind] = grp
+
+    rows = []
+    for member in members:
+        # For each tile, find the highest wind band this member reaches over it.
+        # vuln_weight[tile_id] = vulnerability rate for that tile under this member.
+        tile_vuln = {}  # tile_id → rate
+
+        for i, wind in enumerate(winds):
+            covered = member_tiles_at[wind].get(member, set())
+            if not covered:
+                continue
+
+            # Determine the rate for this wind band
+            if wind < VULNERABILITY_WIND_SEVERE_THRESHOLD:
+                # rate is per-tile (severe_poverty_prob)
+                use_rate = 'severe'
+            elif wind < VULNERABILITY_WIND_FULL_THRESHOLD:
+                t = (wind - VULNERABILITY_WIND_SEVERE_THRESHOLD) / (
+                    VULNERABILITY_WIND_FULL_THRESHOLD - VULNERABILITY_WIND_SEVERE_THRESHOLD
+                )
+                use_rate = ('interp', t)
+            else:
+                use_rate = 'full'
+
+            # Always overwrite: winds iterated ascending → last assignment = highest band = correct rate.
+            covered_list = list(covered)
+            if use_rate == 'full':
+                rates = pd.Series(1.0, index=covered_list)
+            elif use_rate == 'severe':
+                rates = tile_index.loc[
+                    tile_index.index.intersection(covered_list), 'severe_poverty_prob'
+                ].fillna(0.0).reindex(covered_list).fillna(0.0)
+            else:
+                _, t_val = use_rate
+                mod = tile_index.loc[
+                    tile_index.index.intersection(covered_list), 'moderate_poverty_prob'
+                ].fillna(0.0).reindex(covered_list).fillna(0.0)
+                rates = mod * (1.0 - t_val) + t_val
+            tile_vuln.update(rates.to_dict())
+
+        if not tile_vuln:
+            rows.append({
+                'zone_id': member,
+                'severity_people_in_need': 0.0,
+                'severity_children_in_need': 0.0,
+                'severity_infant_in_need': 0.0,
+                'severity_school_age_in_need': 0.0,
+                'severity_adolescent_in_need': 0.0,
+            })
+            continue
+
+        # Sum vulnerability across all covered tiles for this member (vectorized)
+        rate_series = pd.Series(tile_vuln, name='rate')
+        pop_cols = ['population', 'infant_population', 'school_age_population', 'adolescent_population']
+        df_member = (
+            tile_index.loc[tile_index.index.intersection(rate_series.index), pop_cols]
+            .reindex(rate_series.index)
+            .fillna(0.0)
+            .multiply(rate_series, axis=0)
+        )
+        pin        = df_member['population'].sum()
+        infant     = df_member['infant_population'].sum()
+        school_age = df_member['school_age_population'].sum()
+        adolescent = df_member['adolescent_population'].sum()
+        chin       = infant + school_age + adolescent
+
+        rows.append({
+            'zone_id': member,
+            'severity_people_in_need': pin,
+            'severity_children_in_need': chin,
+            'severity_infant_in_need': infant,
+            'severity_school_age_in_need': school_age,
+            'severity_adolescent_in_need': adolescent,
+        })
+
+    result = pd.DataFrame(rows)
+    return result[['zone_id'] + out_cols]
+
+
 # =============================================================================
 # MAIN IMPACT ANALYSIS ORCHESTRATION
 # Top-level function called per country per storm on every --type update run.
@@ -3186,6 +3377,11 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # Vulnerability (people/children in need) — wind-dependent poverty weighting
     vuln_tiles_view = calculate_vulnerability_view(wind_tiles_views, gdf_tiles)
     save_vulnerability_tiles(vuln_tiles_view, country, storm, date, zoom)
+
+    # Per-member vulnerability — analogous to per-threshold track parquets
+    vuln_tracks_view = calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles)
+    save_vulnerability_tracks(vuln_tracks_view, country, storm, date, zoom)
+    logger.info(f"    Created vulnerability tracks view ({len(vuln_tracks_view)} members)")
 
     # Admins — one pass per requested admin level
     logger.info(f"    Processing admins (levels: {admin_levels})...")
