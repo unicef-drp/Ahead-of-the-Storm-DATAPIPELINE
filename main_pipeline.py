@@ -465,15 +465,31 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
     logger = setup_logging(log_level)
     logger.info(f"Patch mode: updating columns {columns} for countries {countries}")
     all_ok = True
+    patched = []
     for country in countries:
         try:
             patch_country_layer(country, zoom, columns)
+            patched.append(country)
         except (FileNotFoundError, ValueError) as e:
             logger.error(f"{country}: Patch failed — {e}")
             all_ok = False
         except Exception as e:
             logger.error(f"{country}: Unexpected error during patch — {e}", exc_info=True)
             all_ok = False
+
+    if patched and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        try:
+            conn = get_snowflake_connection()
+            cur = conn.cursor()
+            cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+            cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+            result = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            logger.info(f"Base layer MAT tables refreshed after patch: {result}")
+        except Exception as e:
+            logger.warning(f"Could not refresh base layer tables after patch: {e}")
+
     return all_ok
 
 
