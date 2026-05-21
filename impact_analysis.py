@@ -1813,6 +1813,21 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
         logger.error("School GeoDataFrame has no valid geometry column. Returning empty views.")
         return {}
     
+    # Schools without a GIGA ID (e.g. MOE-only Post-Secondary, special ed) have
+    # school_id_giga=None. GeometryBasedZonalViewGenerator groups all null zone_ids
+    # into a single zone → one merged row → 18-way fan-out on join → probability=0.
+    # Assign unique fallback IDs so every school is treated as its own zone.
+    gdf_schools = gdf_schools.copy()
+    null_mask = gdf_schools['school_id_giga'].isna()
+    if null_mask.any():
+        logger.warning(
+            f"{null_mask.sum()} schools have no school_id_giga — assigning fallback IDs. "
+            "These are likely non-GIGA sources (Post-Secondary, special ed, etc.)."
+        )
+        gdf_schools.loc[null_mask, 'school_id_giga'] = [
+            f"_custom_{i}" for i in range(null_mask.sum())
+        ]
+
     gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
