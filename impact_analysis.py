@@ -476,6 +476,15 @@ def _load_custom_points_csv(country, kind):
             else:
                 df[id_col] = [f"{kind}_{i}" for i in range(len(df))]
                 logger.info(f"{country}: No ID column in custom {kind} CSV — auto-generated sequential IDs")
+        # Warn early about nulls/duplicates — _ensure_unique_zone_ids will fix
+        # them at view-generation time, but surfacing the issue here helps debug
+        # the source CSV.
+        null_count = df[id_col].isna().sum()
+        dup_count = df[id_col].duplicated(keep='first').sum()
+        if null_count:
+            logger.warning(f"{country}: Custom {kind} CSV has {null_count} null {id_col} values — fallback IDs will be assigned at impact time")
+        if dup_count:
+            logger.warning(f"{country}: Custom {kind} CSV has {dup_count} duplicate {id_col} values — fallback IDs will be assigned at impact time")
         gdf = gpd.GeoDataFrame(
             df,
             geometry=gpd.points_from_xy(df['longitude'], df['latitude']),
@@ -1767,6 +1776,48 @@ def load_mercator_view(country, zoom_level=14):
 # Functions that intersect storm envelopes with facility/tile data to produce
 # per-storm impact probability views. Called on every --type update run.
 # =============================================================================
+
+def _ensure_unique_zone_ids(gdf, id_col, facility_label):
+    """
+    Ensure every row in gdf has a unique value in id_col before passing to
+    GeometryBasedZonalViewGenerator. Two failure modes cause silent data errors:
+
+    1. Null IDs — all null-ID facilities collapse into one zone. The zone gets
+       one probability from the spatial join, which fans out identically to every
+       null-ID row on the merge → all receive probability=0 if the null zone has
+       no envelope intersection, or a shared (possibly wrong) value otherwise.
+
+    2. Duplicate non-null IDs — N facilities sharing the same ID each contribute
+       a separate buffer to the zone, so the polygon-count for that zone is
+       multiplied by N → probability inflated N×, potentially exceeding 1.0.
+
+    Both are fixed by replacing offending values with unique _custom_<i> IDs.
+    The first non-duplicate occurrence of a duplicate ID is kept as-is; only
+    subsequent duplicates are renamed.
+    """
+    gdf = gdf.copy()
+    counter = 0
+
+    null_mask = gdf[id_col].isna()
+    if null_mask.any():
+        logger.warning(
+            f"{null_mask.sum()} {facility_label}(s) have no {id_col} — assigning fallback IDs."
+        )
+        gdf.loc[null_mask, id_col] = [f"_custom_{counter + i}" for i in range(null_mask.sum())]
+        counter += null_mask.sum()
+
+    dup_mask = gdf[id_col].duplicated(keep='first')
+    if dup_mask.any():
+        dup_ids = gdf.loc[dup_mask, id_col].unique().tolist()
+        logger.warning(
+            f"{dup_mask.sum()} {facility_label}(s) have duplicate {id_col} values {dup_ids} — "
+            "assigning fallback IDs to prevent probability double-counting."
+        )
+        gdf.loc[dup_mask, id_col] = [f"_custom_{counter + i}" for i in range(dup_mask.sum())]
+
+    return gdf
+
+
 def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     """
     Create per-facility school impact views from hurricane envelopes.
@@ -1813,20 +1864,7 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
         logger.error("School GeoDataFrame has no valid geometry column. Returning empty views.")
         return {}
     
-    # Schools without a GIGA ID (e.g. MOE-only Post-Secondary, special ed) have
-    # school_id_giga=None. GeometryBasedZonalViewGenerator groups all null zone_ids
-    # into a single zone → one merged row → 18-way fan-out on join → probability=0.
-    # Assign unique fallback IDs so every school is treated as its own zone.
-    gdf_schools = gdf_schools.copy()
-    null_mask = gdf_schools['school_id_giga'].isna()
-    if null_mask.any():
-        logger.warning(
-            f"{null_mask.sum()} schools have no school_id_giga — assigning fallback IDs. "
-            "These are likely non-GIGA sources (Post-Secondary, special ed, etc.)."
-        )
-        gdf_schools.loc[null_mask, 'school_id_giga'] = [
-            f"_custom_{i}" for i in range(null_mask.sum())
-        ]
+    gdf_schools = _ensure_unique_zone_ids(gdf_schools, 'school_id_giga', 'school')
 
     gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
@@ -1902,6 +1940,7 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
         logger.warning(f"No health facilities matching {HC_FACILITY_TYPES} — returning empty impact views")
         return {}
 
+    gdf_hcs = _ensure_unique_zone_ids(gdf_hcs, 'osm_id', 'health center')
     gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
@@ -1952,6 +1991,7 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
         logger.error("Shelter GeoDataFrame has no valid geometry. Returning empty views.")
         return {}
 
+    gdf_shelters = _ensure_unique_zone_ids(gdf_shelters, 'osm_id', 'shelter')
     gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
@@ -1999,6 +2039,7 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
         logger.error("WASH GeoDataFrame has no valid geometry. Returning empty views.")
         return {}
 
+    gdf_wash = _ensure_unique_zone_ids(gdf_wash, 'osm_id', 'WASH facility')
     gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
