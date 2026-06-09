@@ -147,8 +147,8 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         gdf_envelopes = load_envelopes_from_snowflake(storm, date)
         
         if gdf_envelopes.empty:
-            logger.error(f"No envelope data found for {storm} at {date}")
-            return {"success": False, "error": "No envelope data found"}
+            logger.info(f"No envelope data found for {storm} at {date} — forecast may have expired, skipping")
+            return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
