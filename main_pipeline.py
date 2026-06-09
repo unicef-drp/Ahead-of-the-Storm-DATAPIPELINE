@@ -118,7 +118,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
     Complete impact analysis orchestration.
 
     Loads hurricane envelope data from Snowflake, checks which countries are affected
-    (using 1500km buffer per country), and creates impact views for affected countries.
+    (using 500km buffer per country), and creates impact views for affected countries.
     Admin levels are determined automatically by which base admin parquets exist for each
     country (created during --type initialize).
 
@@ -153,7 +153,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
         
-        # --- SQL pre-filter: ask Snowflake which countries are within 1500km ---
+        # --- SQL pre-filter: ask Snowflake which countries are within 500km ---
         affected_countries = []
         sql_prefilter_used = False
         try:
@@ -169,20 +169,20 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
             if affected_countries:
                 logger.info(f"SQL pre-filter: {len(affected_countries)} country/countries in range: {', '.join(affected_countries)}")
             else:
-                logger.info("SQL pre-filter: no countries within 1500km — skipping storm")
+                logger.info("SQL pre-filter: no countries within 500km — skipping storm")
         except Exception as e:
             logger.warning(f"SQL pre-filter failed ({e}) — falling back to Python buffer check")
 
-        # --- Python fallback: 1500km buffer per country (original logic) ---
+        # --- Python fallback: 500km buffer per country (original logic) ---
         if not sql_prefilter_used:
-            logger.info("Checking which countries are affected (1500km buffer per country)...")
+            logger.info("Checking which countries are affected (500km buffer per country)...")
             country_boundaries = get_country_boundaries(countries)
 
             for i, country in enumerate(countries):
                 country_boundary = country_boundaries[i]
                 country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
 
-                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
+                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=500000)
                 country_buffered_geom = country_buffered.geometry.iloc[0]
 
                 bounds = country_buffered_geom.bounds
@@ -217,7 +217,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
                     logger.info(f"  {country}: Not affected (skipping)")
         
         if not affected_countries:
-            logger.info("Envelopes do not intersect with any of the specified countries (within 1500km buffer) — skipping")
+            logger.info("Envelopes do not intersect with any of the specified countries (within 500km buffer) — skipping")
             return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Processing {len(affected_countries)} affected country/countries: {', '.join(affected_countries)}")
