@@ -1797,6 +1797,7 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
     """
     gdf = gdf.copy()
     counter = 0
+    fallbacks_assigned = False
 
     null_mask = gdf[id_col].isna()
     if null_mask.any():
@@ -1805,6 +1806,7 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
         )
         gdf.loc[null_mask, id_col] = [f"_custom_{counter + i}" for i in range(null_mask.sum())]
         counter += null_mask.sum()
+        fallbacks_assigned = True
 
     dup_mask = gdf[id_col].duplicated(keep='first')
     if dup_mask.any():
@@ -1814,6 +1816,13 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
             "assigning fallback IDs to prevent probability double-counting."
         )
         gdf.loc[dup_mask, id_col] = [f"_custom_{counter + i}" for i in range(dup_mask.sum())]
+        fallbacks_assigned = True
+
+    if fallbacks_assigned:
+        # String fallback IDs mixed into a numeric column produce an object-dtype column
+        # that PyArrow cannot write to Parquet (it infers int64 then rejects the strings).
+        # Cast the whole column to str so the type is consistent.
+        gdf[id_col] = gdf[id_col].astype(str)
 
     return gdf
 
@@ -2329,6 +2338,9 @@ def save_school_view(gdf, country, storm, date, wind_th):
         date: Forecast date in YYYYMMDDHHMMSS format
         wind_th: Wind threshold in knots
     """
+    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
+        gdf = gdf.copy()
+        gdf['zone_id'] = gdf['zone_id'].astype(str)
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
 
@@ -2391,6 +2403,9 @@ def save_hc_view(gdf, country, storm, date, wind_th):
         date: Forecast date in YYYYMMDDHHMMSS format
         wind_th: Wind threshold in knots
     """
+    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
+        gdf = gdf.copy()
+        gdf['zone_id'] = gdf['zone_id'].astype(str)
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
@@ -2450,6 +2465,9 @@ def save_shelter_view(gdf, country, storm, date, wind_th):
         date: Forecast date in YYYYMMDDHHMMSS format
         wind_th: Wind threshold in knots
     """
+    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
+        gdf = gdf.copy()
+        gdf['zone_id'] = gdf['zone_id'].astype(str)
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
 
@@ -2509,6 +2527,9 @@ def save_wash_view(gdf, country, storm, date, wind_th):
         date: Forecast date in YYYYMMDDHHMMSS format
         wind_th: Wind threshold in knots
     """
+    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
+        gdf = gdf.copy()
+        gdf['zone_id'] = gdf['zone_id'].astype(str)
     file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
 

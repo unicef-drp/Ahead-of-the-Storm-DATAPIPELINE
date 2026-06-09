@@ -225,19 +225,38 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         # Create impact views only for affected countries
         logger.info("Creating impact views for affected countries...")
         total_views = 0
+        country_errors = []
+        succeeded_countries = []
         for country in affected_countries:
-            create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
-            total_views += 4  # schools, health centers, tiles, tracks
-        
-        logger.info("Impact analysis completed successfully")
+            try:
+                create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
+                total_views += 4  # schools, health centers, tiles, tracks
+                succeeded_countries.append(country)
+            except Exception as country_exc:
+                import traceback as _tb
+                logger.error(f"Pipeline with errors for storm {storm} at {date}")
+                logger.error(f"  {country}: {str(country_exc)}")
+                logger.debug(_tb.format_exc())
+                country_errors.append(f"{country}: {str(country_exc)}")
+
+        if country_errors and not succeeded_countries:
+            # Every country failed — treat as full failure so the run stays eligible for retry
+            return {"success": False, "error": "; ".join(country_errors)}
+
+        if country_errors:
+            logger.warning(f"Impact analysis completed with {len(country_errors)} country error(s): {'; '.join(country_errors)}")
+        else:
+            logger.info("Impact analysis completed successfully")
+
         return {
             "success": True,
             "envelopes_processed": len(gdf_envelopes),
-            "countries_processed": len(affected_countries),
+            "countries_processed": len(succeeded_countries),
             "total_views_created": total_views,
-            "affected_countries": affected_countries
+            "affected_countries": succeeded_countries,
+            "country_errors": country_errors,
         }
-        
+
     except Exception as e:
         import traceback
         logger.error(f"Error during impact analysis: {str(e)}")
