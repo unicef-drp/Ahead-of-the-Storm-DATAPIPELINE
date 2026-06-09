@@ -1804,8 +1804,6 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
         logger.warning(
             f"{null_mask.sum()} {facility_label}(s) have no {id_col} — assigning fallback IDs."
         )
-        gdf.loc[null_mask, id_col] = [f"_custom_{counter + i}" for i in range(null_mask.sum())]
-        counter += null_mask.sum()
         fallbacks_assigned = True
 
     dup_mask = gdf[id_col].duplicated(keep='first')
@@ -1815,14 +1813,18 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
             f"{dup_mask.sum()} {facility_label}(s) have duplicate {id_col} values {dup_ids} — "
             "assigning fallback IDs to prevent probability double-counting."
         )
-        gdf.loc[dup_mask, id_col] = [f"_custom_{counter + i}" for i in range(dup_mask.sum())]
         fallbacks_assigned = True
 
     if fallbacks_assigned:
-        # String fallback IDs mixed into a numeric column produce an object-dtype column
-        # that PyArrow cannot write to Parquet (it infers int64 then rejects the strings).
-        # Cast the whole column to str so the type is consistent.
+        # Cast to str BEFORE assigning fallback strings to avoid pandas FutureWarning
+        # ("Setting an item of incompatible dtype is deprecated") and the PyArrow
+        # int64 conversion failure when writing mixed-type columns to Parquet.
         gdf[id_col] = gdf[id_col].astype(str)
+        if null_mask.any():
+            gdf.loc[null_mask, id_col] = [f"_custom_{counter + i}" for i in range(null_mask.sum())]
+            counter += null_mask.sum()
+        if dup_mask.any():
+            gdf.loc[dup_mask, id_col] = [f"_custom_{counter + i}" for i in range(dup_mask.sum())]
 
     return gdf
 
