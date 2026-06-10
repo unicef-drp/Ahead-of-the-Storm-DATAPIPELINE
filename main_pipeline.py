@@ -227,9 +227,12 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         total_views = 0
         country_errors = []
         succeeded_countries = []
+        any_base_parquet_written = False
         for country in affected_countries:
             try:
-                create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
+                wrote_base = create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
+                if wrote_base:
+                    any_base_parquet_written = True
                 total_views += 4  # schools, health centers, tiles, tracks
                 succeeded_countries.append(country)
             except Exception as country_exc:
@@ -247,6 +250,22 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
             logger.warning(f"Impact analysis completed with {len(country_errors)} country error(s): {'; '.join(country_errors)}")
         else:
             logger.info("Impact analysis completed successfully")
+
+        # If any emergency fallback wrote a base parquet during this update run,
+        # refresh the base layer MATs immediately (they are normally only refreshed
+        # after --type initialize or --type patch).
+        if any_base_parquet_written and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+            try:
+                _conn = get_snowflake_connection()
+                _cur = _conn.cursor()
+                _cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+                _cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+                _result = _cur.fetchone()[0]
+                _cur.close()
+                _conn.close()
+                logger.info(f"Base layer MATs refreshed after emergency fallback during update: {_result}")
+            except Exception as e:
+                logger.error(f"Could not refresh base layer tables after emergency fallback: {e}")
 
         return {
             "success": True,
@@ -439,15 +458,15 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
     if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
         try:
             conn = get_snowflake_connection()
-            signal_pipeline_complete(
-                conn=conn,
-                storm_ids=["INITIALIZE"],
-                countries=countries,
-                files_written=0,
-            )
-            logger.info(f"Signalled pipeline completion to trigger MAT refresh for: {countries}")
+            cur = conn.cursor()
+            cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+            cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+            result = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            logger.info(f"Base layer MAT tables refreshed after initialize: {result}")
         except Exception as e:
-            logger.warning(f"Could not signal pipeline completion after initialize: {e}")
+            logger.error(f"Could not refresh base layer tables after initialize: {e}")
 
     return stats
 
@@ -507,7 +526,8 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
             conn.close()
             logger.info(f"Base layer MAT tables refreshed after patch: {result}")
         except Exception as e:
-            logger.warning(f"Could not refresh base layer tables after patch: {e}")
+            logger.error(f"Could not refresh base layer tables after patch: {e}")
+            all_ok = False
 
     return all_ok
 

@@ -3384,6 +3384,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         # Fallback: ensure admin1 is always processed (creates on-the-fly if missing)
         admin_levels = [1]
 
+    # Track whether any base parquets were written during this run (emergency fallbacks).
+    # Returned to the caller so it can call REFRESH_BASE_LAYER_TABLES() if needed.
+    wrote_base_parquet = False
+
     # Remove all existing output files for this country/storm/forecast run before writing
     # new ones. This prevents stale threshold files (e.g. from a run where 137kt had a
     # few envelope members that have since been cleaned up) from persisting on the stage.
@@ -3443,14 +3447,16 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         logger.info(f"    Loaded existing mercator tiles: {len(gdf_tiles)} tiles")
         # Ensure admin IDs are present (in case file was created without them)
         if 'id' not in gdf_tiles.columns:
-            logger.warning(f"    Mercator view missing admin IDs, adding them...")
+            logger.error(f"    {country}: Mercator view missing admin IDs — adding on-the-fly. Run --type initialize to fix permanently.")
             gdf_tiles, _ = add_admin_ids(gdf_tiles, country)
             save_mercator_view(gdf_tiles, country, zoom)
+            wrote_base_parquet = True
     except Exception as e:
-        logger.info(f"    Creating base mercator tiles for {country}... ({e})")
+        logger.error(f"    {country}: Mercator view missing — creating on-the-fly ({e}). Run --type initialize first.")
         view = create_mercator_country_layer(country, zoom, rewrite=0)
         gdf_tiles, _ = add_admin_ids(view, country)
         save_mercator_view(gdf_tiles, country, zoom)
+        wrote_base_parquet = True
         logger.info(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
 
     wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes)
@@ -3478,9 +3484,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             gdf_admin = load_admin_view(country, admin_level=admin_level)
             logger.info(f"    Loaded existing admin{admin_level}: {len(gdf_admin)} regions")
         except Exception as e:
-            logger.info(f"    Creating base admin{admin_level} for {country}... ({e})")
+            logger.error(f"    {country}: Admin{admin_level} view missing — creating on-the-fly ({e}). Run --type initialize first.")
             gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=admin_level)
             save_admin_view(gdf_admin, country, admin_level=admin_level)
+            wrote_base_parquet = True
             logger.info(f"    Created and saved base admin{admin_level}: {len(gdf_admin)} regions")
 
         # For admin level 1, gdf_tiles already has 'id' = admin1 IDs (from mercator parquet).
@@ -3547,6 +3554,8 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
 
     json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date, wind_shelter_views=wind_shelter_views, wind_wash_views=wind_wash_views, vulnerability_tiles_view=vuln_tiles_view)
     save_json_report(json_report, country, storm, date)
+
+    return wrote_base_parquet
 
 
 # =============================================================================
