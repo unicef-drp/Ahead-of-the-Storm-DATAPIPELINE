@@ -263,7 +263,10 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
                 _result = _cur.fetchone()[0]
                 _cur.close()
                 _conn.close()
-                logger.info(f"Base layer MATs refreshed after emergency fallback during update: {_result}")
+                if _result.startswith('PARTIAL') or 'errors:' in _result:
+                    logger.warning(f"Base layer MAT refresh had failures after emergency fallback: {_result}")
+                else:
+                    logger.info(f"Base layer MATs refreshed after emergency fallback during update: {_result}")
             except Exception as e:
                 logger.error(f"Could not refresh base layer tables after emergency fallback: {e}")
 
@@ -464,7 +467,10 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
             result = cur.fetchone()[0]
             cur.close()
             conn.close()
-            logger.info(f"Base layer MAT tables refreshed after initialize: {result}")
+            if result.startswith('PARTIAL') or 'errors:' in result:
+                logger.warning(f"Base layer MAT refresh had failures after initialize: {result}")
+            else:
+                logger.info(f"Base layer MAT tables refreshed after initialize: {result}")
         except Exception as e:
             logger.error(f"Could not refresh base layer tables after initialize: {e}")
 
@@ -524,7 +530,11 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
             result = cur.fetchone()[0]
             cur.close()
             conn.close()
-            logger.info(f"Base layer MAT tables refreshed after patch: {result}")
+            if result.startswith('PARTIAL') or 'errors:' in result:
+                logger.warning(f"Base layer MAT refresh had failures after patch: {result}")
+                all_ok = False
+            else:
+                logger.info(f"Base layer MAT tables refreshed after patch: {result}")
         except Exception as e:
             logger.error(f"Could not refresh base layer tables after patch: {e}")
             all_ok = False

@@ -1119,14 +1119,15 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
 def save_mercator_view(gdf, country, zoom_level):
     """
     Save base mercator infrastructure view for a country.
-    
+
     Args:
         gdf: GeoDataFrame containing mercator tile data
         country: ISO3 country code
         zoom_level: Zoom level for the tiles
     """
     file_name = f"{country}_{zoom_level}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+    path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
+    write_dataset(gdf, data_store, path)
 
 
 def admins_overlay(gdf_admins1, gdf_mercator):
@@ -2740,7 +2741,8 @@ def create_admin_country_layer(country, rewrite=0, admin_level=1):
 def save_admin_view(gdf, country, admin_level=1):
     """Save base admin infrastructure view for country"""
     file_name = f"{country}_admin{admin_level}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
+    path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name)
+    write_dataset(gdf, data_store, path)
 
 def save_admin_views(countries, rewrite=0, admin_level=1):
     """
