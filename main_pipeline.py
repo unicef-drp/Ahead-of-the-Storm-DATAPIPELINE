@@ -9,7 +9,7 @@ Key Features:
 - initialize: builds country base layers (mercator tiles + admin views) with population,
   built surface, settlement class, wealth index, schools, health centers, shelters, WASH
 - update: fetches active storm envelopes from Snowflake and runs geospatial intersection
-  against all initialized countries within 1,500 km; generates per-facility and tile-level
+  against all initialized countries within 500 km; generates per-facility and tile-level
   impact views at 8 wind thresholds (34–137 kt) plus JSON reports and CCI values
 - patch: backfills specific columns in existing mercator parquets without full
   re-initialization (supported: population, school_age_population, infant_population,

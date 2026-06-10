@@ -629,9 +629,12 @@ def fetch_health_centers(country, rewrite=0):
         save_hc_locations(custom_gdf, country)
         return custom_gdf
 
-    # 2. Use cache if available and rewrite not requested
+    # 2. Use cache if available, valid, and rewrite not requested
     if hc_exist(country) and rewrite == 0:
-        return load_hc_locations(country)
+        cached = load_hc_locations(country)
+        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
+            return cached
+        logger.warning(f"{country}: HC cache invalid or missing required columns — re-fetching from HealthSites.io")
 
     # 3. Fetch from HealthSites.io API
     try:
@@ -745,9 +748,12 @@ def fetch_shelters(country, rewrite=0):
         save_shelter_locations(custom_gdf, country)
         return custom_gdf
 
-    # 2. Use cache if available and rewrite not requested
+    # 2. Use cache if available, valid, and rewrite not requested
     if shelter_exist(country) and rewrite == 0:
-        return load_shelter_locations(country)
+        cached = load_shelter_locations(country)
+        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
+            return cached
+        logger.warning(f"{country}: Shelter cache invalid or missing required columns — re-fetching from OSM")
 
     # 3. Fetch from OSM via Overpass API
     try:
@@ -794,9 +800,12 @@ def fetch_wash(country, rewrite=0):
         save_wash_locations(custom_gdf, country)
         return custom_gdf
 
-    # 2. Use cache if available and rewrite not requested
+    # 2. Use cache if available, valid, and rewrite not requested
     if wash_exist(country) and rewrite == 0:
-        return load_wash_locations(country)
+        cached = load_wash_locations(country)
+        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
+            return cached
+        logger.warning(f"{country}: WASH cache invalid or missing required columns — re-fetching from OSM")
 
     # 3. Fetch from OSM via Overpass API
     try:
