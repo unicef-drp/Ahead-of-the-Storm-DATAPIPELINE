@@ -27,8 +27,9 @@ The pipeline uses environment variables to configure base directories:
   - Relative Wealth Index: `rwi`
   - Facility counts per tile: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Administrative boundary ID (admin level 1): `id`
+  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob` — PCHIP-interpolated child poverty rates per tile from DHS/RWI disaggregation
 - **Created by:** `create_mercator_country_layer()` via `save_mercator_and_admin_views()`
-- **Note:** One file per country per zoom level
+- **Note:** One file per country per zoom level. This parquet is the single source of truth for all base spatial data including poverty rates — poverty rates are NOT echoed into per-threshold impact CSVs.
 
 ### 2. Base Admin Views (per country, per admin level)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_admin{N}.parquet`
@@ -39,9 +40,10 @@ The pipeline uses environment variables to configure base directories:
   - Built surface total: `built_surface_m2`
   - Facility counts: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Average wealth/settlement: `rwi`, `smod_class`, `smod_class_l1`
+  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob` — **population-weighted mean** poverty rate across tiles in the admin unit: `Σ(pop_tile × rate_tile) / Σ(pop_tile)`. Tiles without RWI coverage (NaN poverty rate) are excluded from both numerator and denominator. When all admin tiles lack RWI the column is NaN. Aggregating all admin units population-weighted back to national level exactly recovers the calibrated national target — calibration drops NaN-RWI tiles before quintile assignment and scales PCHIP outputs so `Σ(rate × pop)` matches the DHS-implied count for covered tiles. NaN areas are absent from both the calibration and the aggregation by design, not a source of additional error.
   - Administrative names and geometries
 - **Created by:** `create_admin_country_layer()` via `save_mercator_and_admin_views()`
-- **Note:** One file per country per admin level. Default is admin1; use `--admin 1 2` during initialize (or `--type patch --columns admin2`) to create admin2.
+- **Note:** One file per country per admin level. Default is admin1; use `--admin 1 2` during initialize (or `--type patch --columns admin2`) to create admin2. Admin parquets are automatically re-synced whenever `--type patch` runs, so they pick up any newly patched columns including poverty rates.
 
 ### 3. School Locations (per country, cached)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_schools.parquet`
@@ -52,8 +54,8 @@ The pipeline uses environment variables to configure base directories:
 - **Note:** Cached after first fetch to avoid repeated API calls. Replaced by `geodb/custom/{country}_schools.csv` if present.
 
 ### 4. Health Center Locations (per country, cached)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_hcs.parquet`
-- **Example:** `geodb/aos_views/hc_views/DOM_hcs.parquet`
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_health_centers.parquet`
+- **Example:** `geodb/aos_views/hc_views/DOM_health_centers.parquet`
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** Health center locations fetched from HealthSites API
 - **Created by:** `save_hc_locations()`
@@ -77,11 +79,28 @@ The pipeline uses environment variables to configure base directories:
 
 ---
 
+## Files Produced During Patch (`--type patch --columns vulnerability`)
+
+### 7. Vulnerability Source CSV (per country, per zoom level)
+**Location:** `{ROOT_DATA_DIR}/vulnerability/{country}_vulnerability_z{zoom_level}.csv`
+- **Example:** `geodb/vulnerability/PHL_vulnerability_z14.csv`
+- **Format:** CSV (DataFrame)
+- **Content:** Per-tile child poverty rates from DHS/RWI disaggregation:
+  - `tile_id` — mercator quadkey at the specified zoom level
+  - `moderate_poverty_prob` — moderate child poverty rate per tile (0–1), DHS threshold: ≥2 deprivations
+  - `severe_poverty_prob` — severe child poverty rate per tile (0–1), DHS threshold: ≥3 deprivations
+- **Created by:** `vulnerability/fetch_vulnerability_probs.py` (downloads from Azure Blob)
+- **Note:** Pre-computed using Meta RWI + DHS quintile anchors + PCHIP interpolation. Tiles without RWI coverage have NaN poverty rates (~30% for PHL). This file is the source for patching the base parquet.
+
+After fetching, patching the base parquet writes `moderate_poverty_prob` and `severe_poverty_prob` into `{country}_{zoom}.parquet`. This is the only location where raw poverty rates live at tile level — they are NOT copied into per-threshold impact CSVs.
+
+---
+
 ## Files Produced During Update (`--type update`)
 
 For each storm/forecast combination processed, the following files are created:
 
-### 7. School Impact Views (per country, per storm, per forecast, per wind threshold)
+### 8. School Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/school_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -89,7 +108,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_school_view()`
 - **Note:** Multiple files per storm (one per wind threshold: 34, 40, 50, 64, 83, 96, 113, 137)
 
-### 8. Health Center Impact Views (per country, per storm, per forecast, per wind threshold)
+### 9. Health Center Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/hc_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -97,7 +116,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_hc_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 9. Shelter Impact Views (per country, per storm, per forecast, per wind threshold)
+### 10. Shelter Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/shelter_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/shelter_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -105,7 +124,7 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_shelter_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 10. WASH Impact Views (per country, per storm, per forecast, per wind threshold)
+### 11. WASH Impact Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/wash_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/wash_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -113,20 +132,20 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_wash_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 11. Mercator Tile Impact Views (per country, per storm, per forecast, per wind threshold, per zoom)
+### 12. Mercator Tile Impact Views (per country, per storm, per forecast, per wind threshold, per zoom)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{wind_threshold}_{zoom_level}.csv`
 - **Example:** `geodb/aos_views/mercator_views/DOM_LORENZO_20251015120000_34_14.csv`
 - **Format:** CSV (DataFrame, no geometry)
-- **Content:** Expected impact values per tile:
+- **Content:** Expected impact values per tile at the given wind threshold:
   - `E_population`, `E_school_age_population`, `E_infant_population`, `E_adolescent_population`
   - `E_built_surface_m2`
   - `E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`
   - `E_rwi`, `E_smod_class`, `E_smod_class_l1`
   - `probability`
 - **Created by:** `save_tiles_view()`
-- **Note:** Multiple files per storm (one per wind threshold)
+- **Note:** Multiple files per storm (one per wind threshold). **Poverty rate columns are not included** — raw poverty rates (`moderate_poverty_prob`, `severe_poverty_prob`) live only in the base parquet; wind-integrated people-in-need estimates live only in the vulnerability output file (item 15). This keeps per-threshold files lean and avoids redundant duplication across 8 threshold files per forecast.
 
-### 12. CCI (Child Cyclone Index) Tile Views (per country, per storm, per forecast, per zoom)
+### 13. CCI (Child Cyclone Index) Tile Views (per country, per storm, per forecast, per zoom)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{zoom_level}_cci.csv`
 - **Example:** `geodb/aos_views/mercator_views/DOM_LORENZO_20251015120000_14_cci.csv`
 - **Format:** CSV (DataFrame)
@@ -137,9 +156,9 @@ For each storm/forecast combination processed, the following files are created:
   - `CCI_adolescent`, `E_CCI_adolescent`
   - `CCI_pop`, `E_CCI_pop`
 - **Created by:** `save_cci_tiles()`
-- **Note:** One file per storm (aggregates all wind thresholds)
+- **Note:** One file per storm per forecast (aggregates all wind thresholds)
 
-### 13. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold, per admin level)
+### 14. Admin Level Impact Views (per country, per storm, per forecast, per wind threshold, per admin level)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_{wind_threshold}_admin{N}.csv`
 - **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_34_admin1.csv`, `geodb/aos_views/admin_views/PNG_FUNG-WONG_20251110120000_34_admin2.csv`
 - **Format:** CSV (DataFrame, no geometry)
@@ -151,17 +170,41 @@ For each storm/forecast combination processed, the following files are created:
   - `probability`
   - `name` (admin name)
 - **Created by:** `save_admin_tiles_view()`
-- **Note:** Multiple files per storm per wind threshold per initialized admin level. Auto-detected from existing base admin parquets — no configuration needed at update time.
+- **Note:** Multiple files per storm per wind threshold per initialized admin level. Auto-detected from existing base admin parquets — no configuration needed at update time. **Poverty rate columns are not included** — people-in-need estimates aggregated by admin are in the vulnerability admin views (item 16).
 
-### 14. CCI Admin Views (per country, per storm, per forecast, per admin level)
+### 15. CCI Admin Views (per country, per storm, per forecast, per admin level)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin{N}_cci.csv`
 - **Example:** `geodb/aos_views/admin_views/DOM_LORENZO_20251015120000_admin1_cci.csv`, `geodb/aos_views/admin_views/PNG_FUNG-WONG_20251110120000_admin2_cci.csv`
 - **Format:** CSV (DataFrame)
 - **Content:** Child Cyclone Index (CCI) values aggregated by admin level N
 - **Created by:** `save_cci_admin()`
-- **Note:** One file per storm per initialized admin level
+- **Note:** One file per storm per forecast per initialized admin level
 
-### 15. Track Views (per country, per storm, per forecast, per wind threshold)
+### 16. Vulnerability Tile Views (per country, per storm, per forecast, per zoom)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{zoom_level}_vulnerability.csv`
+- **Example:** `geodb/aos_views/mercator_views/PHL_FUNG-WONG_20251109060000_14_vulnerability.csv`
+- **Format:** CSV (DataFrame)
+- **Content:** Wind-integrated people/children in need per tile (CHIN methodology):
+  - `zone_id` — mercator quadkey (= tile_id)
+  - `id` — admin1 unit ID (for admin aggregation)
+  - `E_infant_in_need` — expected infants (0–4y) in need
+  - `E_school_age_in_need` — expected school-age children (5–14y) in need
+  - `E_adolescent_in_need` — expected adolescents (15–19y) in need
+  - `E_children_in_need` — expected children (0–19y) in need
+  - `E_people_in_need` — expected total people in need
+- **Created by:** `save_vulnerability_tiles()` (called automatically during `--type update` for patched countries)
+- **Note:** One file per storm per forecast. This is the sole output with E_people_in_need estimates — these are not included in the per-threshold CSVs (item 12). Tiles without RWI/poverty coverage produce NaN and are excluded. Countries not patched with vulnerability data produce an empty file (NaN columns, no error).
+- **Methodology:** Vulnerability weight = Σ P(band k) × rate(k), where bands are mutually exclusive (P(band k) = P(≥k) − P(≥k+1)) and rates follow the CHIN formula: <50kt → severe rate; 50–96kt → `moderate × (1−t) + t, t = (kt−50)/46`; ≥96kt → 1.0.
+
+### 17. Vulnerability Admin Views (per country, per storm, per forecast, per admin level)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin{N}_vulnerability.csv`
+- **Example:** `geodb/aos_views/admin_views/PHL_FUNG-WONG_20251109060000_admin1_vulnerability.csv`
+- **Format:** CSV (DataFrame)
+- **Content:** Same columns as vulnerability tile views (item 16), aggregated (summed) by admin level N
+- **Created by:** `save_vulnerability_admin()` (called automatically during `--type update`)
+- **Note:** One file per storm per forecast per initialized admin level
+
+### 18. Track Views (per country, per storm, per forecast, per wind threshold)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/track_views/DOM_LORENZO_20251015120000_34.parquet`
 - **Format:** Parquet (GeoDataFrame)
@@ -175,21 +218,40 @@ For each storm/forecast combination processed, the following files are created:
 - **Created by:** `save_tracks_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
 
-### 16. JSON Impact Reports (per country, per storm, per forecast)
+### 19. Vulnerability Track Views (per country, per storm, per forecast, per zoom)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_views/{country}_{storm}_{date}_{zoom_level}_vulnerability_tracks.parquet`
+- **Example:** `geodb/aos_views/track_views/PHL_FUNG-WONG_20251109060000_14_vulnerability_tracks.parquet`
+- **Format:** Parquet (DataFrame)
+- **Content:** Per-ensemble-member people/children in need totals:
+  - `zone_id` — ensemble member number
+  - `severity_people_in_need`
+  - `severity_children_in_need`
+  - `severity_infant_in_need`
+  - `severity_school_age_in_need`
+  - `severity_adolescent_in_need`
+- **Created by:** `calculate_vulnerability_tracks()` → `save_vulnerability_tracks()`
+- **Note:** One file per storm per forecast (not per wind threshold — vulnerability integrates across all thresholds per member). All `severity_*` columns are NaN for countries not patched with vulnerability data. Loaded into **`TRACK_VULNERABILITY_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. The dashboard joins this onto `TRACK_MAT` via `get_track_impacts()` in `snowflake_utils.py` to include in-need columns alongside wind-threshold severity metrics.
+- **Methodology:** For each member, tiles intersecting that member's cumulative wind envelopes are identified via spatial join. Each tile is assigned the rate of its *highest* wind band reached by that member (exclusive assignment, same rate formula as item 16). The per-tile `population × rate` values are then summed. This is the per-member analogue of item 16: item 16 uses ensemble-probability weights to produce expected values per tile; this file uses binary member coverage to produce scenario totals per member (enabling DET/#51 and worst-case display in the dashboard). See `vulnerability/README.md` for the full rate formula and the relationship between these two outputs.
+
+### 20. JSON Impact Reports (per country, per storm, per forecast)
 **Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
 - **Example:** `project_results/climate/lacro_project/jsons/DOM_LORENZO_20251015120000.json`
 - **Format:** JSON
 - **Content:** Comprehensive impact report data including:
-  - Expected impacts by wind threshold
-  - Top 5 schools at risk
-  - Top 5 health centers at risk
-  - Administrative breakdowns
-  - Vulnerability indicators (poverty, urban/rural)
-  - Change indicators (compared to previous forecast)
-- **Created by:** `save_json_report()`
-- **Note:** One file per country per storm per forecast
+  - Expected impacts by wind threshold: `expected_pop_{wind}`, `expected_children_{wind}`, `expected_school_{wind}`, `expected_infant_{wind}`, `expected_adolescent_{wind}`, `expected_schools_{wind}`, `expected_hcs_{wind}`, `expected_shelters_{wind}`, `expected_wash_{wind}`
+  - Overall expected counts (across all thresholds): `expected_pop`, `expected_children`, `expected_school_age`, `expected_infants`, `expected_adolescent`, `expected_schools`, `expected_hcs`, `expected_shelters`, `expected_wash`
+  - People/children in need (CHIN vulnerability, `None` if country not patched): `E_people_in_need`, `E_children_in_need`, `E_infant_in_need`, `E_school_age_in_need`, `E_adolescent_in_need`
+  - CCI: `expected_cci_pop`, `expected_cci_school`, `expected_cci_infant`, `expected_cci_adolescent`
+  - Urban/rural breakdown: `expected_pop_urban`, `expected_pop_rural`, `expected_school_urban`, `expected_school_rural`, `expected_infant_urban`, `expected_infant_rural`, `expected_adolescent_urban`, `expected_adolescent_rural`
+  - RWI-based poverty breakdown: `expected_pop_poverty`, `expected_pop_severe`, `expected_school_poverty`, `expected_school_severe`, `expected_infant_poverty`, `expected_infant_severe`, `expected_adolescent_poverty`, `expected_adolescent_severe`
+  - Top 5 schools, health centers, shelters, WASH facilities at risk
+  - Administrative breakdowns: `rows_admins_pop_total`, `rows_admins_school`, `rows_admins_infant`, `rows_admins_adolescent`, `rows_schools_winds`, `rows_hcs_winds`, `rows_shelters_winds`, `rows_wash_winds`. Each admin row includes per-wind impact counts, a `"cci"` key (Child Cyclone Index for that admin), and a `"people_in_need"` key (`null` when country not patched with vulnerability data)
+  - Change indicators vs previous forecast: `children_change`, `children_change_perc`, `children_change_direction`
+  - Metadata: `storm`, `country`, `forecast_date`, `next_forecast_date`, `report_date`, `expected_landfall`, `storm_category`
+- **Created by:** `do_report()` → `save_json_report()`
+- **Note:** One file per country per storm per forecast. `E_*_in_need` fields are `None` (N/A) for countries not patched with vulnerability data — all other fields are unaffected.
 
-### 17. Processed Storms Tracking File
+### 21. Processed Storms Tracking File
 **Location:** `{RESULTS_DIR}/{STORMS_FILE}`
 - **Example:** `project_results/climate/lacro_project/storms.json`
 - **Format:** JSON
@@ -211,46 +273,46 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 > below can be visualized directly from that parquet — each tile has a geometry and the corresponding
 > aggregated value — without needing access to the original rasters.
 
-### 18. WorldPop Population Data
+### 22. WorldPop Population Data
 - **Source:** WorldPop API (GR2, year=2025)
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
 - **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store (local filesystem or Snowflake stage). On first init for a country all 62 age-band files (~175 MB) are downloaded and cached; subsequent runs reuse the cache.
 - **Stored in mercator parquet as:** `population` (100m res, sum per tile), `school_age_population`, `infant_population`, `adolescent_population` (all 100m res, sum per tile)
 
-### 19. GHSL Built Surface Data
+### 23. GHSL Built Surface Data
 - **Source:** Global Human Settlement Layer (GHSL), year=2020, 100m resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
 - **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `built_surface_m2` (sum per tile)
 
-### 20. SMOD Settlement Classification Data
+### 24. SMOD Settlement Classification Data
 - **Source:** GHSL Settlement Model (SMOD), year=2020, 1km resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
 - **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `smod_class` (raw L2 median per tile, values 10–30) and `smod_class_l1` (derived 3-class: 1=rural, 2=suburban, 3=urban)
 
-### 21. Relative Wealth Index (RWI) Data
+### 25. Relative Wealth Index (RWI) Data
 - **Source:** Facebook/Meta RWI dataset via HDX
 - **Downloaded by:** `RWIHandler` (giga-spatial internal)
 - **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `rwi` (mean per tile)
 - **Note:** Not available for all countries. Tiles will have NaN for `rwi` where data is unavailable — no error raised.
 
-### 22. School Locations
+### 26. School Locations
 **Source:** GIGA School Location API
 - **Fetched by:** `GigaSchoolLocationFetcher.fetch_locations()`
 - **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views/{country}_schools.parquet`
 - **Note:** Cached after first fetch to avoid repeated API calls
 - **Requires:** `GIGA_SCHOOL_LOCATION_API_KEY` environment variable
 
-### 23. Health Center Locations
+### 27. Health Center Locations
 **Source:** HealthSites API
 - **Fetched by:** `HealthSitesFetcher.fetch_facilities()`
-- **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_hcs.parquet`
+- **Cached to:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views/{country}_health_centers.parquet`
 - **Note:** Cached after first fetch to avoid repeated API calls
 - **Requires:** `HEALTHSITES_API_KEY` environment variable
 
-### 24. Administrative Boundaries
+### 28. Administrative Boundaries
 **Source:** UNICEF GeoRepo (via GigaSpatial)
 - **Fetched by:** `AdminBoundaries.create()`
 - **Note:** Fetched via API, not cached to disk (fetched each time)
@@ -276,20 +338,24 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 │   ├── {country}_built_surface_z{zoom}.csv
 │   ├── {country}_smod_z{zoom}.csv
 │   └── {country}_rwi_z{zoom}.csv
+├── vulnerability/                      # Poverty rate source data (downloaded from Azure Blob)
+│   └── {country}_vulnerability_z{zoom}.csv   # moderate/severe poverty prob per tile
 └── {VIEWS_DIR}/                        # e.g., aos_views/
     ├── mercator_views/
-    │   ├── {country}_{zoom}.parquet                    # Base mercator views
-    │   ├── {country}_{storm}_{date}_{wind}_{zoom}.csv  # Impact tile views
-    │   └── {country}_{storm}_{date}_{zoom}_cci.csv     # CCI tile views
+    │   ├── {country}_{zoom}.parquet                         # Base mercator views (incl. poverty rates after patch)
+    │   ├── {country}_{storm}_{date}_{wind}_{zoom}.csv       # Per-threshold impact tile views (no poverty rates)
+    │   ├── {country}_{storm}_{date}_{zoom}_cci.csv          # CCI tile views
+    │   └── {country}_{storm}_{date}_{zoom}_vulnerability.csv # People/children in need (sole E_*_in_need output)
     ├── admin_views/
-    │   ├── {country}_admin{N}.parquet                     # Base admin views (one per initialized level)
-    │   ├── {country}_{storm}_{date}_{wind}_admin{N}.csv   # Impact admin views (per level)
-    │   └── {country}_{storm}_{date}_admin{N}_cci.csv      # CCI admin views (per level)
+    │   ├── {country}_admin{N}.parquet                          # Base admin views (one per initialized level)
+    │   ├── {country}_{storm}_{date}_{wind}_admin{N}.csv        # Per-threshold impact admin views (no poverty rates)
+    │   ├── {country}_{storm}_{date}_admin{N}_cci.csv           # CCI admin views (per level)
+    │   └── {country}_{storm}_{date}_admin{N}_vulnerability.csv # People/children in need by admin (per level)
     ├── school_views/
     │   ├── {country}_schools.parquet                    # Cached school locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # School impact views
     ├── hc_views/
-    │   ├── {country}_hcs.parquet                        # Cached health center locations
+    │   ├── {country}_health_centers.parquet             # Cached health center locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # Health center impact views
     ├── shelter_views/
     │   ├── {country}_shelters.parquet                   # Cached shelter locations
@@ -298,7 +364,8 @@ These files are downloaded automatically by the GigaSpatial library and stored i
     │   ├── {country}_wash.parquet                       # Cached WASH locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # WASH impact views
     └── track_views/
-        └── {country}_{storm}_{date}_{wind}.parquet      # Track impact views
+        ├── {country}_{storm}_{date}_{wind}.parquet                        # Track impact views (per wind threshold)
+        └── {country}_{storm}_{date}_{zoom}_vulnerability_tracks.parquet   # Per-member vulnerability totals
 ```
 
 ---
@@ -332,7 +399,6 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 2. **File Formats:**
    - `.parquet` files contain GeoDataFrames (with geometry)
    - `.csv` files contain DataFrames (no geometry, just data)
-
 
 3. **Storage Location:**
    - If using Azure Blob Storage (`DATA_PIPELINE_DB=BLOB`), paths are relative to the blob container
