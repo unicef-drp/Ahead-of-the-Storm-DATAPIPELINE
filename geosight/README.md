@@ -72,6 +72,9 @@ Combine with filters to target a specific subset:
 # One country
 python geosight/upload_admin_related_table.py --backfill --country TWN
 
+# One storm
+python geosight/upload_admin_related_table.py --backfill --storm MELISSA
+
 # One date
 python geosight/upload_admin_related_table.py --backfill --date 2025-11-10
 
@@ -85,6 +88,28 @@ python geosight/upload_admin_related_table.py --backfill \
 ```
 
 Filters also work in incremental mode to restrict which files are considered.
+
+### Replace — overwrite existing rows after a pipeline re-run
+
+```bash
+python geosight/upload_admin_related_table.py --replace --storm MELISSA
+```
+
+Fetches all GeoSight rows matching the active filters, deletes them one by one,
+then uploads the fresh data from the stage. At least one filter is required to
+prevent accidentally wiping unrelated data.
+
+```bash
+# Replace one storm across all countries
+python geosight/upload_admin_related_table.py --replace --storm MELISSA
+
+# Replace one country for one storm
+python geosight/upload_admin_related_table.py --replace --country JAM --storm MELISSA
+
+# Replace a date range
+python geosight/upload_admin_related_table.py --replace \
+  --from-date 2025-10-22 --to-date 2025-10-31
+```
 
 ## Schema Management
 

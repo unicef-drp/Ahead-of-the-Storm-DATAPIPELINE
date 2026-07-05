@@ -9,12 +9,12 @@ Key Features:
 - initialize: builds country base layers (mercator tiles + admin views) with population,
   built surface, settlement class, wealth index, schools, health centers, shelters, WASH
 - update: fetches active storm envelopes from Snowflake and runs geospatial intersection
-  against all initialized countries within 1,500 km; generates per-facility and tile-level
+  against all initialized countries within 500 km; generates per-facility and tile-level
   impact views at 8 wind thresholds (34–137 kt) plus JSON reports and CCI values
 - patch: backfills specific columns in existing mercator parquets without full
   re-initialization (supported: population, school_age_population, infant_population,
   adolescent_population, built_surface_m2, smod_class, smod_class_l1, rwi,
-  schools, hcs, shelters, wash)
+  schools, hcs, shelters, wash, vulnerability)
 
 - Custom data overrides: place a CSV in geodb/custom/ to replace any API or raster source
   for a specific country — custom files are never overwritten by the pipeline
@@ -118,7 +118,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
     Complete impact analysis orchestration.
 
     Loads hurricane envelope data from Snowflake, checks which countries are affected
-    (using 1500km buffer per country), and creates impact views for affected countries.
+    (using 500km buffer per country), and creates impact views for affected countries.
     Admin levels are determined automatically by which base admin parquets exist for each
     country (created during --type initialize).
 
@@ -147,13 +147,13 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         gdf_envelopes = load_envelopes_from_snowflake(storm, date)
         
         if gdf_envelopes.empty:
-            logger.error(f"No envelope data found for {storm} at {date}")
-            return {"success": False, "error": "No envelope data found"}
+            logger.info(f"No envelope data found for {storm} at {date} — forecast may have expired, skipping")
+            return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
         
-        # --- SQL pre-filter: ask Snowflake which countries are within 1500km ---
+        # --- SQL pre-filter: ask Snowflake which countries are within 500km ---
         affected_countries = []
         sql_prefilter_used = False
         try:
@@ -169,20 +169,20 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
             if affected_countries:
                 logger.info(f"SQL pre-filter: {len(affected_countries)} country/countries in range: {', '.join(affected_countries)}")
             else:
-                logger.info("SQL pre-filter: no countries within 1500km — skipping storm")
+                logger.info("SQL pre-filter: no countries within 500km — skipping storm")
         except Exception as e:
             logger.warning(f"SQL pre-filter failed ({e}) — falling back to Python buffer check")
 
-        # --- Python fallback: 1500km buffer per country (original logic) ---
+        # --- Python fallback: 500km buffer per country (original logic) ---
         if not sql_prefilter_used:
-            logger.info("Checking which countries are affected (1500km buffer per country)...")
+            logger.info("Checking which countries are affected (500km buffer per country)...")
             country_boundaries = get_country_boundaries(countries)
 
             for i, country in enumerate(countries):
                 country_boundary = country_boundaries[i]
                 country_gdf = gpd.GeoDataFrame(geometry=[country_boundary], crs='EPSG:4326')
 
-                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=1500000)
+                country_buffered = buffer_geodataframe(country_gdf, buffer_distance_meters=500000)
                 country_buffered_geom = country_buffered.geometry.iloc[0]
 
                 bounds = country_buffered_geom.bounds
@@ -217,7 +217,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
                     logger.info(f"  {country}: Not affected (skipping)")
         
         if not affected_countries:
-            logger.info("Envelopes do not intersect with any of the specified countries (within 1500km buffer) — skipping")
+            logger.info("Envelopes do not intersect with any of the specified countries (within 500km buffer) — skipping")
             return {"success": True, "skipped": True, "envelopes_processed": 0, "countries_processed": 0, "total_views_created": 0, "affected_countries": []}
         
         logger.info(f"Processing {len(affected_countries)} affected country/countries: {', '.join(affected_countries)}")
@@ -225,19 +225,60 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         # Create impact views only for affected countries
         logger.info("Creating impact views for affected countries...")
         total_views = 0
+        country_errors = []
+        succeeded_countries = []
+        any_base_parquet_written = False
         for country in affected_countries:
-            create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
-            total_views += 4  # schools, health centers, tiles, tracks
-        
-        logger.info("Impact analysis completed successfully")
+            try:
+                wrote_base = create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
+                if wrote_base:
+                    any_base_parquet_written = True
+                total_views += 4  # schools, health centers, tiles, tracks
+                succeeded_countries.append(country)
+            except Exception as country_exc:
+                import traceback as _tb
+                logger.error(f"Pipeline with errors for storm {storm} at {date}")
+                logger.error(f"  {country}: {str(country_exc)}")
+                logger.debug(_tb.format_exc())
+                country_errors.append(f"{country}: {str(country_exc)}")
+
+        if country_errors and not succeeded_countries:
+            # Every country failed — treat as full failure so the run stays eligible for retry
+            return {"success": False, "error": "; ".join(country_errors)}
+
+        if country_errors:
+            logger.warning(f"Impact analysis completed with {len(country_errors)} country error(s): {'; '.join(country_errors)}")
+        else:
+            logger.info("Impact analysis completed successfully")
+
+        # If any emergency fallback wrote a base parquet during this update run,
+        # refresh the base layer MATs immediately (they are normally only refreshed
+        # after --type initialize or --type patch).
+        if any_base_parquet_written and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+            try:
+                _conn = get_snowflake_connection()
+                _cur = _conn.cursor()
+                _cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+                _cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+                _result = _cur.fetchone()[0]
+                _cur.close()
+                _conn.close()
+                if _result.startswith('PARTIAL') or 'errors:' in _result:
+                    logger.warning(f"Base layer MAT refresh had failures after emergency fallback: {_result}")
+                else:
+                    logger.info(f"Base layer MATs refreshed after emergency fallback during update: {_result}")
+            except Exception as e:
+                logger.error(f"Could not refresh base layer tables after emergency fallback: {e}")
+
         return {
             "success": True,
             "envelopes_processed": len(gdf_envelopes),
-            "countries_processed": len(affected_countries),
+            "countries_processed": len(succeeded_countries),
             "total_views_created": total_views,
-            "affected_countries": affected_countries
+            "affected_countries": succeeded_countries,
+            "country_errors": country_errors,
         }
-        
+
     except Exception as e:
         import traceback
         logger.error(f"Error during impact analysis: {str(e)}")
@@ -416,6 +457,23 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
 
     save_mercator_and_admin_views(countries, zoom, rewrite, admin_levels=admin_levels)
     stats.analysis_success = True
+
+    if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        try:
+            conn = get_snowflake_connection()
+            cur = conn.cursor()
+            cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+            cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+            result = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            if result.startswith('PARTIAL') or 'errors:' in result:
+                logger.warning(f"Base layer MAT refresh had failures after initialize: {result}")
+            else:
+                logger.info(f"Base layer MAT tables refreshed after initialize: {result}")
+        except Exception as e:
+            logger.error(f"Could not refresh base layer tables after initialize: {e}")
+
     return stats
 
 
@@ -432,8 +490,12 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
     - Re-derives smod_class_l1 whenever smod_class is patched
 
     Supported columns: population, school_age_population, infant_population, adolescent_population,
-    built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash,
+    built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash, vulnerability,
     admin<N> (e.g. admin2 — creates a new base admin parquet for that level)
+
+    For 'vulnerability': reads pre-computed poverty probability data from geodb/vulnerability/
+    (generated by vulnerability/fetch_vulnerability_probs.py) and writes moderate_poverty_prob
+    and severe_poverty_prob into the base mercator parquet.
 
     Args:
         countries: List of ISO3 country codes (e.g., ['PNG', 'FJI'])
@@ -447,15 +509,36 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
     logger = setup_logging(log_level)
     logger.info(f"Patch mode: updating columns {columns} for countries {countries}")
     all_ok = True
+    patched = []
     for country in countries:
         try:
             patch_country_layer(country, zoom, columns)
+            patched.append(country)
         except (FileNotFoundError, ValueError) as e:
             logger.error(f"{country}: Patch failed — {e}")
             all_ok = False
         except Exception as e:
             logger.error(f"{country}: Unexpected error during patch — {e}", exc_info=True)
             all_ok = False
+
+    if patched and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        try:
+            conn = get_snowflake_connection()
+            cur = conn.cursor()
+            cur.execute("ALTER STAGE AOTS.TC_ECMWF.AOTS_ANALYSIS REFRESH")
+            cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
+            result = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            if result.startswith('PARTIAL') or 'errors:' in result:
+                logger.warning(f"Base layer MAT refresh had failures after patch: {result}")
+                all_ok = False
+            else:
+                logger.info(f"Base layer MAT tables refreshed after patch: {result}")
+        except Exception as e:
+            logger.error(f"Could not refresh base layer tables after patch: {e}")
+            all_ok = False
+
     return all_ok
 
 
@@ -835,7 +918,9 @@ def main():
         help=(
             "Columns to patch (only used with --type patch). "
             "Supported: population, school_age_population, infant_population, adolescent_population, "
-            "built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash. "
+            "built_surface_m2, smod_class, smod_class_l1, rwi, schools, hcs, shelters, wash, vulnerability. "
+            "Use 'vulnerability' to patch moderate_poverty_prob + severe_poverty_prob from geodb/vulnerability/ "
+            "(run vulnerability/fetch_vulnerability_probs.py first). "
             "Example: --columns built_surface_m2 rwi"
         )
     )

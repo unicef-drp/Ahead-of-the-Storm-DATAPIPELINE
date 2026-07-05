@@ -124,6 +124,27 @@ old = '                response = requests.get(\n                    self.base_u
 new = '                _headers = {\"User-Agent\": \"curl/7.88.1\"}\n                _url = \"https://overpass.osm.ch/api/interpreter\" if attempt == self.max_retries - 1 else self.base_url\n                response = requests.get(\n                    _url, params={\"data\": query}, timeout=self.timeout, headers=_headers\n                )'; \
 p.write_text(p.read_text().replace(old, new))"
 
+# Patch giga-spatial SnowflakeDataStore.file_exists / file_size / list_files / is_file
+# to quote stage paths in LIST commands. Unquoted paths break Snowflake SQL parsing
+# when filenames contain spaces (e.g. "Saint Lucia_relative_wealth_index.csv") or
+# reserved words (e.g. "Saint Vincent and Grenadines_..."). Fix: wrap stage_path in
+# single quotes → LIST '@stage/path/to/file with spaces.csv'.
+# Remove this block once upstream giga-spatial fixes the quoting issue.
+RUN python3 -c "\
+import pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.11/site-packages/gigaspatial/core/io/snowflake_data_store.py'); \
+p.write_text(p.read_text().replace('list_command = f\"LIST {stage_path}\"', 'list_command = f\"LIST \047{stage_path}\047\"'))"
+
+# Patch giga-spatial SnowflakeDataStore.read_file to quote stage paths in GET commands.
+# Same root cause as Bug 4 above: GET @stage/path/Saint Lucia_... breaks on the space.
+# Snowflake SQL parser stops at the first space-separated token; must quote the path.
+# Fix: wrap stage_path in single quotes → GET '@stage/path/Saint Lucia_...'.
+# Remove this block once upstream giga-spatial fixes the quoting issue.
+RUN python3 -c "\
+import pathlib; \
+p = pathlib.Path('/usr/local/lib/python3.11/site-packages/gigaspatial/core/io/snowflake_data_store.py'); \
+p.write_text(p.read_text().replace('get_command = f\"GET {stage_path} \047file://{temp_dir_normalized}\047\"', 'get_command = f\"GET \047{stage_path}\047 \047file://{temp_dir_normalized}\047\"'))"
+
 # ==============================================================================
 # Create directories for data (if using local storage as fallback)
 # ==============================================================================

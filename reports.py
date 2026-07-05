@@ -105,31 +105,33 @@ logger = logging.getLogger(__name__)
 # Used for validation to ensure all required fields are present
 REPORT_TEMPLATE = {
     'storm': '', 'forecast_date': '', 'expected_landfall': '', 'storm_category': '', 'country': '',
-    'expected_children': 0, 'expected_school_age': 0, 'expected_infants': 0, 'expected_adolescent': 0,
-    'expected_schools': 0, 'expected_hcs': 0, 'expected_shelters': 0, 'expected_wash': 0,
-    'children_change_direction': '', 'children_change': 0, 'children_change_perc': 0,
+    'expected_children': None, 'expected_school_age': None, 'expected_infants': None, 'expected_adolescent': None,
+    'expected_schools': None, 'expected_hcs': None, 'expected_shelters': None, 'expected_wash': None,
+    'children_change_direction': '', 'children_change': None, 'children_change_perc': None,
     'rows_admins_pop_total': [], 'rows_admins_school': [], 'rows_admins_infant': [], 'rows_admins_adolescent': [],
     'rows_schools_winds': [], 'rows_hcs_winds': [], 'rows_shelters_winds': [], 'rows_wash_winds': [],
-    'expected_pop': 0, 'expected_cci_pop': 0, 'expected_cci_school': 0, 'expected_cci_infant': 0, 'expected_cci_adolescent': 0,
-    'expected_pop_poverty': 0, 'expected_pop_severe': 0, 'expected_pop_urban': 0, 'expected_pop_rural': 0,
-    'expected_school_poverty': 0, 'expected_school_severe': 0, 'expected_school_urban': 0, 'expected_school_rural': 0,
-    'expected_infant_poverty': 0, 'expected_infant_severe': 0, 'expected_infant_urban': 0, 'expected_infant_rural': 0,
-    'expected_adolescent_poverty': 0, 'expected_adolescent_severe': 0, 'expected_adolescent_urban': 0, 'expected_adolescent_rural': 0,
-    'next_forecast_date': '', 'report_date': ''
+    'expected_pop': None, 'expected_cci_pop': None, 'expected_cci_school': None, 'expected_cci_infant': None, 'expected_cci_adolescent': None,
+    'expected_pop_poverty': None, 'expected_pop_severe': None, 'expected_pop_urban': None, 'expected_pop_rural': None,
+    'expected_school_poverty': None, 'expected_school_severe': None, 'expected_school_urban': None, 'expected_school_rural': None,
+    'expected_infant_poverty': None, 'expected_infant_severe': None, 'expected_infant_urban': None, 'expected_infant_rural': None,
+    'expected_adolescent_poverty': None, 'expected_adolescent_severe': None, 'expected_adolescent_urban': None, 'expected_adolescent_rural': None,
+    'next_forecast_date': '', 'report_date': '',
+    'E_people_in_need': None, 'E_children_in_need': None,
+    'E_infant_in_need': None, 'E_school_age_in_need': None, 'E_adolescent_in_need': None,
 }
 
 # Add wind threshold-specific keys to template
 for wind in STORM_CATEGORIES.keys():
     REPORT_TEMPLATE.update({
-        f'expected_children_{wind}': 0, f'change_children_{wind}': '',
-        f'expected_school_{wind}': 0, f'change_school_{wind}': '',
-        f'expected_infant_{wind}': 0, f'change_infant_{wind}': '',
-        f'expected_adolescent_{wind}': 0,
-        f'expected_pop_{wind}': 0,
-        f'expected_schools_{wind}': 0, f'change_schools_{wind}': '',
-        f'expected_hcs_{wind}': 0, f'change_hcs_{wind}': '',
-        f'expected_shelters_{wind}': 0, f'change_shelters_{wind}': '',
-        f'expected_wash_{wind}': 0, f'change_wash_{wind}': ''
+        f'expected_children_{wind}': None, f'change_children_{wind}': '',
+        f'expected_school_{wind}': None, f'change_school_{wind}': '',
+        f'expected_infant_{wind}': None, f'change_infant_{wind}': '',
+        f'expected_adolescent_{wind}': None,
+        f'expected_pop_{wind}': None,
+        f'expected_schools_{wind}': None, f'change_schools_{wind}': '',
+        f'expected_hcs_{wind}': None, f'change_hcs_{wind}': '',
+        f'expected_shelters_{wind}': None, f'change_shelters_{wind}': '',
+        f'expected_wash_{wind}': None, f'change_wash_{wind}': ''
     })
 
 # Add top facilities keys
@@ -464,16 +466,18 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
 def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                           cci_admin_view: pd.DataFrame,
                           gdf_admin: gpd.GeoDataFrame,
-                          d_previous: Dict[str, Any]) -> Dict[str, list]:
+                          d_previous: Dict[str, Any],
+                          vuln_tiles_view: Optional[pd.DataFrame] = None) -> Dict[str, list]:
     """
     Calculate administrative-level impact rows for the report.
-    
+
     Args:
         wind_admin_views: Dictionary mapping wind thresholds to admin-level views
         cci_admin_view: DataFrame with CCI values per admin
         gdf_admin: GeoDataFrame with admin boundaries
         d_previous: Previous report dictionary for change calculations
-    
+        vuln_tiles_view: Optional tile-level vulnerability view (zone_id, id, E_*_in_need)
+
     Returns:
         dict: Dictionary with keys 'rows_admins_pop_total', 'rows_admins_school',
               'rows_admins_infant', 'rows_schools_winds', 'rows_hcs_winds',
@@ -554,6 +558,24 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         d_rows_admins_infant["cci"] = int(admin_cci['E_CCI_infants'].sum())
         d_rows_admins_adolescent["cci"] = int(admin_cci['E_CCI_adolescents'].sum())
 
+        # Vulnerability in-need values for this admin (None when country not patched)
+        if vuln_tiles_view is not None and 'id' in vuln_tiles_view.columns:
+            admin_vuln = vuln_tiles_view[vuln_tiles_view['id'] == admin_id]
+            def _vuln_sum(col):
+                if col not in admin_vuln.columns:
+                    return None
+                total = admin_vuln[col].sum(min_count=1)
+                return int(total) if not pd.isna(total) else None
+            d_rows_admins_pop_total["people_in_need"] = _vuln_sum('E_people_in_need')
+            d_rows_admins_school["people_in_need"]    = _vuln_sum('E_school_age_in_need')
+            d_rows_admins_infant["people_in_need"]    = _vuln_sum('E_infant_in_need')
+            d_rows_admins_adolescent["people_in_need"] = _vuln_sum('E_adolescent_in_need')
+        else:
+            d_rows_admins_pop_total["people_in_need"] = None
+            d_rows_admins_school["people_in_need"]    = None
+            d_rows_admins_infant["people_in_need"]    = None
+            d_rows_admins_adolescent["people_in_need"] = None
+
         rows_admins_pop_total.append(d_rows_admins_pop_total)
         rows_admins_school.append(d_rows_admins_school)
         rows_admins_infant.append(d_rows_admins_infant)
@@ -584,7 +606,8 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
               gdf_tracks: gpd.GeoDataFrame,
               country: str, storm: str, date: str,
               wind_shelter_views: Optional[Dict[int, pd.DataFrame]] = None,
-              wind_wash_views: Optional[Dict[int, pd.DataFrame]] = None) -> Dict[str, Any]:
+              wind_wash_views: Optional[Dict[int, pd.DataFrame]] = None,
+              vulnerability_tiles_view: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """
     Generate comprehensive impact report from analysis views.
 
@@ -735,12 +758,26 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
             d[f"wash_type_{i}"] = row.get('wash_type', '')
             d[f"wash_prob_{i}"] = float(row.get('probability', 0))
     
-    # Calculate vulnerability metrics
+    # Calculate vulnerability metrics (RWI/SMOD-based urban/rural, poverty/severe breakdowns)
     vulnerability_metrics = _calculate_vulnerability_metrics(expected_tiles)
     d.update(vulnerability_metrics)
 
+    # People/children in need totals from CHIN vulnerability view
+    if vulnerability_tiles_view is not None:
+        for col, key in [
+            ('E_people_in_need',     'E_people_in_need'),
+            ('E_children_in_need',   'E_children_in_need'),
+            ('E_infant_in_need',     'E_infant_in_need'),
+            ('E_school_age_in_need', 'E_school_age_in_need'),
+            ('E_adolescent_in_need', 'E_adolescent_in_need'),
+        ]:
+            if col in vulnerability_tiles_view.columns:
+                total = vulnerability_tiles_view[col].sum(min_count=1)
+                d[key] = int(total) if not pd.isna(total) else None
+
     # Calculate administrative-level impact rows
-    admin_rows = _calculate_admin_rows(wind_admin_views, cci_admin_view, gdf_admin, d_previous)
+    admin_rows = _calculate_admin_rows(wind_admin_views, cci_admin_view, gdf_admin, d_previous,
+                                       vuln_tiles_view=vulnerability_tiles_view)
     d.update(admin_rows)
 
     # Post-process facility counts: if no named at-risk facilities exist for a type,

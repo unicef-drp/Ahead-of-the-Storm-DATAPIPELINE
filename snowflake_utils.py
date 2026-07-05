@@ -587,7 +587,7 @@ def get_envelope_data_snowflake(track_id: str, forecast_time: str) -> pd.DataFra
     
     return df
 
-def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 1_500_000) -> list:
+def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 500_000) -> list:
     """
     Returns ISO codes of countries whose boundary is within buffer_m metres of the
     combined storm envelope for the given track_id and forecast_time.
