@@ -83,6 +83,7 @@ from country_utils import update_country_initialized
 # Import only Snowflake data retrieval functions
 from snowflake_utils import (
     get_envelopes_from_snowflake,
+    get_gust_envelopes_from_snowflake,
     convert_envelopes_to_geodataframe,
     get_snowflake_tracks,
     get_snowflake_connection
@@ -1839,7 +1840,7 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
     return gdf
 
 
-def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
+def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_column='wind_threshold'):
     """
     Create per-facility school impact views from hurricane envelopes.
 
@@ -1891,16 +1892,16 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     wind_views = {}
 
     num_ensembles = FULL_ENSEMBLE_SIZE
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
+    wind_ths = list(gdf_envelopes[threshold_column].unique())
     for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
             schools_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_schools_buff, zone_id_column='school_id_giga')
             try:
                 new_col = schools_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
-                logger.warning(f"Error mapping polygons for school view at {wind_th}kt: {e}")
+                logger.warning(f"Error mapping polygons for school view at {wind_th} ({threshold_column}): {e}")
                 probs = {k: 0.0 for k in schools_viewer.view['zone_id'].unique()}
             schools_viewer.add_variable_to_view(probs, 'probability')
 
@@ -1910,7 +1911,7 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes):
     return wind_views
 
 
-def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
+def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_column='wind_threshold'):
     """
     Create per-facility health center impact views from hurricane envelopes.
 
@@ -1966,16 +1967,16 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     wind_views = {}
 
     num_ensembles = FULL_ENSEMBLE_SIZE
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
+    wind_ths = list(gdf_envelopes[threshold_column].unique())
     for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
             hcs_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_hcs_buff, zone_id_column='osm_id')
             try:
                 new_col = hcs_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
-                logger.warning(f"Error mapping polygons for health center view at {wind_th}kt: {e}")
+                logger.warning(f"Error mapping polygons for health center view at {wind_th} ({threshold_column}): {e}")
                 probs = {k: 0.0 for k in hcs_viewer.view['zone_id'].unique()}
             hcs_viewer.add_variable_to_view(probs, 'probability')
 
@@ -1985,7 +1986,7 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes):
     return wind_views
 
 
-def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
+def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_column='wind_threshold'):
     """
     Create per-facility shelter impact views from hurricane envelopes.
 
@@ -2016,22 +2017,22 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes):
     gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
-    for wind_th in gdf_envelopes.wind_threshold.unique():
-        gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+    for wind_th in gdf_envelopes[threshold_column].unique():
+        gdf_env_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_env_wth.empty:
             viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_shelters_buff, zone_id_column='osm_id')
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
-                logger.warning(f"Error mapping polygons for shelter view at {wind_th}kt: {e}")
+                logger.warning(f"Error mapping polygons for shelter view at {wind_th} ({threshold_column}): {e}")
                 probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
             viewer.add_variable_to_view(probs, 'probability')
             wind_views[wind_th] = viewer.to_geodataframe()
     return wind_views
 
 
-def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
+def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='wind_threshold'):
     """
     Create per-facility WASH impact views from hurricane envelopes.
 
@@ -2064,22 +2065,22 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes):
     gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
-    for wind_th in gdf_envelopes.wind_threshold.unique():
-        gdf_env_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+    for wind_th in gdf_envelopes[threshold_column].unique():
+        gdf_env_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_env_wth.empty:
             viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_wash_buff, zone_id_column='osm_id')
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except Exception as e:
-                logger.warning(f"Error mapping polygons for WASH view at {wind_th}kt: {e}")
+                logger.warning(f"Error mapping polygons for WASH view at {wind_th} ({threshold_column}): {e}")
                 probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
             viewer.add_variable_to_view(probs, 'probability')
             wind_views[wind_th] = viewer.to_geodataframe()
     return wind_views
 
 
-def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
+def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_column='wind_threshold'):
     """
     Create mercator tile impact views from hurricane envelopes.
 
@@ -2096,9 +2097,9 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
     """
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
+    wind_ths = list(gdf_envelopes[threshold_column].unique())
     for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
@@ -2117,7 +2118,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
                 all_tile_ids = gdf_tiles['tile_id']
                 probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
             except Exception as e:
-                logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
+                logger.warning(f"map_polygons failed for {threshold_column}, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
@@ -2161,7 +2162,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes):
     return wind_views
 
 
-def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
+def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, threshold_column='wind_threshold'):
     if 'name' in gdf_admin.columns:
         d = gdf_admin.set_index('tile_id')['name'].to_dict()
     else:
@@ -2169,9 +2170,9 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
         d = {}
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
+    wind_ths = list(gdf_envelopes[threshold_column].unique())
     for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
             tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
             try:
@@ -2190,7 +2191,7 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
                 all_tile_ids = gdf_tiles['tile_id']
                 probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
             except Exception as e:
-                logger.warning(f"map_polygons failed for wind threshold, defaulting probabilities to 0: {e}")
+                logger.warning(f"map_polygons failed for {threshold_column}, defaulting probabilities to 0: {e}")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
@@ -2262,19 +2263,19 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes):
             df_view['name'] = df_view['tile_id'].map(d)
             missing_names = df_view['name'].isna().sum()
             if missing_names > 0:
-                logger.warning(f"  {missing_names} admin region(s) at {wind_th}kt have no name mapping (tile_id not in admin GeoDataFrame)")
+                logger.warning(f"  {missing_names} admin region(s) at {wind_th} ({threshold_column}) have no name mapping (tile_id not in admin GeoDataFrame)")
 
             wind_views[wind_th] = df_view
 
     return wind_views
 
 
-def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=None, gdf_wash=None):
+def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=None, gdf_wash=None, threshold_column='wind_threshold'):
     """Create tracks impact views from envelopes"""
     wind_views = {}
-    wind_ths = list(gdf_envelopes.wind_threshold.unique())
+    wind_ths = list(gdf_envelopes[threshold_column].unique())
     for wind_th in wind_ths:
-        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes.wind_threshold == int(wind_th)]
+        gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
 
         tracks_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_envelopes_wth, zone_id_column=index_column)
 
@@ -2331,12 +2332,15 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
 # (written once at --type initialize) and per-storm impact views (written on
 # every --type update). Grouped by facility type: schools, HCs, shelters, WASH.
 # =============================================================================
-def save_school_view(gdf, country, storm, date, wind_th):
+def save_school_view(gdf, country, storm, date, wind_th, dataset='wind'):
     """
     Save per-facility school impact view for a specific storm, date, and wind threshold.
 
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
-    Stored under: school_views/ in the configured data store.
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
+    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own school_views_gust/ dir).
+    The separate directory + 'g' prefix keep gust files structurally distinct
+    from wind (avoids collision with wind thresholds of the same numeric value,
+    and with any path-pattern-based downstream classification of school_views/).
 
     Note: This is distinct from the location cache (<COUNTRY>_schools.parquet).
     The impact view has one row per school with a 'probability' column; the
@@ -2348,13 +2352,16 @@ def save_school_view(gdf, country, storm, date, wind_th):
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Wind threshold in knots
+        wind_th: Threshold value (knots for wind, m/s for gust)
+        dataset: 'wind' (default) or 'gust'
     """
     if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
         gdf = gdf.copy()
         gdf['zone_id'] = gdf['zone_id'].astype(str)
-    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
+    dir_name = 'school_views_gust' if dataset == 'gust' else 'school_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 def save_school_locations(gdf, country):
     """
@@ -2394,12 +2401,12 @@ def school_exist(country):
     return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
 
 
-def save_hc_view(gdf, country, storm, date, wind_th):
+def save_hc_view(gdf, country, storm, date, wind_th, dataset='wind'):
     """
     Save per-facility health center impact view for a specific storm, date, and wind threshold.
 
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
-    Stored under: hc_views/ in the configured data store.
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
+    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own hc_views_gust/ dir).
 
     Note: This is distinct from the location cache (<COUNTRY>_health_centers.parquet).
     The impact view has one row per facility with a 'probability' column; the
@@ -2413,13 +2420,16 @@ def save_hc_view(gdf, country, storm, date, wind_th):
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Wind threshold in knots
+        wind_th: Threshold value (knots for wind, m/s for gust)
+        dataset: 'wind' (default) or 'gust'
     """
     if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
         gdf = gdf.copy()
         gdf['zone_id'] = gdf['zone_id'].astype(str)
-    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
+    dir_name = 'hc_views_gust' if dataset == 'gust' else 'hc_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 def save_hc_locations(gdf, country):
     """
@@ -2459,12 +2469,12 @@ def hc_exist(country):
     return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
 
 
-def save_shelter_view(gdf, country, storm, date, wind_th):
+def save_shelter_view(gdf, country, storm, date, wind_th, dataset='wind'):
     """
     Save per-facility shelter impact view for a specific storm, date, and wind threshold.
 
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
-    Stored under: shelter_views/ in the configured data store.
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
+    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own shelter_views_gust/ dir).
 
     Note: This is distinct from the location cache (<COUNTRY>_shelters.parquet).
     The impact view has one row per shelter with a 'probability' column; the
@@ -2475,13 +2485,16 @@ def save_shelter_view(gdf, country, storm, date, wind_th):
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Wind threshold in knots
+        wind_th: Threshold value (knots for wind, m/s for gust)
+        dataset: 'wind' (default) or 'gust'
     """
     if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
         gdf = gdf.copy()
         gdf['zone_id'] = gdf['zone_id'].astype(str)
-    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
+    dir_name = 'shelter_views_gust' if dataset == 'gust' else 'shelter_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 def save_shelter_locations(gdf, country):
     """
@@ -2521,12 +2534,12 @@ def shelter_exist(country):
     return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
 
 
-def save_wash_view(gdf, country, storm, date, wind_th):
+def save_wash_view(gdf, country, storm, date, wind_th, dataset='wind'):
     """
     Save per-facility WASH impact view for a specific storm, date, and wind threshold.
 
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet
-    Stored under: wash_views/ in the configured data store.
+    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
+    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own wash_views_gust/ dir).
 
     Note: This is distinct from the location cache (<COUNTRY>_wash.parquet).
     The impact view has one row per WASH facility with a 'probability' column; the
@@ -2537,13 +2550,16 @@ def save_wash_view(gdf, country, storm, date, wind_th):
         country: ISO3 country code
         storm: Storm name
         date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Wind threshold in knots
+        wind_th: Threshold value (knots for wind, m/s for gust)
+        dataset: 'wind' (default) or 'gust'
     """
     if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
         gdf = gdf.copy()
         gdf['zone_id'] = gdf['zone_id'].astype(str)
-    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
+    dir_name = 'wash_views_gust' if dataset == 'gust' else 'wash_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 def save_wash_locations(gdf, country):
     """
@@ -2757,12 +2773,16 @@ def save_admin_views(countries, rewrite=0, admin_level=1):
         view = create_admin_country_layer(country, rewrite, admin_level=admin_level)
         save_admin_view(view, country, admin_level=admin_level)
 
-def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level):
+def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level, dataset='wind'):
     """
-    Saves tiles views
+    Saves tiles views. dataset='gust' writes to mercator_views_gust/ with a
+    'g'-prefixed threshold token, keeping gust files structurally distinct
+    from wind (own directory, no numeric-threshold collision).
     """
-    file_name = f"{country}_{storm}_{date}_{wind_th}_{zoom_level}.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+    dir_name = 'mercator_views_gust' if dataset == 'gust' else 'mercator_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}_{zoom_level}.csv"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 
 def save_cci_tiles(gdf, country, storm, date, zoom_level):
@@ -2779,12 +2799,17 @@ def save_cci_tiles(gdf, country, storm, date, zoom_level):
     file_name = f"{country}_{storm}_{date}_{zoom_level}_cci.csv"
     write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
 
-def save_admin_tiles_view(gdf, country, storm, date, wind_th, admin_level=1):
+def save_admin_tiles_view(gdf, country, storm, date, wind_th, admin_level=1, dataset='wind'):
     """
-    Saves admin tiles views
+    Saves admin tiles views. dataset='gust' writes to admin_views_gust/ with a
+    'g'-prefixed threshold token, keeping gust files structurally distinct
+    from wind (own directory, so ADMIN_IMPACT_FILE_RE-style downstream parsers
+    that assume wind semantics never see them).
     """
-    file_name = f"{country}_{storm}_{date}_{wind_th}_admin{admin_level}.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
+    dir_name = 'admin_views_gust' if dataset == 'gust' else 'admin_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}_admin{admin_level}.csv"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 
 def save_cci_admin(gdf, country, storm, date, admin_level=1):
@@ -2844,12 +2869,16 @@ def load_admin_view(country, admin_level=1):
     return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name), data_store)
 
 
-def save_tracks_view(gdf, country, storm, date, wind_th):
+def save_tracks_view(gdf, country, storm, date, wind_th, dataset='wind'):
     """
-    Saves tracks views
+    Saves tracks views. dataset='gust' writes to track_views_gust/ with a
+    'g'-prefixed threshold token, keeping gust files structurally distinct
+    from wind.
     """
-    file_name = f"{country}_{storm}_{date}_{wind_th}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name))
+    dir_name = 'track_views_gust' if dataset == 'gust' else 'track_views'
+    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
+    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
+    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
 
 
 def save_vulnerability_tracks(df, country, storm, date, zoom_level):
@@ -3353,7 +3382,7 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
 # Top-level function called per country per storm on every --type update run.
 # Coordinates all view generation, CCI calculation, and report writing.
 # =============================================================================
-def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom):
+def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=None):
     """
     Create and save all impact views for a country from hurricane envelopes.
 
@@ -3368,6 +3397,8 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     - Child Cyclone Index (CCI) views (both tile and admin level)
     - Track views (severity metrics per ensemble member)
     - JSON impact report
+    - Gust envelope core exposure views (school/HC/shelter/WASH/tiles/admin/tracks
+      only, if gdf_envelopes_gust is provided; no CCI/vulnerability/report for gust)
 
     Args:
         country: ISO3 country code
@@ -3375,6 +3406,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
         gdf_envelopes: GeoDataFrame containing hurricane envelope geometries
         zoom: Zoom level for mercator tiles
+        gdf_envelopes_gust: Optional GeoDataFrame of gust envelope geometries
+            (same shape as gdf_envelopes, 'gust_threshold' column instead of
+            'wind_threshold'). None or empty means no gust data for this
+            storm/forecast, gust views are skipped, wind views are unaffected.
 
     Note:
         Base data (mercator tiles, admin views) are loaded if available, or created
@@ -3395,7 +3430,9 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # few envelope members that have since been cleaned up) from persisting on the stage.
     prefix = f"{country}_{storm}_{date}_"
     for view_dir in ('school_views', 'hc_views', 'shelter_views', 'wash_views',
-                     'mercator_views', 'admin_views', 'track_views'):
+                     'mercator_views', 'admin_views', 'track_views',
+                     'school_views_gust', 'hc_views_gust', 'shelter_views_gust', 'wash_views_gust',
+                     'mercator_views_gust', 'admin_views_gust', 'track_views_gust'):
         dir_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, view_dir)
         try:
             existing = data_store.list_files(dir_path)
@@ -3481,6 +3518,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
 
     # Admins — one pass per requested admin level
     logger.info(f"    Processing admins (levels: {admin_levels})...")
+    # Captured per level so the gust admin pass below can reuse them without
+    # recomputing admins_overlay() a second time.
+    gdf_admin_by_level = {}
+    gdf_tiles_for_admin_by_level = {}
     for admin_level in admin_levels:
         try:
             gdf_admin = load_admin_view(country, admin_level=admin_level)
@@ -3501,6 +3542,9 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             gdf_admin_boundaries = gdf_admin[['tile_id', 'geometry']].rename(columns={'tile_id': 'id'})
             gdf_tiles_for_admin = admins_overlay(gdf_admin_boundaries,
                                                  gdf_tiles.drop(columns=['id'], errors='ignore'))
+
+        gdf_admin_by_level[admin_level] = gdf_admin
+        gdf_tiles_for_admin_by_level[admin_level] = gdf_tiles_for_admin
 
         wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles_for_admin, gdf_envelopes)
         for wind_th in wind_admin_views:
@@ -3557,6 +3601,56 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date, wind_shelter_views=wind_shelter_views, wind_wash_views=wind_wash_views, vulnerability_tiles_view=vuln_tiles_view)
     save_json_report(json_report, country, storm, date)
 
+    # --- Gust envelopes (optional, core exposure views only) ---
+    # No CCI, vulnerability, or JSON report for gust
+    # Wrapped in its own try/except: wind processing above
+    # has already fully succeeded and saved, an uncaught exception here must not
+    # propagate to the per-country try/except in run_complete_impact_analysis(),
+    # which would otherwise discard the wind results from this same call.
+    if gdf_envelopes_gust is not None and not gdf_envelopes_gust.empty:
+        try:
+            logger.info(f"    Processing gust envelopes ({len(gdf_envelopes_gust)} records)...")
+
+            gust_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes_gust, threshold_column='gust_threshold')
+            for gth in gust_school_views:
+                save_school_view(gust_school_views[gth], country, storm, date, gth, dataset='gust')
+
+            gust_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes_gust, threshold_column='gust_threshold')
+            for gth in gust_hc_views:
+                save_hc_view(gust_hc_views[gth], country, storm, date, gth, dataset='gust')
+
+            gust_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes_gust, threshold_column='gust_threshold')
+            for gth in gust_shelter_views:
+                save_shelter_view(gust_shelter_views[gth], country, storm, date, gth, dataset='gust')
+
+            gust_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes_gust, threshold_column='gust_threshold')
+            for gth in gust_wash_views:
+                save_wash_view(gust_wash_views[gth], country, storm, date, gth, dataset='gust')
+
+            gust_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes_gust, threshold_column='gust_threshold')
+            for gth in gust_tiles_views:
+                save_tiles_view(gust_tiles_views[gth], country, storm, date, gth, zoom, dataset='gust')
+
+            for admin_level in admin_levels:
+                gust_admin_views = create_admin_view_from_envelopes_new(
+                    gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level],
+                    gdf_envelopes_gust, threshold_column='gust_threshold')
+                for gth in gust_admin_views:
+                    save_admin_tiles_view(gust_admin_views[gth], country, storm, date, gth,
+                                          admin_level=admin_level, dataset='gust')
+
+            gust_tracks_views = create_tracks_view_from_envelopes(
+                gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes_gust, index_column='ensemble_member',
+                gdf_shelters=gdf_shelters, gdf_wash=gdf_wash, threshold_column='gust_threshold')
+            for gth in gust_tracks_views:
+                save_tracks_view(gust_tracks_views[gth], country, storm, date, gth, dataset='gust')
+
+            logger.info(f"    Created gust views ({len(gust_school_views)} thresholds)")
+        except Exception as e:
+            logger.warning(f"    Gust envelope processing failed for {country}/{storm}/{date}, gust views skipped this run, wind views unaffected: {e}")
+    else:
+        logger.info(f"    No gust envelope data for {country}/{storm}/{date}, skipping gust views")
+
     return wrote_base_parquet
 
 
@@ -3587,4 +3681,34 @@ def load_envelopes_from_snowflake(storm, date):
 
     except Exception as e:
         logger.error(f"Error loading envelopes from Snowflake: {str(e)}")
+        return pd.DataFrame()
+
+def load_gust_envelopes_from_snowflake(storm, date):
+    """
+    Load gust envelope data directly from Snowflake (mirrors load_envelopes_from_snowflake).
+
+    Gust data is optional per storm/forecast (upstream extraction may not have
+    produced a gust polygon, or the storm may be too weak for any gust threshold
+    to register). Uses info/warning logging rather than error, and always returns
+    an empty DataFrame rather than raising, so callers can treat "no gust data"
+    as a normal, expected outcome rather than a failure.
+    """
+    if len(date) == 14:  # YYYYMMDDHHMMSS format
+        dt = pd.to_datetime(date, format="%Y%m%d%H%M%S")
+        forecast_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        forecast_time = date
+
+    try:
+        df_gust_envelopes = get_gust_envelopes_from_snowflake(storm, forecast_time)
+
+        if df_gust_envelopes.empty:
+            logger.info(f"No gust envelope data found in Snowflake for {storm} at {forecast_time}")
+            return pd.DataFrame()
+
+        gdf_gust_envelopes = convert_envelopes_to_geodataframe(df_gust_envelopes)
+        return gdf_gust_envelopes
+
+    except Exception as e:
+        logger.warning(f"Error loading gust envelopes from Snowflake: {str(e)}")
         return pd.DataFrame()

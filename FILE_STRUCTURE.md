@@ -320,6 +320,71 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 
 ---
 
+## Gust Impact Views (per country, per storm, per forecast, per gust threshold)
+
+Mirrors items 8, 9, 10, 11, 12, 14, and 18 above (core exposure views: school, HC, shelter,
+WASH, mercator tile, admin, tracks), using wind gust envelope polygons
+(`TC_GUST_ENVELOPES_COMBINED` in Snowflake, `GUST_THRESHOLD` column, 17/21/26/33/43/49/58/70 m/s)
+instead of sustained-wind envelopes. Produced by the same underlying `create_*_view_from_envelopes()`
+and `save_*_view()` functions as the wind views, called with `threshold_column='gust_threshold'`
+and `dataset='gust'` respectively, identical format and columns to their wind counterparts, only
+the source polygons and file location differ. Written into separate `*_views_gust` directories with
+a `g`-prefixed threshold token in the filename (e.g. `g43` instead of `43`) so gust files can never
+collide with, or be misclassified as, wind files by anything (this repo's own stale-file cleanup,
+`geosight/admin_related_table.py`'s admin-file regex, or ORCHESTRATION's stage-path-based MAT table
+loader) that scans the wind directories by path pattern.
+
+Gust processing runs automatically alongside wind during `--type update` whenever gust envelope data
+exists in Snowflake for that storm/forecast (`--skip-gust` disables it). If no gust data is available
+for a given storm/forecast (e.g. upstream extraction found no gust polygon, or the storm was too weak
+to register at any gust threshold), gust views are silently skipped for that run, wind views are
+produced normally either way, gust availability is fully independent of wind.
+
+### 29. Gust School Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/school_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/school_views_gust/PHL_BAVI_20260705000000_g43.parquet`
+- **Format:** Parquet (GeoDataFrame), same columns as item 8
+- **Created by:** `save_school_view(..., dataset='gust')`
+- **Note:** Multiple files per storm (one per gust threshold: 17, 21, 26, 33, 43, 49, 58, 70)
+
+### 30. Gust Health Center Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/hc_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/hc_views_gust/PHL_BAVI_20260705000000_g43.parquet`
+- **Format:** Parquet (GeoDataFrame), same columns as item 9
+- **Created by:** `save_hc_view(..., dataset='gust')`
+
+### 31. Gust Shelter Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/shelter_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/shelter_views_gust/PHL_BAVI_20260705000000_g43.parquet`
+- **Format:** Parquet (GeoDataFrame), same columns as item 10
+- **Created by:** `save_shelter_view(..., dataset='gust')`
+
+### 32. Gust WASH Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/wash_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/wash_views_gust/PHL_BAVI_20260705000000_g43.parquet`
+- **Format:** Parquet (GeoDataFrame), same columns as item 11
+- **Created by:** `save_wash_view(..., dataset='gust')`
+
+### 33. Gust Mercator Tile Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views_gust/{country}_{storm}_{date}_g{gust_threshold}_{zoom_level}.csv`
+- **Example:** `geodb/aos_views/mercator_views_gust/PHL_BAVI_20260705000000_g43_14.csv`
+- **Format:** CSV (DataFrame, no geometry), same `E_*`/`probability` columns as item 12
+- **Created by:** `save_tiles_view(..., dataset='gust')`
+
+### 34. Gust Admin Level Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_gust/{country}_{storm}_{date}_g{gust_threshold}_admin{N}.csv`
+- **Example:** `geodb/aos_views/admin_views_gust/PHL_BAVI_20260705000000_g43_admin1.csv`
+- **Format:** CSV (DataFrame, no geometry), same columns as item 14
+- **Created by:** `save_admin_tiles_view(..., dataset='gust')`
+
+### 35. Gust Track Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/track_views_gust/PHL_BAVI_20260705000000_g43.parquet`
+- **Format:** Parquet (GeoDataFrame), same `severity_*` columns as item 18
+- **Created by:** `save_tracks_view(..., dataset='gust')`
+
+---
+
 ## Complete Directory Structure Example
 
 ```
@@ -363,9 +428,23 @@ These files are downloaded automatically by the GigaSpatial library and stored i
     ├── wash_views/
     │   ├── {country}_wash.parquet                       # Cached WASH locations
     │   └── {country}_{storm}_{date}_{wind}.parquet      # WASH impact views
-    └── track_views/
-        ├── {country}_{storm}_{date}_{wind}.parquet                        # Track impact views (per wind threshold)
-        └── {country}_{storm}_{date}_{zoom}_vulnerability_tracks.parquet   # Per-member vulnerability totals
+    ├── track_views/
+    │   ├── {country}_{storm}_{date}_{wind}.parquet                        # Track impact views (per wind threshold)
+    │   └── {country}_{storm}_{date}_{zoom}_vulnerability_tracks.parquet   # Per-member vulnerability totals
+    ├── mercator_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}_{zoom}.csv        # Gust tile impact views
+    ├── admin_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}_admin{N}.csv      # Gust admin impact views
+    ├── school_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust school impact views
+    ├── hc_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust health center impact views
+    ├── shelter_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust shelter impact views
+    ├── wash_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust WASH impact views
+    └── track_views_gust/
+        └── {country}_{storm}_{date}_g{gust}.parquet           # Gust track impact views
 ```
 
 ---
@@ -379,6 +458,13 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 ### Wind Threshold Values
 - Common thresholds: `34`, `40`, `50`, `64`, `83`, `96`, `113`, `137`
 - Represent wind speeds in knots
+
+### Gust Threshold Values
+- Common thresholds: `17`, `21`, `26`, `33`, `43`, `49`, `58`, `70`
+- Represent gust speeds in m/s
+- Always written with a `g` prefix in filenames (e.g. `g43`) to distinguish from wind thresholds
+  of the same numeric value and to keep gust files out of any path-pattern-based classification
+  that assumes wind semantics
 
 ### Country Codes
 - ISO3 country codes (e.g., `DOM`, `ATG`, `BLZ`)

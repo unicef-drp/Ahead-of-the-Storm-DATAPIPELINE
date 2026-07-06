@@ -67,6 +67,7 @@ load_dotenv()
 # =============================================================================
 from impact_analysis import (
     load_envelopes_from_snowflake,
+    load_gust_envelopes_from_snowflake,
     is_envelope_in_zone,
     get_country_boundaries,
     create_views_from_envelopes_in_country,
@@ -113,7 +114,7 @@ def setup_logging(log_level="INFO"):
 # =============================================================================
 # IMPACT ANALYSIS FUNCTIONS
 # =============================================================================
-def run_complete_impact_analysis(storm, date, countries, logger, zoom):
+def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust=False):
     """
     Complete impact analysis orchestration.
 
@@ -122,12 +123,18 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
     Admin levels are determined automatically by which base admin parquets exist for each
     country (created during --type initialize).
 
+    Also loads gust envelope data (if available) and generates core exposure gust
+    views alongside the wind views, for the same affected countries. Gust data is
+    optional per storm/forecast; its absence never affects the wind results.
+
     Args:
         storm: Storm name (e.g., 'FUNG-WONG', 'JERRY')
         date: Forecast date in YYYYMMDDHHMMSS format (e.g., '20251110000000')
         countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
         logger: Logger instance for logging
         zoom: Zoom level for mercator tiles (default: 14)
+        skip_gust: If True, skip gust envelope processing even if gust data is
+            available (wind processing is unaffected either way)
 
     Returns:
         dict: Summary of analysis results with keys:
@@ -152,7 +159,12 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         
         logger.info(f"Loaded {len(gdf_envelopes)} envelope records")
         logger.info("Envelopes already converted to GeoDataFrame")
-        
+
+        # Gust envelopes are optional and independent of the wind path above.
+        gdf_envelopes_gust = pd.DataFrame() if skip_gust else load_gust_envelopes_from_snowflake(storm, date)
+        if not gdf_envelopes_gust.empty:
+            logger.info(f"Loaded {len(gdf_envelopes_gust)} gust envelope records")
+
         # --- SQL pre-filter: ask Snowflake which countries are within 500km ---
         affected_countries = []
         sql_prefilter_used = False
@@ -230,7 +242,8 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom):
         any_base_parquet_written = False
         for country in affected_countries:
             try:
-                wrote_base = create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom)
+                wrote_base = create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom,
+                                                                     gdf_envelopes_gust=gdf_envelopes_gust)
                 if wrote_base:
                     any_base_parquet_written = True
                 total_views += 4  # schools, health centers, tiles, tracks
@@ -324,7 +337,7 @@ class ImpactPipelineStats:
 # =============================================================================
 # PIPELINE EXECUTION FUNCTIONS
 # =============================================================================
-def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=False, log_level="INFO", zoom=14):
+def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=False, log_level="INFO", zoom=14, skip_gust=False):
     """
     Run the complete hurricane impact analysis pipeline for a single storm/forecast.
 
@@ -339,6 +352,8 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
         skip_analysis: If True, skip the analysis step (useful for testing)
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR). Default: INFO.
         zoom: Zoom level for mercator tiles. Default: 14.
+        skip_gust: If True, skip gust envelope processing even if gust data is
+            available (wind processing is unaffected either way)
     
     Returns:
         ImpactPipelineStats: Pipeline execution statistics object containing:
@@ -376,7 +391,7 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
                 analysis_date = forecast_time
             
             # Run complete impact analysis orchestration
-            analysis_result = run_complete_impact_analysis(storm, analysis_date, countries, logger, zoom)
+            analysis_result = run_complete_impact_analysis(storm, analysis_date, countries, logger, zoom, skip_gust=skip_gust)
             
             if analysis_result["success"]:
                 stats.analysis_success = True
@@ -636,7 +651,7 @@ def signal_pipeline_complete(conn, storm_ids: list, countries: list, files_writt
 # =============================================================================
 # UPDATE FUNCTIONS
 # =============================================================================
-def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta, target_date=None, target_storm=None):
+def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta, target_date=None, target_storm=None, skip_gust=False):
     """
     Update pipeline: Process hurricane data from Snowflake for matching storms.
 
@@ -661,6 +676,8 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         time_delta: Number of days in the past to consider storms (default: 2)
         target_date: Optional specific date to filter (YYYY-MM-DD format). Overrides time_delta.
         target_storm: Optional specific storm name to filter (e.g., 'FUNG-WONG')
+        skip_gust: If True, skip gust envelope processing even if gust data is
+            available (wind processing is unaffected either way)
 
     Returns:
         ImpactPipelineStats: Statistics object with execution results
@@ -765,7 +782,8 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
             countries=countries,
             skip_analysis=skip_analysis,
             log_level=log_level,
-            zoom=zoom
+            zoom=zoom,
+            skip_gust=skip_gust
         )
 
         if loop_stats.analysis_success:
@@ -996,7 +1014,13 @@ def main():
         action="store_true",
         help="Skip the analysis step (useful for testing pipeline structure without processing data)"
     )
-    
+
+    parser.add_argument(
+        "--skip-gust",
+        action="store_true",
+        help="Skip gust envelope processing even if gust data is available (wind processing is unaffected)"
+    )
+
     parser.add_argument(
         "--log-level",
         type=str,
@@ -1038,7 +1062,8 @@ def main():
                 rewrite=args.rewrite,
                 time_delta=args.time_delta,
                 target_date=args.date,
-                target_storm=args.storm
+                target_storm=args.storm,
+                skip_gust=args.skip_gust
             )
         elif args.type == "patch":
             if not args.columns:

@@ -112,6 +112,7 @@ python main_pipeline.py --type update
 - `--countries`: List of country codes to process (e.g., `TWN` or `DOM VNM`)
 - `--zoom` (default: 14): Zoom level for tiles
 - `--skip-analysis`: Skip analysis step (for testing)
+- `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
 
 **What it does:**
 - Connects to Snowflake and retrieves available storm data
@@ -143,6 +144,11 @@ python main_pipeline.py --type update
      - Admin-level impact views (aggregated to admin level 1)
      - CCI views (Child Cyclone Index values)
      - Track views (severity metrics per ensemble member)
+     - Gust views: the same per-facility, tile, admin, and track views mirrored for wind gust
+       envelopes (17-70 m/s thresholds), written to separate `*_views_gust/` directories with a
+       `g`-prefixed threshold token. Runs automatically whenever gust data exists for the
+       storm/forecast (disable with `--skip-gust`). No CCI, vulnerability, or JSON report for
+       gust; see `FILE_STRUCTURE.md` for the full gust file reference.
    - Generates JSON impact reports
    - Marks storm as processed in `storms.json`
 
@@ -267,6 +273,7 @@ The pipeline supports three storage backends (configured via `DATA_PIPELINE_DB`)
 - **Tile impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/`
 - **Admin impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/`
 - **CCI views:** `mercator_views/` and `admin_views/` (with `_cci` suffix)
+- **Gust impact views:** `school_views_gust/`, `hc_views_gust/`, `shelter_views_gust/`, `wash_views_gust/`, `mercator_views_gust/`, `admin_views_gust/`, `track_views_gust/` (mirror the wind directories, `g`-prefixed thresholds, no CCI/vulnerability/JSON report)
 - **Custom data overrides:** `{ROOT_DATA_DIR}/custom/` — place `<COUNTRY>_<type>.csv` here (see `custom_data/README.md`)
 - **Impact reports:** `{RESULTS_DIR}/jsons/` (JSON files per country/storm/forecast)
 - **Processed storms:** `{ROOT_DATA_DIR}/{STORMS_FILE}` (default: `geodb/storms.json`)

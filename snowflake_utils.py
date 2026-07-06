@@ -412,7 +412,7 @@ def get_envelopes_from_snowflake(track_id: str, forecast_time: str) -> pd.DataFr
     forecast_datetime = _normalize_forecast_time(forecast_time)
     
     query = """
-    SELECT 
+    SELECT
         FORECAST_TIME,
         TRACK_ID,
         ENSEMBLE_MEMBER,
@@ -423,7 +423,43 @@ def get_envelopes_from_snowflake(track_id: str, forecast_time: str) -> pd.DataFr
     WHERE TRACK_ID = %s AND FORECAST_TIME = %s
     ORDER BY ENSEMBLE_MEMBER, WIND_THRESHOLD
     """
-    
+
+    return _execute_query(query, params=[track_id, forecast_datetime])
+
+def get_gust_envelopes_from_snowflake(track_id: str, forecast_time: str) -> pd.DataFrame:
+    """
+    Get gust envelope data from Snowflake TC_GUST_ENVELOPES_COMBINED table.
+
+    Mirrors get_envelopes_from_snowflake(), substituting GUST_THRESHOLD for
+    WIND_THRESHOLD (same table shape otherwise, populated by the same
+    upstream TC-ECMWF pipeline run as the wind envelopes).
+
+    Args:
+        track_id: Storm identifier (e.g., 'JERRY', 'FUNG-WONG')
+        forecast_time: Forecast time (e.g., '2025-10-10 00:00:00' or '20251010000000')
+
+    Returns:
+        pd.DataFrame: Gust envelope data with columns:
+            - FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER
+            - LEAD_TIME_RANGE, GUST_THRESHOLD
+            - ENVELOPE_REGION (WKT format)
+        Returns empty DataFrame on error, or if no gust data exists for this storm/forecast.
+    """
+    forecast_datetime = _normalize_forecast_time(forecast_time)
+
+    query = """
+    SELECT
+        FORECAST_TIME,
+        TRACK_ID,
+        ENSEMBLE_MEMBER,
+        LEAD_TIME_RANGE,
+        GUST_THRESHOLD,
+        ST_ASWKT(ENVELOPE_REGION) AS ENVELOPE_REGION
+    FROM TC_GUST_ENVELOPES_COMBINED
+    WHERE TRACK_ID = %s AND FORECAST_TIME = %s
+    ORDER BY ENSEMBLE_MEMBER, GUST_THRESHOLD
+    """
+
     return _execute_query(query, params=[track_id, forecast_datetime])
 
 def convert_envelopes_to_geodataframe(envelopes_df: pd.DataFrame) -> gpd.GeoDataFrame:
@@ -463,12 +499,18 @@ def convert_envelopes_to_geodataframe(envelopes_df: pd.DataFrame) -> gpd.GeoData
     # Create GeoDataFrame
     gdf = gpd.GeoDataFrame(envelopes_df, geometry=geometries, crs='EPSG:4326')
     
-    # Rename columns to lowercase for consistency with processing functions
+    # Rename columns to lowercase for consistency with processing functions.
+    # Auto-detect wind vs. gust from whichever threshold column is present,
+    # both get_envelopes_from_snowflake() (WIND_THRESHOLD) and
+    # get_gust_envelopes_from_snowflake() (GUST_THRESHOLD) route through here.
     column_mapping = {
         'ENSEMBLE_MEMBER': 'ensemble_member',
-        'WIND_THRESHOLD': 'wind_threshold',
         'ENVELOPE_REGION': 'envelope_region'
     }
+    if 'WIND_THRESHOLD' in gdf.columns:
+        column_mapping['WIND_THRESHOLD'] = 'wind_threshold'
+    elif 'GUST_THRESHOLD' in gdf.columns:
+        column_mapping['GUST_THRESHOLD'] = 'gust_threshold'
     gdf = gdf.rename(columns=column_mapping)
     
     # Remove rows with invalid geometries
