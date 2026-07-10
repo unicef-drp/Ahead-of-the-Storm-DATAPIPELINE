@@ -48,9 +48,12 @@ pip install -r requirements.txt
 - ROOT_DATA_DIR (default: `geodb`)
 - VIEWS_DIR (default: `aos_views`)
 - SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
-- DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` for Azure, `SNOWFLAKE` for Snowflake stage)
+- DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` for Azure, `SNOWFLAKE` for Snowflake stage) — where THIS repo's own output/cache is written
   - If `BLOB`, also set: `ACCOUNT_URL`, `SAS_TOKEN`
   - If `SNOWFLAKE`, also set: `SNOWFLAKE_STAGE_NAME` (stage must exist in the database/schema)
+- HAZARD_DATA_SOURCE (`SNOWFLAKE` by default; use `LOCAL` or `BLOB` to read upstream hurricane wind/gust/tracks/precip data from somewhere other than Snowflake) — independent of `DATA_PIPELINE_DB`, mainly a local dev/testing convenience
+  - If `LOCAL`, also set: `HAZARD_LOCAL_WIND_DIR`, `HAZARD_LOCAL_TRACKS_DIR`, `HAZARD_LOCAL_MET_DIR` (point at TC-ECMWF-Forecast-Pipeline's own local output directories)
+  - If `BLOB`, also set: `HAZARD_BLOB_ACCOUNT_URL`, `HAZARD_BLOB_SAS_TOKEN`, `HAZARD_BLOB_CONTAINER` (separate from this app's own `ACCOUNT_URL`/`SAS_TOKEN` above)
 
 ### API tokens
 - GIGA_SCHOOL_LOCATION_API_KEY (required to fetch school locations)

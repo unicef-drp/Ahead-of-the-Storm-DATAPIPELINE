@@ -85,12 +85,15 @@ from gigaspatial.core.io.local_data_store import LocalDataStore
 from data_store_utils import get_data_store
 from country_utils import update_country_initialized
 
-# Import only Snowflake data retrieval functions
+# Import hazard source data retrieval functions. get_envelopes/get_gust_envelopes/
+# get_tracks dispatch to Snowflake or LOCAL/BLOB based on config.HAZARD_DATA_SOURCE
+# (see snowflake_utils.py's "HAZARD_DATA_SOURCE DISPATCH" section); get_snowflake_connection
+# is unrelated (used only for the country pre-filter, always Snowflake).
 from snowflake_utils import (
-    get_envelopes_from_snowflake,
-    get_gust_envelopes_from_snowflake,
+    get_envelopes,
+    get_gust_envelopes,
     convert_envelopes_to_geodataframe,
-    get_snowflake_tracks,
+    get_tracks,
     get_snowflake_connection
 )
 
@@ -4189,7 +4192,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     files_written += len(wind_tracks_views)
     logger.info(f"    Created {len(wind_tracks_views)} track views")
 
-    df_tracks = get_snowflake_tracks(date, storm)
+    df_tracks = get_tracks(date, storm)
     gdf_tracks = convert_to_geodataframe(df_tracks)
 
     json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date, wind_shelter_views=wind_shelter_views, wind_wash_views=wind_wash_views, vulnerability_tiles_view=vuln_tiles_view)
@@ -4270,11 +4273,11 @@ def load_envelopes_from_snowflake(storm, date):
         forecast_time = date
     
     try:
-        # Get envelope data from Snowflake
-        df_envelopes = get_envelopes_from_snowflake(storm, forecast_time)
-        
+        # Get envelope data (Snowflake or LOCAL/BLOB per config.HAZARD_DATA_SOURCE)
+        df_envelopes = get_envelopes(storm, forecast_time)
+
         if df_envelopes.empty:
-            logger.error(f"No envelope data found in Snowflake for {storm} at {forecast_time}")
+            logger.error(f"No envelope data found for {storm} at {forecast_time}")
             return pd.DataFrame()
 
         # Convert to GeoDataFrame
@@ -4282,7 +4285,7 @@ def load_envelopes_from_snowflake(storm, date):
         return gdf_envelopes
 
     except Exception as e:
-        logger.error(f"Error loading envelopes from Snowflake: {str(e)}")
+        logger.error(f"Error loading envelopes: {str(e)}")
         return pd.DataFrame()
 
 def load_gust_envelopes_from_snowflake(storm, date):
@@ -4302,15 +4305,15 @@ def load_gust_envelopes_from_snowflake(storm, date):
         forecast_time = date
 
     try:
-        df_gust_envelopes = get_gust_envelopes_from_snowflake(storm, forecast_time)
+        df_gust_envelopes = get_gust_envelopes(storm, forecast_time)
 
         if df_gust_envelopes.empty:
-            logger.info(f"No gust envelope data found in Snowflake for {storm} at {forecast_time}")
+            logger.info(f"No gust envelope data found for {storm} at {forecast_time}")
             return pd.DataFrame()
 
         gdf_gust_envelopes = convert_envelopes_to_geodataframe(df_gust_envelopes)
         return gdf_gust_envelopes
 
     except Exception as e:
-        logger.warning(f"Error loading gust envelopes from Snowflake: {str(e)}")
+        logger.warning(f"Error loading gust envelopes: {str(e)}")
         return pd.DataFrame()

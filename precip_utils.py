@@ -4,11 +4,17 @@ Precipitation/Runoff Utilities Module
 
 Reads ambient global precipitation (tp) and runoff (ro) ensemble forecasts,
 produced every pipeline cycle by TC-ECMWF-Forecast-Pipeline regardless of
-whether any named storm is active. Data lands in Snowflake as a pointer
-table (MET_FORECASTS) referencing dense Zarr files on the stage, one file
-per param per forecast cycle, each holding a (51-member, 25-step) accumulated
-grid. This module downloads and reads those Zarr files, and computes
-exceedance-probability grids from them.
+whether any named storm is active. By default (config.HAZARD_DATA_SOURCE=
+SNOWFLAKE), data lands in Snowflake as a pointer table (MET_FORECASTS)
+referencing dense Zarr files on the stage, one file per param per forecast
+cycle, each holding a (51-member, 25-step) accumulated grid. When
+HAZARD_DATA_SOURCE is LOCAL/BLOB, the same Zarr files are read directly from
+TC-ECMWF-Forecast-Pipeline's own met_data/ output instead (see
+get_hazard_met_data_store()/get_latest_met_forecast_local()/
+get_met_forecast_for_date_local() below) -- get_latest_met_forecast()/
+get_met_forecast_for_date() dispatch between the two automatically. This
+module downloads and reads those Zarr files, and computes exceedance-
+probability grids from them.
 
 Usage:
     from precip_utils import get_latest_met_forecast, read_precip_window, \
@@ -19,11 +25,14 @@ Usage:
 """
 
 import os
+import re
 import tempfile
 import logging
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import rasterio
 import zarr
 
@@ -68,7 +77,7 @@ def get_met_forecasts_data_store():
         stage_name=app_config.SNOWFLAKE_STAGE_NAME,
     )
 
-def get_latest_met_forecast(param: str) -> Optional[dict]:
+def get_latest_met_forecast_snowflake(param: str) -> Optional[dict]:
     """
     Latest MET_FORECASTS row for a param ('tp' or 'ro').
 
@@ -95,7 +104,7 @@ def get_latest_met_forecast(param: str) -> Optional[dict]:
     }
 
 
-def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
+def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dict]:
     """
     MET_FORECASTS row for a param ('tp' or 'ro') on a specific calendar date,
     for historical backfills (--type update --date ...). MET_FORECASTS
@@ -108,7 +117,7 @@ def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
 
     If multiple cycles exist for that calendar date (e.g. 00Z and 12Z), the
     latest one on that date is used, same "latest wins" tie-break as
-    get_latest_met_forecast() uses across the whole table.
+    get_latest_met_forecast_snowflake() uses across the whole table.
 
     Args:
         param: 'tp' (total precipitation) or 'ro' (runoff).
@@ -135,6 +144,94 @@ def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
         'forecast_time': row['FORECAST_TIME'],
         'stage_path': row['STAGE_PATH'],
     }
+
+
+# =============================================================================
+# HAZARD_DATA_SOURCE=LOCAL/BLOB: read the same tp/ro Zarr files directly from
+# TC-ECMWF-Forecast-Pipeline's own met_data/ output instead of MET_FORECASTS.
+# Path convention confirmed directly against ecmwf_met_downloader.py:
+# `run_str = f'{forecast_date:%Y%m%d}_{run_time:02d}'`,
+# `zip_path = output_dir / f'{param}_{run_str}.zarr.zip'` -- flat, no
+# subdirectory, matching real sample files (met_data/tp_20260701_18.zarr.zip).
+# =============================================================================
+
+_MET_FILENAME_RE = re.compile(r'^([a-z]+)_(\d{8})_(\d{2})\.zarr\.zip$')
+
+
+def get_hazard_met_data_store():
+    """
+    Data store for reading MET_FORECASTS-equivalent precip/runoff Zarr files,
+    governed by config.HAZARD_DATA_SOURCE. SNOWFLAKE (default) is identical
+    to get_met_forecasts_data_store(); LOCAL/BLOB read TC-ECMWF-Forecast-
+    Pipeline's own met_data/ output instead.
+    """
+    if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
+        return get_met_forecasts_data_store()
+    from data_store_utils import get_hazard_data_store
+    if app_config.HAZARD_DATA_SOURCE == 'LOCAL':
+        return get_hazard_data_store(base_path=app_config.HAZARD_LOCAL_MET_DIR)
+    return get_hazard_data_store()  # BLOB -- shared container, files under 'met/'
+
+
+def _list_local_met_files(param: str):
+    """Returns [(forecast_time datetime, relative_path), ...] for a given
+    param, found in the configured LOCAL/BLOB met directory. Empty list if
+    the directory can't be listed or has no matching files -- an expected
+    outcome (e.g. before the first cycle), not an error."""
+    data_store = get_hazard_met_data_store()
+    search_dir = '.' if app_config.HAZARD_DATA_SOURCE == 'LOCAL' else 'met'
+    try:
+        files = data_store.list_files(search_dir)
+    except Exception as e:
+        logger.info(f"Could not list local/blob met files at '{search_dir}': {e}")
+        return []
+
+    results = []
+    for f in files:
+        basename = f.rsplit('/', 1)[-1]
+        m = _MET_FILENAME_RE.match(basename)
+        if not m or m.group(1) != param:
+            continue
+        dt = datetime.strptime(f"{m.group(2)}{m.group(3)}", "%Y%m%d%H")
+        results.append((dt, f))
+    return results
+
+
+def get_latest_met_forecast_local(param: str) -> Optional[dict]:
+    """LOCAL/BLOB equivalent of get_latest_met_forecast_snowflake()."""
+    candidates = _list_local_met_files(param)
+    if not candidates:
+        logger.info(f"No local/blob met files found for param='{param}'")
+        return None
+    dt, path = max(candidates, key=lambda c: c[0])
+    return {'forecast_time': dt, 'stage_path': path}
+
+
+def get_met_forecast_for_date_local(param: str, target_date) -> Optional[dict]:
+    """LOCAL/BLOB equivalent of get_met_forecast_for_date_snowflake()."""
+    target = pd.to_datetime(target_date).date()
+    candidates = [(dt, path) for dt, path in _list_local_met_files(param) if dt.date() == target]
+    if not candidates:
+        logger.info(f"No local/blob met files found for param='{param}' on {target_date}")
+        return None
+    dt, path = max(candidates, key=lambda c: c[0])
+    return {'forecast_time': dt, 'stage_path': path}
+
+
+def get_latest_met_forecast(param: str) -> Optional[dict]:
+    """Dispatches to get_latest_met_forecast_snowflake() or
+    get_latest_met_forecast_local() based on config.HAZARD_DATA_SOURCE."""
+    if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
+        return get_latest_met_forecast_snowflake(param)
+    return get_latest_met_forecast_local(param)
+
+
+def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
+    """Dispatches to get_met_forecast_for_date_snowflake() or
+    get_met_forecast_for_date_local() based on config.HAZARD_DATA_SOURCE."""
+    if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
+        return get_met_forecast_for_date_snowflake(param, target_date)
+    return get_met_forecast_for_date_local(param, target_date)
 
 
 # =============================================================================

@@ -87,3 +87,39 @@ def get_data_store():
             f"Unrecognized DATA_PIPELINE_DB value: '{data_pipeline_db}' "
             f"(expected LOCAL, BLOB, or SNOWFLAKE)"
         )
+
+
+def get_hazard_data_store(base_path: str = ''):
+    """
+    Data store for reading upstream hazard source data (wind/gust envelopes,
+    tracks, precip/runoff), governed by HAZARD_DATA_SOURCE, independent of
+    DATA_PIPELINE_DB, which only governs this repo's own output/cache.
+
+    Only called when HAZARD_DATA_SOURCE is LOCAL or BLOB (the SNOWFLAKE case
+    keeps using the existing direct-query functions in snowflake_utils.py/
+    precip_utils.py unchanged, no data store needed).
+
+    Args:
+        base_path: for LOCAL only, the specific directory this call needs
+            (wind, tracks, or met — they can differ), passed to LocalDataStore
+            so callers can use paths relative to that directory.
+
+    Returns:
+        DataStore: LocalDataStore or ADLSDataStore instance.
+    """
+    app_config.validate_hazard_data_source_config()
+    hazard_data_source = app_config.HAZARD_DATA_SOURCE
+
+    if hazard_data_source == 'LOCAL':
+        return LocalDataStore(base_path=base_path)
+    elif hazard_data_source == 'BLOB':
+        return ADLSDataStore(
+            container=app_config.HAZARD_BLOB_CONTAINER,
+            account_url=app_config.HAZARD_BLOB_ACCOUNT_URL,
+            sas_token=app_config.HAZARD_BLOB_SAS_TOKEN,
+        )
+    else:
+        raise ValueError(
+            f"get_hazard_data_store() should only be called for HAZARD_DATA_SOURCE "
+            f"LOCAL or BLOB, got '{hazard_data_source}'"
+        )

@@ -109,7 +109,7 @@ from precip_utils import (
     read_precip_window,
     exceedance_probability,
     ratio_exceedance_probability,
-    get_met_forecasts_data_store,
+    get_hazard_met_data_store,
 )
 
 # Import gigaspatial for buffering
@@ -405,7 +405,7 @@ def run_precip_analysis(countries, logger, zoom=14, target_date=None):
             None (default) uses the latest available cycle, matching normal
             (non-backfill) --type update behavior.
     """
-    met_data_store = get_met_forecasts_data_store()
+    met_data_store = get_hazard_met_data_store()
 
     if target_date is not None:
         tp_row = get_met_forecast_for_date('tp', target_date)
