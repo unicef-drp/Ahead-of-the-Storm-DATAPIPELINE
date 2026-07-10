@@ -20,6 +20,7 @@ def get_active_countries_from_snowflake():
     Returns:
         list: List of active country codes (e.g., ['TWN', 'DOM', 'VNM'])
     """
+    conn = None
     try:
         conn = get_snowflake_connection()
         query = """
@@ -30,8 +31,7 @@ def get_active_countries_from_snowflake():
             ORDER BY COUNTRY_CODE
         """
         df = pd.read_sql(query, conn)
-        conn.close()
-        
+
         countries = df['COUNTRY_CODE'].tolist()
         logger.info(f"Retrieved {len(countries)} active countries from Snowflake: {', '.join(countries)}")
         return countries
@@ -39,6 +39,9 @@ def get_active_countries_from_snowflake():
         logger.error(f"Error retrieving countries from Snowflake: {e}")
         logger.warning("Falling back to empty list")
         return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 def get_all_countries_from_snowflake(include_inactive=False):
     """
@@ -50,19 +53,22 @@ def get_all_countries_from_snowflake(include_inactive=False):
     Returns:
         pandas.DataFrame: DataFrame with country information
     """
+    conn = None
     try:
         conn = get_snowflake_connection()
         if include_inactive:
             query = "SELECT * FROM PIPELINE_COUNTRIES ORDER BY COUNTRY_CODE"
         else:
             query = "SELECT * FROM PIPELINE_COUNTRIES WHERE ACTIVE = TRUE AND (IS_REGION IS NULL OR IS_REGION = FALSE) ORDER BY COUNTRY_CODE"
-        
+
         df = pd.read_sql(query, conn)
-        conn.close()
         return df
     except Exception as e:
         logger.error(f"Error retrieving countries from Snowflake: {e}")
         return pd.DataFrame()
+    finally:
+        if conn is not None:
+            conn.close()
 
 def _resolve_country_name(country_code: str) -> str:
     """Return the official country name for an ISO3 code, or the code itself if not found."""
@@ -299,16 +305,17 @@ def get_countries_needing_initialization(zoom_level=None):
     Returns:
         list: List of country codes that need initialization
     """
+    conn = None
     try:
         conn = get_snowflake_connection()
-        
+
         if zoom_level is None:
             # Get countries that haven't been initialized at their default zoom level
             query = """
-                SELECT c.COUNTRY_CODE 
+                SELECT c.COUNTRY_CODE
                 FROM PIPELINE_COUNTRIES c
-                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z 
-                    ON c.COUNTRY_CODE = z.COUNTRY_CODE 
+                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z
+                    ON c.COUNTRY_CODE = z.COUNTRY_CODE
                     AND c.ZOOM_LEVEL = z.ZOOM_LEVEL
                 WHERE c.ACTIVE = TRUE
                   AND (c.IS_REGION IS NULL OR c.IS_REGION = FALSE)
@@ -328,17 +335,19 @@ def get_countries_needing_initialization(zoom_level=None):
                   AND z.LAST_INITIALIZED IS NULL
                 ORDER BY c.COUNTRY_CODE
             """
-        
+
         if zoom_level is None:
             df = pd.read_sql(query, conn)
         else:
             df = pd.read_sql(query, conn, params=[zoom_level])
-        
-        conn.close()
+
         return df['COUNTRY_CODE'].tolist()
     except Exception as e:
         logger.error(f"Error retrieving countries needing initialization: {e}")
         return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 def get_initialized_zoom_levels(country_code):
     """
@@ -350,20 +359,23 @@ def get_initialized_zoom_levels(country_code):
     Returns:
         list: List of initialized zoom levels
     """
+    conn = None
     try:
         conn = get_snowflake_connection()
         query = """
-            SELECT ZOOM_LEVEL 
-            FROM PIPELINE_COUNTRY_ZOOM_LEVELS 
+            SELECT ZOOM_LEVEL
+            FROM PIPELINE_COUNTRY_ZOOM_LEVELS
             WHERE COUNTRY_CODE = %s
             ORDER BY ZOOM_LEVEL
         """
         df = pd.read_sql(query, conn, params=[country_code])
-        conn.close()
         return df['ZOOM_LEVEL'].tolist()
     except Exception as e:
         logger.error(f"Error retrieving initialized zoom levels for {country_code}: {e}")
         return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 def get_countries_needing_zoom_level(country_code, zoom_level):
     """

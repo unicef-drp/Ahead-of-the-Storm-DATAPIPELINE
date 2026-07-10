@@ -75,6 +75,41 @@ from impact_analysis import (
     save_json_storms,
     load_json_storms,
     patch_country_layer,
+    load_mercator_view,
+    load_admin_view,
+    get_initialized_admin_levels,
+    admins_overlay,
+    create_precip_tile_view,
+    create_precip_admin_view,
+    create_precip_facility_view,
+    grid_to_geotiff_to_tifprocessor,
+    save_precip_tile_view,
+    save_precip_admin_view,
+    save_precip_ratio_view,
+    save_precip_ratio_admin_view,
+    save_precip_school_view,
+    save_precip_ratio_school_view,
+    save_precip_hc_view,
+    save_precip_ratio_hc_view,
+    save_precip_shelter_view,
+    save_precip_ratio_shelter_view,
+    save_precip_wash_view,
+    save_precip_ratio_wash_view,
+    fetch_schools,
+    fetch_health_centers,
+    fetch_shelters,
+    fetch_wash,
+    _ensure_unique_zone_ids,
+    HC_FACILITY_TYPES,
+    assign_facilities_to_tiles,
+)
+from precip_utils import (
+    get_latest_met_forecast,
+    get_met_forecast_for_date,
+    read_precip_window,
+    exceedance_probability,
+    ratio_exceedance_probability,
+    get_met_forecasts_data_store,
 )
 
 # Import gigaspatial for buffering
@@ -168,12 +203,12 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
         # --- SQL pre-filter: ask Snowflake which countries are within 500km ---
         affected_countries = []
         sql_prefilter_used = False
+        conn_prefilter = None
         try:
             conn_prefilter = get_snowflake_connection()
             cursor_prefilter = conn_prefilter.cursor()
             sql_countries = get_countries_in_range(cursor_prefilter, storm, date)
             cursor_prefilter.close()
-            conn_prefilter.close()
             # Trust SQL result whether empty or not — empty means confirmed out-of-range.
             # Only fall back to Python if the query itself raises (connection/auth failure).
             affected_countries = [c for c in sql_countries if c in countries]
@@ -184,6 +219,9 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
                 logger.info("SQL pre-filter: no countries within 500km — skipping storm")
         except Exception as e:
             logger.warning(f"SQL pre-filter failed ({e}) — falling back to Python buffer check")
+        finally:
+            if conn_prefilter is not None:
+                conn_prefilter.close()
 
         # --- Python fallback: 500km buffer per country (original logic) ---
         if not sql_prefilter_used:
@@ -242,11 +280,11 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
         any_base_parquet_written = False
         for country in affected_countries:
             try:
-                wrote_base = create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom,
-                                                                     gdf_envelopes_gust=gdf_envelopes_gust)
+                wrote_base, country_files_written = create_views_from_envelopes_in_country(
+                    country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=gdf_envelopes_gust)
                 if wrote_base:
                     any_base_parquet_written = True
-                total_views += 4  # schools, health centers, tiles, tracks
+                total_views += country_files_written
                 succeeded_countries.append(country)
             except Exception as country_exc:
                 import traceback as _tb
@@ -268,6 +306,7 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
         # refresh the base layer MATs immediately (they are normally only refreshed
         # after --type initialize or --type patch).
         if any_base_parquet_written and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+            _conn = None
             try:
                 _conn = get_snowflake_connection()
                 _cur = _conn.cursor()
@@ -275,13 +314,15 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
                 _cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
                 _result = _cur.fetchone()[0]
                 _cur.close()
-                _conn.close()
                 if _result.startswith('PARTIAL') or 'errors:' in _result:
                     logger.warning(f"Base layer MAT refresh had failures after emergency fallback: {_result}")
                 else:
                     logger.info(f"Base layer MATs refreshed after emergency fallback during update: {_result}")
             except Exception as e:
                 logger.error(f"Could not refresh base layer tables after emergency fallback: {e}")
+            finally:
+                if _conn is not None:
+                    _conn.close()
 
         return {
             "success": True,
@@ -300,6 +341,307 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
 
 
 # =============================================================================
+# PRECIPITATION/RUNOFF ANALYSIS (storm-independent)
+# =============================================================================
+
+# Four countable-impact windows, hours from T+0. 6h is the standard
+# flash-flood-response window; 24h short-term outlook; 72h "next few days"
+# (close to GloFAS's own first Flood Summary tier); 120h (5 days) matches
+# the OCHA ROWCA reference used to anchor the tp thresholds below.
+PRECIP_WINDOWS_H = [6, 24, 72, 120]
+
+# tp exceedance thresholds (mm), per window: moderate/heavy/extreme.
+# Heavy@6h (50mm) is the UK Extreme Rainfall Alert figure; the whole 120h row
+# is OCHA ROWCA's own moderate/heavy/extreme scale. Both real, independently
+# verifiable anchors. Every other cell is a power-law fit (E = alpha * D^beta)
+# sharing one beta=0.2313 (fit from the only tier with two real anchors,
+# heavy), scaled per tier from its own real 120h anchor. See the "Thresholds
+# and aggregation windows" section of the precip integration plan for the
+# full derivation and sourcing.
+PRECIP_TP_THRESHOLDS_MM = {
+    6:   [25, 50, 75],
+    24:  [35, 70, 103],
+    72:  [45, 90, 133],
+    120: [50, 100, 150],
+}
+
+# ro/tp ratio exceedance tiers: dimensionless cut points on the ro/tp ratio,
+# not a fixed mm threshold (no real flood-forecasting system uses one, see
+# WMO's Global Flash Flood Guidance System). Grounded in the Rational Method
+# runoff coefficient (C) reference table (civil-engineering stormwater
+# design standard): 0.3 sits at the entry point of "meaningfully elevated"
+# runoff response, 0.6 at "majority of the rain becomes runoff".
+RATIO_THRESHOLDS = [0.3, 0.6]
+
+# Below this accumulated tp, a member's ro/tp ratio is treated as 0
+# (negligible rain means negligible runoff-response signal from that
+# member, not an excluded observation).
+RATIO_MIN_TP_MM = 5.0
+
+
+def run_precip_analysis(countries, logger, zoom=14, target_date=None):
+    """
+    Storm-independent precipitation/runoff analysis, run once per --type
+    update invocation, not once per storm. Reads the tp/ro Zarr forecast
+    from MET_FORECASTS (ambient global data, produced every pipeline cycle
+    regardless of storm activity) and produces tp exceedance-probability
+    tiles/admin views plus ro/tp ratio exceedance-probability tiles/admin
+    views, at four windows.
+
+    A precip failure never affects storm (wind/gust) processing and vice
+    versa.
+
+    Args:
+        countries: List of ISO3 country codes to process (every initialized
+            country, not a storm's affected-country list — precip applies
+            unconditionally everywhere).
+        logger: Logger instance.
+        zoom: Mercator tile zoom level (default: 14, matches wind/gust).
+        target_date: Optional specific date (YYYY-MM-DD or date) to backfill
+            against, mirroring update_storms()'s own target_date. MET_FORECASTS
+            retains one row per past forecast cycle (same as
+            TC_ENVELOPES_COMBINED retains historical envelopes), so a
+            historical cycle's Zarr file is genuinely available to re-read.
+            None (default) uses the latest available cycle, matching normal
+            (non-backfill) --type update behavior.
+    """
+    met_data_store = get_met_forecasts_data_store()
+
+    if target_date is not None:
+        tp_row = get_met_forecast_for_date('tp', target_date)
+        ro_row = get_met_forecast_for_date('ro', target_date)
+    else:
+        tp_row = get_latest_met_forecast('tp')
+        ro_row = get_latest_met_forecast('ro')
+    if tp_row is None and ro_row is None:
+        if target_date is not None:
+            logger.info(f"No MET_FORECASTS data available for {target_date}, skipping precip analysis")
+        else:
+            logger.info("No MET_FORECASTS data available, skipping precip analysis")
+        return
+
+    date_label = f"for {target_date}" if target_date is not None else "(latest)"
+    if tp_row is not None:
+        logger.info(f"tp forecast {date_label}: {tp_row['forecast_time']}")
+    if ro_row is not None:
+        logger.info(f"ro forecast {date_label}: {ro_row['forecast_time']}")
+
+    # tp and ro are downloaded independently upstream, one param's cycle can
+    # fail while the other succeeds, leaving MET_FORECASTS with mismatched
+    # "latest" rows per param. Never combine them into a ratio in that case,
+    # tp still gets processed on its own below (it doesn't need ro at all).
+    if tp_row is not None and ro_row is not None and tp_row['forecast_time'] != ro_row['forecast_time']:
+        logger.warning(
+            f"tp ({tp_row['forecast_time']}) and ro ({ro_row['forecast_time']}) latest forecasts "
+            "are from different cycles, skipping the ro/tp ratio this run (tp itself is unaffected)"
+        )
+        ro_row = None
+
+    forecast_time = (tp_row or ro_row)['forecast_time']
+    if hasattr(forecast_time, 'strftime'):
+        forecast_time_str = forecast_time.strftime('%Y%m%d%H%M%S')
+    else:
+        forecast_time_str = str(forecast_time)
+
+    # Per-country setup (tiles, admin regions, facility locations, facility-
+    # to-tile maps) is entirely window-independent, so it's cached here and
+    # computed once across all 4 window_h iterations below, not once per
+    # window per country (4x redundant Snowflake/blob reads and spatial
+    # joins otherwise, caught by a multi-agent review of this function).
+    # None means "setup failed for this country, skip it in every window".
+    country_setup_cache = {}
+
+    for window_h in PRECIP_WINDOWS_H:
+        tp_bounds = tp_grid = None
+        ro_grid = None
+
+        if tp_row is not None:
+            try:
+                _, lat_min, lat_max, lon_min, lon_max, tp_grid = read_precip_window(
+                    tp_row['stage_path'], met_data_store, 0, window_h
+                )
+                tp_bounds = (lat_min, lat_max, lon_min, lon_max)
+            except Exception as e:
+                logger.warning(f"Failed to read tp window {window_h}h: {e}")
+
+        if ro_row is not None:
+            try:
+                # ro shares tp's own grid (same ECMWF ENS run), so only its
+                # array is kept, tp_bounds is reused for both GeoTIFFs below.
+                _, _, _, _, _, ro_grid = read_precip_window(
+                    ro_row['stage_path'], met_data_store, 0, window_h
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read ro window {window_h}h: {e}")
+
+        for country in countries:
+            if country in country_setup_cache:
+                cached = country_setup_cache[country]
+                if cached is None:
+                    continue  # setup failed for this country on an earlier window, skip here too
+                (gdf_tiles, gdf_admin_by_level, gdf_tiles_for_admin_by_level,
+                 gdf_schools, gdf_hcs, gdf_shelters, gdf_wash,
+                 school_tile_map, hc_tile_map, shelter_tile_map, wash_tile_map) = cached
+            else:
+                try:
+                    gdf_tiles = load_mercator_view(country, zoom)
+                except Exception as e:
+                    logger.warning(f"Could not load mercator tiles for {country}, skipping precip for this country: {e}")
+                    country_setup_cache[country] = None
+                    continue
+
+                # Isolated per-country, same as load_mercator_view above: a
+                # transient storage hiccup or malformed admin geometry for ONE
+                # country must not abort processing for every country after it
+                # in this list. Falls back to no admin views for this country
+                # this cycle (tile-level tp/ratio processing below doesn't need
+                # admin_levels at all, so it still proceeds normally).
+                gdf_admin_by_level = {}
+                gdf_tiles_for_admin_by_level = {}
+                try:
+                    admin_levels = get_initialized_admin_levels(country) or [1]
+                    for admin_level in admin_levels:
+                        try:
+                            gdf_admin = load_admin_view(country, admin_level=admin_level)
+                        except Exception as e:
+                            logger.warning(f"Could not load admin{admin_level} view for {country}, skipping this level: {e}")
+                            continue
+                        if admin_level == 1:
+                            gdf_tiles_for_admin = gdf_tiles
+                        else:
+                            gdf_admin_boundaries = gdf_admin[['tile_id', 'geometry']].rename(columns={'tile_id': 'id'})
+                            gdf_tiles_for_admin = admins_overlay(gdf_admin_boundaries,
+                                                                 gdf_tiles.drop(columns=['id'], errors='ignore'))
+                        gdf_admin_by_level[admin_level] = gdf_admin
+                        gdf_tiles_for_admin_by_level[admin_level] = gdf_tiles_for_admin
+                except Exception as e:
+                    logger.warning(f"Admin-level setup failed for {country}, proceeding with tile-level views only: {e}")
+                    gdf_admin_by_level = {}
+                    gdf_tiles_for_admin_by_level = {}
+
+                # Facility locations, fetched and cleaned ONCE per country (not
+                # once per window x threshold, unlike wind's own facility create
+                # functions which handle dedup/filtering internally since they're
+                # each called once per country too, here the threshold loop below
+                # calls create_precip_facility_view fresh 20x per country, so
+                # doing this setup once upfront avoids redoing it 20x for
+                # unchanged data). Isolated per-country, same reasoning as the
+                # admin-level setup above: a failure here must not cascade to
+                # every subsequent country. Falls back to empty facility
+                # GeoDataFrames (tile/admin views above are unaffected either way).
+                gdf_schools = gdf_hcs = gdf_shelters = gdf_wash = gpd.GeoDataFrame()
+                school_tile_map = hc_tile_map = shelter_tile_map = wash_tile_map = pd.DataFrame()
+                try:
+                    gdf_schools = _ensure_unique_zone_ids(fetch_schools(country, rewrite=0), 'school_id_giga', 'school')
+
+                    gdf_hcs_raw = fetch_health_centers(country, rewrite=0)
+                    if not gdf_hcs_raw.empty:
+                        mask = pd.Series(False, index=gdf_hcs_raw.index)
+                        for col, values in HC_FACILITY_TYPES.items():
+                            if col in gdf_hcs_raw.columns:
+                                mask |= gdf_hcs_raw[col].isin(values)
+                        gdf_hcs_raw = gdf_hcs_raw[mask].copy()
+                    gdf_hcs = _ensure_unique_zone_ids(gdf_hcs_raw, 'osm_id', 'health center')
+
+                    gdf_shelters = _ensure_unique_zone_ids(fetch_shelters(country, rewrite=0), 'osm_id', 'shelter')
+                    gdf_wash = _ensure_unique_zone_ids(fetch_wash(country, rewrite=0), 'osm_id', 'WASH facility')
+
+                    # Facility-to-tile mapping, also computed ONCE per country:
+                    # precip's own probability is routed through each facility's
+                    # containing tile (its native grid cell is far coarser than a
+                    # tile, so a facility must always agree with the tile it
+                    # physically sits inside), rather than resampling the raster
+                    # independently per facility.
+                    if not gdf_schools.empty:
+                        school_tile_map = assign_facilities_to_tiles(gdf_schools, gdf_tiles, 'school_id_giga')
+                    if not gdf_hcs.empty:
+                        hc_tile_map = assign_facilities_to_tiles(gdf_hcs, gdf_tiles, 'osm_id')
+                    if not gdf_shelters.empty:
+                        shelter_tile_map = assign_facilities_to_tiles(gdf_shelters, gdf_tiles, 'osm_id')
+                    if not gdf_wash.empty:
+                        wash_tile_map = assign_facilities_to_tiles(gdf_wash, gdf_tiles, 'osm_id')
+                except Exception as e:
+                    logger.warning(f"Facility fetch failed for {country}, proceeding without facility-level precip views: {e}")
+                    gdf_schools = gdf_hcs = gdf_shelters = gdf_wash = gpd.GeoDataFrame()
+                    school_tile_map = hc_tile_map = shelter_tile_map = wash_tile_map = pd.DataFrame()
+
+                country_setup_cache[country] = (
+                    gdf_tiles, gdf_admin_by_level, gdf_tiles_for_admin_by_level,
+                    gdf_schools, gdf_hcs, gdf_shelters, gdf_wash,
+                    school_tile_map, hc_tile_map, shelter_tile_map, wash_tile_map,
+                )
+
+            if tp_grid is not None:
+                for threshold_mm in PRECIP_TP_THRESHOLDS_MM[window_h]:
+                    try:
+                        probability_grid = exceedance_probability(tp_grid, threshold_mm)
+                        with grid_to_geotiff_to_tifprocessor(probability_grid, *tp_bounds) as tif:
+                            tile_view = create_precip_tile_view(gdf_tiles, tif)
+                            save_precip_tile_view(tile_view, country, forecast_time_str, threshold_mm, window_h)
+                            for admin_level in gdf_admin_by_level:
+                                admin_view = create_precip_admin_view(
+                                    gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level], tif
+                                )
+                                save_precip_admin_view(admin_view, country, forecast_time_str, threshold_mm,
+                                                       window_h, admin_level=admin_level)
+
+                            # Facility-level views: each facility's exposure is its
+                            # containing tile's already-computed probability (tile_view,
+                            # above), not an independent raster sample, so no raster
+                            # access happens here at all. Empty coverage (WASH/shelters
+                            # are frequently sparse in OSM) is skipped entirely rather than
+                            # writing a zero-row file.
+                            if not gdf_schools.empty:
+                                school_view = create_precip_facility_view(gdf_schools, school_tile_map, tile_view, 'school_id_giga')
+                                save_precip_school_view(school_view, country, forecast_time_str, threshold_mm, window_h)
+                            if not gdf_hcs.empty:
+                                hc_view = create_precip_facility_view(gdf_hcs, hc_tile_map, tile_view, 'osm_id')
+                                save_precip_hc_view(hc_view, country, forecast_time_str, threshold_mm, window_h)
+                            if not gdf_shelters.empty:
+                                shelter_view = create_precip_facility_view(gdf_shelters, shelter_tile_map, tile_view, 'osm_id')
+                                save_precip_shelter_view(shelter_view, country, forecast_time_str, threshold_mm, window_h)
+                            if not gdf_wash.empty:
+                                wash_view = create_precip_facility_view(gdf_wash, wash_tile_map, tile_view, 'osm_id')
+                                save_precip_wash_view(wash_view, country, forecast_time_str, threshold_mm, window_h)
+                    except Exception as e:
+                        logger.warning(f"tp view failed for {country}/{window_h}h/{threshold_mm}mm: {e}")
+
+            if tp_grid is not None and ro_grid is not None:
+                for ratio_threshold in RATIO_THRESHOLDS:
+                    try:
+                        probability_grid = ratio_exceedance_probability(
+                            ro_grid, tp_grid, ratio_threshold, min_tp_mm=RATIO_MIN_TP_MM
+                        )
+                        with grid_to_geotiff_to_tifprocessor(probability_grid, *tp_bounds) as tif:
+                            tile_view = create_precip_tile_view(gdf_tiles, tif)
+                            save_precip_ratio_view(tile_view, country, forecast_time_str, ratio_threshold, window_h)
+                            for admin_level in gdf_admin_by_level:
+                                admin_view = create_precip_admin_view(
+                                    gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level], tif
+                                )
+                                save_precip_ratio_admin_view(admin_view, country, forecast_time_str, ratio_threshold,
+                                                             window_h, admin_level=admin_level)
+
+                            # Facility-level views: same tile-routed lookup as the tp loop above.
+                            if not gdf_schools.empty:
+                                school_view = create_precip_facility_view(gdf_schools, school_tile_map, tile_view, 'school_id_giga')
+                                save_precip_ratio_school_view(school_view, country, forecast_time_str, ratio_threshold, window_h)
+                            if not gdf_hcs.empty:
+                                hc_view = create_precip_facility_view(gdf_hcs, hc_tile_map, tile_view, 'osm_id')
+                                save_precip_ratio_hc_view(hc_view, country, forecast_time_str, ratio_threshold, window_h)
+                            if not gdf_shelters.empty:
+                                shelter_view = create_precip_facility_view(gdf_shelters, shelter_tile_map, tile_view, 'osm_id')
+                                save_precip_ratio_shelter_view(shelter_view, country, forecast_time_str, ratio_threshold, window_h)
+                            if not gdf_wash.empty:
+                                wash_view = create_precip_facility_view(gdf_wash, wash_tile_map, tile_view, 'osm_id')
+                                save_precip_ratio_wash_view(wash_view, country, forecast_time_str, ratio_threshold, window_h)
+                    except Exception as e:
+                        logger.warning(f"ro/tp ratio view failed for {country}/{window_h}h/{ratio_threshold}: {e}")
+
+    logger.info(f"Precip analysis complete for {len(countries)} countries across {len(PRECIP_WINDOWS_H)} windows")
+
+
+# =============================================================================
 # PIPELINE STATISTICS CLASS
 # =============================================================================
 class ImpactPipelineStats:
@@ -313,6 +655,7 @@ class ImpactPipelineStats:
         self.views_created = 0
         self.affected_countries = []
         self.errors = []
+        self.country_errors = []
     
     def log_summary(self, logger):
         """Log pipeline execution summary"""
@@ -398,8 +741,23 @@ def run_hurricane_pipeline(storm, forecast_time, countries=None, skip_analysis=F
                 stats.countries_processed = analysis_result["countries_processed"]
                 stats.views_created = analysis_result["total_views_created"]
                 stats.affected_countries = analysis_result["affected_countries"]
+                # country_errors can be non-empty even when success is True (at least
+                # one country succeeded, so the run stays eligible to avoid a full
+                # retry), surface it into stats.errors so it's visible in the log
+                # summary and doesn't get silently reported as a clean full success.
+                stats.country_errors = analysis_result.get("country_errors", [])
+                if stats.country_errors:
+                    stats.errors.extend(stats.country_errors)
                 if analysis_result.get("skipped"):
                     logger.info("Impact analysis skipped — storm not in range of any country")
+                elif stats.country_errors:
+                    logger.warning(
+                        f"Impact analysis completed with {len(stats.country_errors)} "
+                        f"country error(s), other countries succeeded"
+                    )
+                    logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
+                    logger.info(f"   Countries processed: {stats.countries_processed}")
+                    logger.info(f"   Views created: {stats.views_created}")
                 else:
                     logger.info(f"Impact analysis completed successfully")
                     logger.info(f"   Envelopes processed: {analysis_result['envelopes_processed']}")
@@ -474,6 +832,7 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
     stats.analysis_success = True
 
     if os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        conn = None
         try:
             conn = get_snowflake_connection()
             cur = conn.cursor()
@@ -481,13 +840,15 @@ def initialize_pipeline(countries, zoom, rewrite, admin_levels=None):
             cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
             result = cur.fetchone()[0]
             cur.close()
-            conn.close()
             if result.startswith('PARTIAL') or 'errors:' in result:
                 logger.warning(f"Base layer MAT refresh had failures after initialize: {result}")
             else:
                 logger.info(f"Base layer MAT tables refreshed after initialize: {result}")
         except Exception as e:
             logger.error(f"Could not refresh base layer tables after initialize: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
 
     return stats
 
@@ -537,6 +898,7 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
             all_ok = False
 
     if patched and os.environ.get("DATA_PIPELINE_DB", "LOCAL").upper() == "SNOWFLAKE":
+        conn = None
         try:
             conn = get_snowflake_connection()
             cur = conn.cursor()
@@ -544,7 +906,6 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
             cur.execute("CALL AOTS.TC_ECMWF.REFRESH_BASE_LAYER_TABLES()")
             result = cur.fetchone()[0]
             cur.close()
-            conn.close()
             if result.startswith('PARTIAL') or 'errors:' in result:
                 logger.warning(f"Base layer MAT refresh had failures after patch: {result}")
                 all_ok = False
@@ -553,6 +914,9 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
         except Exception as e:
             logger.error(f"Could not refresh base layer tables after patch: {e}")
             all_ok = False
+        finally:
+            if conn is not None:
+                conn.close()
 
     return all_ok
 
@@ -561,11 +925,22 @@ def patch_pipeline(countries, zoom, columns, log_level="INFO"):
 # SNOWFLAKE RUN LOGGING
 # =============================================================================
 
-def is_already_processed(conn, storm_id: str, forecast_time) -> bool:
-    """Return True if this (storm_id, forecast_time) has a SUCCESS or recent IN_PROGRESS record."""
+def is_already_processed(conn, storm_id: str, forecast_time, countries: list) -> bool:
+    """
+    Return True if this (storm_id, forecast_time) has a SUCCESS or recent
+    IN_PROGRESS record that already covers ALL of the currently-requested
+    countries.
+
+    Includes the country dimension, unlike keying purely on (storm_id,
+    forecast_time): a prior narrower run (e.g. just JAM) must not silently
+    satisfy a later, broader request (e.g. JAM+DOM after DOM is onboarded),
+    or DOM would never actually get processed for this storm/forecast.
+    Mirrors the LOCAL/BLOB JSON-mode dedup key below, which already includes
+    the sorted country list in storm_key.
+    """
     cur = conn.cursor()
     cur.execute("""
-        SELECT COUNT(*) FROM AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
+        SELECT COUNTRIES_PROCESSED FROM AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
         WHERE STORM_ID = %s
           AND FORECAST_TIME = %s
           AND (
@@ -574,19 +949,40 @@ def is_already_processed(conn, storm_id: str, forecast_time) -> bool:
                 AND STARTED_AT > DATEADD('hour', -6, CURRENT_TIMESTAMP()))
           )
     """, (storm_id, forecast_time))
-    count = cur.fetchone()[0]
+    rows = cur.fetchall()
     cur.close()
-    return count > 0
+    requested = set(countries or [])
+    if not requested:
+        return len(rows) > 0
+    for (countries_processed_raw,) in rows:
+        if isinstance(countries_processed_raw, str):
+            processed = set(json.loads(countries_processed_raw))
+        elif isinstance(countries_processed_raw, (list, tuple)):
+            processed = set(countries_processed_raw)
+        else:
+            processed = set()
+        if requested.issubset(processed):
+            return True
+    return False
 
 
-def log_run_start(conn, storm_id: str, forecast_time) -> None:
-    """Insert an IN_PROGRESS marker into TC_PIPELINE_RUN_LOG."""
+def log_run_start(conn, storm_id: str, forecast_time, countries: list = None) -> None:
+    """
+    Insert an IN_PROGRESS marker into TC_PIPELINE_RUN_LOG.
+
+    countries must be written here (not left NULL): is_already_processed()'s
+    concurrent-run lock checks whether an IN_PROGRESS row's own
+    COUNTRIES_PROCESSED is a superset of a later request's countries, a NULL
+    value here would make that check always fail (falls to an empty set),
+    silently disabling the lock and letting a second overlapping invocation
+    for the same storm/forecast/countries run concurrently with this one.
+    """
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO AOTS.TC_ECMWF.TC_PIPELINE_RUN_LOG
-            (STORM_ID, FORECAST_TIME, STATUS, STARTED_AT)
-        VALUES (%s, %s, 'IN_PROGRESS', CURRENT_TIMESTAMP())
-    """, (storm_id, forecast_time))
+            (STORM_ID, FORECAST_TIME, STATUS, COUNTRIES_PROCESSED, STARTED_AT)
+        SELECT %s, %s, 'IN_PROGRESS', PARSE_JSON(%s), CURRENT_TIMESTAMP()
+    """, (storm_id, forecast_time, json.dumps(countries or [])))
     conn.commit()
     cur.close()
 
@@ -713,7 +1109,20 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
     storms_df['TIME'] = pd.to_datetime(storms_df['FORECAST_TIME']).dt.strftime('%H:%M')
 
     if target_date:
-        target_date_obj = pd.to_datetime(target_date).date() if isinstance(target_date, str) else target_date
+        try:
+            target_date_obj = pd.to_datetime(target_date).date() if isinstance(target_date, str) else target_date
+        except (ValueError, TypeError) as e:
+            # Give a clean, actionable error instead of a raw pandas/dateutil
+            # traceback: run_precip_analysis()'s own use of this same --date
+            # value (a few lines later in main()) is already wrapped in
+            # try/except, this path previously wasn't, an invalid --date
+            # crashed the whole script here instead.
+            logger.error(f"Invalid --date value '{target_date}' (expected YYYY-MM-DD): {e}")
+            stats.errors.append(f"Invalid --date value '{target_date}': {e}")
+            stats.analysis_success = False
+            if conn:
+                conn.close()
+            return stats
         storms_df = storms_df[storms_df['DATE'] == target_date_obj]
         logger.info(f"Filtering to storms on {target_date_obj} only")
 
@@ -751,7 +1160,7 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         already_done = False
         if snowflake_mode and conn:
             try:
-                already_done = is_already_processed(conn, storm, forecast_time_ts)
+                already_done = is_already_processed(conn, storm, forecast_time_ts, countries)
             except Exception as e:
                 logger.warning(f"Could not check TC_PIPELINE_RUN_LOG: {e}")
         elif d is not None:
@@ -769,7 +1178,7 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         # --- Log start ---
         if snowflake_mode and conn:
             try:
-                log_run_start(conn, storm, forecast_time_ts)
+                log_run_start(conn, storm, forecast_time_ts, countries)
             except Exception as e:
                 logger.warning(f"Could not log run start to TC_PIPELINE_RUN_LOG: {e}")
 
@@ -789,6 +1198,11 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
         if loop_stats.analysis_success:
             if loop_stats.countries_processed == 0:
                 logger.info(f"Storm {storm} at {forecast_datetime_str} — not in range of any country, skipped")
+            elif loop_stats.country_errors:
+                logger.warning(
+                    f"Pipeline completed with {len(loop_stats.country_errors)} country error(s) "
+                    f"for storm {storm} at {forecast_datetime_str}, other countries succeeded"
+                )
             else:
                 logger.info(f"Pipeline completed successfully for storm {storm} at {forecast_datetime_str}")
             stats.countries_processed += loop_stats.countries_processed
@@ -798,10 +1212,19 @@ def update_storms(countries, skip_analysis, log_level, zoom, rewrite, time_delta
             # --- Mark success ---
             if snowflake_mode and conn:
                 try:
+                    # country_errors can be non-empty even here (success=True stays,
+                    # matching the existing "at least one country succeeded, don't
+                    # force a full retry" design), but the per-country failure detail
+                    # must still be visible in the persisted audit trail, not silently
+                    # dropped just because the overall run counts as a success.
+                    partial_error_msg = (
+                        '; '.join(loop_stats.country_errors) if loop_stats.country_errors else None
+                    )
                     log_run_complete(
                         conn, storm, forecast_time_ts, success=True,
                         countries=loop_stats.affected_countries,
                         files_written=loop_stats.views_created,
+                        error_message=partial_error_msg,
                         started_at=run_started_at,
                     )
                 except Exception as e:
@@ -893,7 +1316,7 @@ def main():
     # Force re-initialization (regenerates all data from scratch)
     python main_pipeline.py --type initialize --countries PNG --rewrite 1
 
-    # Process all recent storms (last 9 days)
+    # Process all recent storms (last 2 days, per --time_delta's default)
     python main_pipeline.py --type update
 
     # Process storms for a specific date
@@ -956,7 +1379,7 @@ def main():
     parser.add_argument(
         "--countries",
         nargs="+",
-        default=_DEFAULT_COUNTRIES,
+        default=None,
         help="ISO3 country codes to process (e.g., TWN DOM). If not specified, attempts to read from Snowflake PIPELINE_COUNTRIES table. Default: Caribbean countries list."
     )
     
@@ -1022,6 +1445,12 @@ def main():
     )
 
     parser.add_argument(
+        "--skip-precip",
+        action="store_true",
+        help="Skip precipitation/runoff analysis even if MET_FORECASTS data is available (storm processing is unaffected)"
+    )
+
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -1034,9 +1463,12 @@ def main():
     # Setup logging first
     logger = setup_logging(args.log_level)
 
-    # If countries not provided (using default), try to get from Snowflake table
-    # This allows GitHub Actions to use Snowflake as source of truth
-    if not args.countries or args.countries == _DEFAULT_COUNTRIES:
+    # If --countries wasn't explicitly passed at all (args.countries is still the
+    # None sentinel, not a value-equality check against _DEFAULT_COUNTRIES, which
+    # would also silently override an operator who deliberately passed exactly that
+    # list), try to get from Snowflake table. This allows GitHub Actions to use
+    # Snowflake as source of truth.
+    if args.countries is None:
         try:
             logger.info("No countries specified, attempting to read from Snowflake table...")
             countries_from_snowflake = get_active_countries_from_snowflake()
@@ -1045,8 +1477,10 @@ def main():
                 logger.info(f"Using {len(args.countries)} countries from Snowflake: {', '.join(args.countries)}")
             else:
                 logger.warning("No active countries found in Snowflake table, using default list")
+                args.countries = _DEFAULT_COUNTRIES
         except Exception as e:
             logger.warning(f"Could not read countries from Snowflake: {e}. Using default list.")
+            args.countries = _DEFAULT_COUNTRIES
     
     # Run pipeline based on hazard type
     if args.hazard == "hurricane":
@@ -1065,6 +1499,18 @@ def main():
                 target_storm=args.storm,
                 skip_gust=args.skip_gust
             )
+
+            # Precip/runoff is storm-independent ambient data, run once per
+            # invocation alongside (not inside) update_storms(). Wrapped in
+            # its own try/except so a precip failure can never affect the
+            # storm-processing exit code/stats above, and vice versa.
+            if not args.skip_precip:
+                try:
+                    run_precip_analysis(args.countries, logger, zoom=args.zoom, target_date=args.date)
+                except Exception as e:
+                    logger.error(f"Precip analysis failed, storm processing above is unaffected: {e}")
+            else:
+                logger.info("Skipping precip analysis (--skip-precip)")
         elif args.type == "patch":
             if not args.columns:
                 logger.error("--type patch requires --columns (e.g. --columns built_surface_m2 rwi)")

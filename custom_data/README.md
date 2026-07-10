@@ -185,7 +185,7 @@ Pre-aggregated GHSL built surface per tile.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `built_surface_m2` | Yes | float | Total built surface area in m² (sum within tile). Use `NaN` for missing. |
+| `built_surface_m2` | Not enforced | float | Total built surface area in m² (sum within tile). Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the GHSL raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `built_surface_m2` is read and merged into the mercator parquet.
 
@@ -201,7 +201,7 @@ derives `smod_class_l1` (1=rural, 2=suburban, 3=urban) automatically.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `smod_class` | Yes | float | GHS-SMOD L2 class (median within tile). Values: 10=water, 11=very low density rural, 12=low density rural, 13=rural cluster, 21=suburban, 22=semi-dense urban, 23=dense urban, 30=urban centre. Use `NaN` for missing. |
+| `smod_class` | Not enforced | float | GHS-SMOD L2 class (median within tile). Values: 10=water, 11=very low density rural, 12=low density rural, 13=rural cluster, 21=suburban, 22=semi-dense urban, 23=dense urban, 30=urban centre. Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the GHSL raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `smod_class` is read; `smod_class_l1` is always derived automatically.
 
@@ -216,7 +216,7 @@ Pre-aggregated Relative Wealth Index per tile.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `rwi` | Yes | float | Mean RWI within tile (range approximately -2.5 to +2.5). Use `NaN` for missing. |
+| `rwi` | Not enforced | float | Mean RWI within tile (range approximately -2.5 to +2.5). Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `rwi` is read and merged into the mercator parquet.
 

@@ -240,10 +240,6 @@ EXECUTE JOB SERVICE
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
           
-          # Pipeline parameters
-          ZOOM_LEVEL: "14"
-          REWRITE: "0"
-          
           # Optional: SSL/certificate handling (set to true if experiencing certificate issues)
           # SNOWFLAKE_INSECURE_MODE: false
        args:
@@ -283,8 +279,6 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
           SNOWFLAKE_WAREHOUSE: your_warehouse
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
-          ZOOM_LEVEL: "14"
-          REWRITE: "0"
           # API Keys (required for data fetching)
           GIGA_SCHOOL_LOCATION_API_KEY: <your_giga_api_key>
           HEALTHSITES_API_KEY: <your_healthsites_api_key>
@@ -344,8 +338,6 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
 
 ### Optional
 
-- `ZOOM_LEVEL`: Zoom level for mercator tiles (default: `14`)
-- `REWRITE`: Set to `1` to force reprocessing, `0` to skip existing (default: `0`)
 - `ROOT_DATA_DIR`: Base data directory (default: `geodb`)
 - `VIEWS_DIR`: Views subdirectory (default: `aos_views`)
 - `RESULTS_DIR`: Results directory (default: `results`)
@@ -359,10 +351,15 @@ The pipeline accepts command-line arguments:
 - `--zoom`: Zoom level for tiles (default: `14`)
 - `--admin`: Admin levels to initialize, space-separated (default: `1`; use `1 2` for admin1 + admin2). Only applies to `--type initialize`. Logs an error and skips gracefully if a level is unavailable in GeoRepo.
 - `--rewrite`: Set to `1` to force reprocessing (default: `0`)
-- `--time_delta`: Number of days in the past to consider storms (default: `9`)
+- `--time_delta`: Number of days in the past to consider storms (default: `2`)
 - `--date`: Process only storms on a specific date (YYYY-MM-DD format)
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
-- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet)
+- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet, or `vulnerability` to patch poverty probabilities)
+- `--hazard`: Hazard type to process (currently only `hurricane` is supported)
+- `--skip-analysis`: Skip the analysis step (for testing pipeline structure without processing data)
+- `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
+- `--skip-precip`: Skip precipitation/runoff analysis even if `MET_FORECASTS` data is available (storm processing is unaffected)
+- `--log-level`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`; default: `INFO`)
 
 ## Example: Initialize Pipeline for Taiwan
 

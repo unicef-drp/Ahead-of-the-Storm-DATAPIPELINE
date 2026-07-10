@@ -7,7 +7,7 @@ MODES
 -----
 incremental (default)
     Scans GeoSight for the latest forecast_time already uploaded per
-    (country, storm, admin_level).  Only files with a newer forecast time
+    (country, storm).  Only files with a newer forecast time
     are downloaded and uploaded.  Safe to run as a cron job.
 
 --backfill
@@ -142,11 +142,11 @@ def delete_matching_rows(
         row_id = row.get("id")
         if row_id is None:
             continue
-        if country and props.get("country_code", "").upper() != country.upper():
+        if country and (props.get("country_code") or "").upper() != country.upper():
             continue
-        if storm and props.get("storm", "").upper() != storm.upper():
+        if storm and (props.get("storm") or "").upper() != storm.upper():
             continue
-        ft = props.get("forecast_time", "")
+        ft = props.get("forecast_time") or ""
         # forecast_time in GeoSight is ISO 8601 e.g. "2025-10-22T00:00:00"
         ft_date = ft[:10].replace("-", "") if ft else ""
         if date and ft_date != date.replace("-", ""):
@@ -167,17 +167,31 @@ def delete_matching_rows(
     return len(to_delete)
 
 
-def fetch_latest_forecast_time(client: GeoSightClient, table_id) -> str:
+def fetch_latest_forecast_time(client: GeoSightClient, table_id) -> dict:
     """
-    Scan GeoSight RT once; return the single latest forecast_time across all rows.
-    Returns '' if the table is empty. ISO 8601 strings sort lexicographically.
+    Scan GeoSight RT once; return the latest forecast_time per (country_code,
+    storm), not a single global scalar across the whole table.
+
+    A single global latest silently breaks incremental sync whenever two
+    storms are active with different forecast cadences: a Pacific storm's
+    genuinely-never-uploaded file could be skipped as "already up to date"
+    just because an Atlantic storm's newer cycle already pushed a later
+    forecast_time into the same shared table. Scoping per (country, storm)
+    matches this module's own docstring, which already promised this
+    granularity.
+
+    Returns: {(country_code, storm): latest_forecast_time}. A key absent
+    from this dict (or an empty string value) means no rows exist yet for
+    that country/storm, all of its matching files should be uploaded.
     """
-    latest = ""
+    latest_by_key: dict[tuple[str, str], str] = {}
     for row in client.iter_related_table_rows(table_id=table_id, page_size=500):
-        ft = row.get("properties", {}).get("forecast_time", "")
-        if ft > latest:
-            latest = ft
-    return latest
+        props = row.get("properties", {})
+        key = ((props.get("country_code") or "").upper(), (props.get("storm") or "").upper())
+        ft = props.get("forecast_time") or ""
+        if ft > latest_by_key.get(key, ""):
+            latest_by_key[key] = ft
+    return latest_by_key
 
 
 def ensure_related_table(
@@ -211,6 +225,18 @@ def upload_rows(
     rows: list[dict],
     backfill: bool,
 ) -> tuple[int, int]:
+    """
+    Returns (uploaded, skipped). Each row's upload is isolated: client.create_related_table_row()
+    already retries transient failures internally (see GeoSightClient's own
+    max_retries), so an exception here means those retries were exhausted for
+    this specific row, not that the whole batch should abort. Continuing past
+    one failed row (instead of letting the exception propagate and kill the
+    whole run) matters most in --backfill/--replace mode specifically, where
+    dedup is intentionally disabled, a full-batch crash there previously meant
+    a rerun would re-upload every already-succeeded row as a duplicate; failed
+    rows are collected and reported so a rerun can be scoped precisely to just
+    what actually failed instead of redoing everything.
+    """
     existing_ids: set[str] = set()
     if not backfill:
         for row in client.iter_related_table_rows(table_id=table_id, page_size=500):
@@ -219,18 +245,32 @@ def upload_rows(
                 existing_ids.add(build_row_signature(props))
 
     uploaded = skipped = 0
+    failed_rows: list[dict] = []
     for i, row in enumerate(rows, 1):
         row_id = build_row_signature(row)
         if not backfill and row_id in existing_ids:
             skipped += 1
             continue
-        client.create_related_table_row(table_id=table_id, properties=row)
+        try:
+            client.create_related_table_row(table_id=table_id, properties=row)
+        except Exception as e:
+            print(f"  Failed to upload row {row_id}: {e}")
+            failed_rows.append(row)
+            continue
         existing_ids.add(row_id)
         uploaded += 1
         if uploaded % 50 == 0:
             print(f"  Uploaded {uploaded} rows...")
         if i % 500 == 0:
             print(f"  Processed {i}/{len(rows)} candidates...")
+
+    if failed_rows:
+        print(f"  {len(failed_rows)} row(s) failed after retries, uploaded {uploaded} successfully:")
+        for row in failed_rows[:20]:
+            print(f"    {build_row_signature(row)}")
+        if len(failed_rows) > 20:
+            print(f"    ... and {len(failed_rows) - 20} more")
+
     return uploaded, skipped
 
 
@@ -307,13 +347,15 @@ def main() -> None:
         # Upload all matching files unconditionally (no dedup needed after delete)
         args.backfill = True
 
-    # 5. For incremental mode: scan RT once for the global latest forecast_time
-    latest_forecast_time = ""
+    # 5. For incremental mode: scan RT once for the latest forecast_time per
+    # (country, storm), not one global scalar (see fetch_latest_forecast_time's
+    # own docstring for why a global value silently breaks multi-storm sync).
+    latest_by_key: dict = {}
     if not args.backfill and existing_table:
-        print("Scanning GeoSight RT for latest forecast time...")
-        latest_forecast_time = fetch_latest_forecast_time(client, existing_table["id"])
-        if latest_forecast_time:
-            print(f"  Latest forecast time already in GeoSight: {latest_forecast_time}")
+        print("Scanning GeoSight RT for latest forecast time per country/storm...")
+        latest_by_key = fetch_latest_forecast_time(client, existing_table["id"])
+        if latest_by_key:
+            print(f"  Found existing data for {len(latest_by_key)} country/storm combination(s).")
         else:
             print("  GeoSight RT is empty — will upload all matching files.")
 
@@ -329,7 +371,9 @@ def main() -> None:
         else:
             selected = [
                 (fname, parts) for fname, parts in files
-                if format_forecast_time(parts["forecast"]) > latest_forecast_time
+                if format_forecast_time(parts["forecast"]) > latest_by_key.get(
+                    (parts["country"].upper(), parts["storm"].upper()), ""
+                )
             ]
             skipped_count = len(files) - len(selected)
             print(f"Admin level {admin_level}: {len(selected)} new file(s), {skipped_count} already up to date.")

@@ -197,16 +197,58 @@ def load_json_report(country: str, storm: str, date: str) -> Dict[str, Any]:
 def get_previous_date(date: str) -> str:
     """
     Get the previous forecast date (6 hours earlier).
-    
+
     Args:
         date: Forecast date in YYYYMMDDHHMMSS format
-    
+
     Returns:
         str: Previous forecast date in YYYYMMDDHHMMSS format
     """
     dt = datetime.strptime(date, "%Y%m%d%H%M%S")
     dt_minus_6h = dt - timedelta(hours=PREVIOUS_FORECAST_HOURS)
     return dt_minus_6h.strftime("%Y%m%d%H%M%S")
+
+
+def find_previous_report(country: str, storm: str, date: str, max_lookback_hours: int = 72) -> Dict[str, Any]:
+    """
+    Load the most recent actual previous report, searching backward at the
+    standard 6-hour forecast cadence rather than assuming exactly one
+    PREVIOUS_FORECAST_HOURS-ago report exists.
+
+    get_previous_date() + a single load_json_report() call used to be exact:
+    if any forecast cycle was skipped (pipeline downtime, a missed run), the
+    report exactly 6h back never existed, load_json_report() returned {}, and
+    every "if not d_previous" branch in do_report()/_calculate_children_change()/
+    _calculate_admin_rows() treated the NEXT report as if it were the storm's
+    very first, resetting all "change" fields to a fresh-baseline computation
+    even though a legitimate earlier report existed a few cycles further back.
+
+    Args:
+        country: ISO3 country code
+        storm: Storm name
+        date: Current forecast date in YYYYMMDDHHMMSS format
+        max_lookback_hours: Stop searching past this many hours back (default
+            72h = 12 cycles at the standard 6h cadence), a storm's very first
+            report should legitimately return {} rather than searching forever.
+
+    Returns:
+        dict: The most recent existing previous report, or {} if none exists
+            within max_lookback_hours (a genuine first report for this storm).
+    """
+    dt = datetime.strptime(date, "%Y%m%d%H%M%S")
+    hours_back = PREVIOUS_FORECAST_HOURS
+    while hours_back <= max_lookback_hours:
+        candidate_date = (dt - timedelta(hours=hours_back)).strftime("%Y%m%d%H%M%S")
+        d_previous = load_json_report(country, storm, candidate_date)
+        if d_previous:
+            if hours_back > PREVIOUS_FORECAST_HOURS:
+                logger.info(
+                    f"No report at {PREVIOUS_FORECAST_HOURS}h back for {country}/{storm}, "
+                    f"found one {hours_back}h back instead (a forecast cycle was likely skipped)"
+                )
+            return d_previous
+        hours_back += PREVIOUS_FORECAST_HOURS
+    return {}
 
 def get_future_date(date: str, delta_hours: int) -> str:
     """
@@ -495,6 +537,16 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
     rows_shelters_winds = []
     rows_wash_winds = []
 
+    # Matched by admin name, not list position: the admin parquet's row order can
+    # change between two consecutive reports (e.g. a --type patch run resyncs it
+    # via a groupby, which sorts by admin id, while the initial build preserves
+    # GeoRepo API order), a purely positional match would silently compute
+    # change_{wind} for one administrative region using another region's
+    # previous numbers whenever that happens.
+    prev_pop_by_name = {r.get('name'): r for r in d_previous.get('rows_admins_pop_total', [])} if d_previous else {}
+    prev_school_by_name = {r.get('name'): r for r in d_previous.get('rows_admins_school', [])} if d_previous else {}
+    prev_infant_by_name = {r.get('name'): r for r in d_previous.get('rows_admins_infant', [])} if d_previous else {}
+
     for i, (_, row) in enumerate(gdf_admin.iterrows()):
         admin_id = row['tile_id']
         admin_name = row['name']
@@ -539,13 +591,9 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
                 d_rows_admins_school[f"change_{wind}"] = d_rows_admins_school[f"{wind}"]
                 d_rows_admins_infant[f"change_{wind}"] = d_rows_admins_infant[f"{wind}"]
             else:
-                prev_rows = d_previous.get('rows_admins_pop_total', [])
-                prev_school_rows = d_previous.get('rows_admins_school', [])
-                prev_infant_rows = d_previous.get('rows_admins_infant', [])
-
-                prev_pop = prev_rows[i].get(f"{wind}", 0) if i < len(prev_rows) else 0
-                prev_school = prev_school_rows[i].get(f"{wind}", 0) if i < len(prev_school_rows) else 0
-                prev_infant = prev_infant_rows[i].get(f"{wind}", 0) if i < len(prev_infant_rows) else 0
+                prev_pop = prev_pop_by_name.get(admin_name, {}).get(f"{wind}", 0)
+                prev_school = prev_school_by_name.get(admin_name, {}).get(f"{wind}", 0)
+                prev_infant = prev_infant_by_name.get(admin_name, {}).get(f"{wind}", 0)
 
                 d_rows_admins_pop_total[f"change_{wind}"] = d_rows_admins_pop_total[f"{wind}"] - prev_pop
                 d_rows_admins_school[f"change_{wind}"] = d_rows_admins_school[f"{wind}"] - prev_school
@@ -647,9 +695,9 @@ def do_report(wind_school_views: Dict[int, pd.DataFrame],
     if expected_wind is None:
         return {}
     
-    # Load previous report for change calculations
-    previous_date = get_previous_date(date)
-    d_previous = load_json_report(country, storm, previous_date)
+    # Load previous report for change calculations, searching backward past a
+    # skipped cycle if needed rather than assuming exactly one 6h-back report exists.
+    d_previous = find_previous_report(country, storm, date)
     
     # Initialize report dictionary
     d = {

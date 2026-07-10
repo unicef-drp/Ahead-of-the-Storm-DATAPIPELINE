@@ -118,6 +118,7 @@ Rewrite: 0
    - **Center Lat**: Latitude for map center (e.g., `23.50`) - **Optional**
    - **Center Lon**: Longitude for map center (e.g., `121.00`) - **Optional**
    - **View Zoom**: Zoom level for visualization map (e.g., `8`) - **Optional**
+   - **Timezone**: IANA timezone name for local time display in alerts (e.g., `America/Jamaica`) - **Optional**, defaults to UTC
 5. Click **"Run workflow"**
 
 **What it does:**
@@ -230,6 +231,7 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | `hcs` | HealthSites API → updates `num_hcs` column |
 | `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
 | `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
+| `vulnerability` | `geodb/vulnerability/` → updates `moderate_poverty_prob` + `severe_poverty_prob` (run `vulnerability/fetch_vulnerability_probs.py` first) |
 | `admin<N>` (e.g. `admin2`) | Adds a new admin level base parquet without re-initializing |
 
 **Notes:**
@@ -277,6 +279,8 @@ Countries are stored in the `PIPELINE_COUNTRIES` table:
 | `CENTER_LON` | Longitude for visualization map center |
 | `VIEW_ZOOM` | Zoom level for visualization map (different from analysis ZOOM_LEVEL) |
 | `NOTES` | Optional notes |
+| `TIMEZONE` | IANA timezone name for local time display in alerts (e.g. `America/Jamaica`), defaults to UTC |
+| `IS_REGION` | Excludes a row from the active-countries list when TRUE (e.g. a regional grouping row rather than a real country) |
 
 ### Viewing Countries
 
@@ -302,7 +306,7 @@ VALUES ('PHL', 'Philippines', 14, 12.88, 121.77, 6);
 -- Then initialize via GitHub Actions or manually
 ```
 
-**Note:** Map configuration (`CENTER_LAT`, `CENTER_LON`, `VIEW_ZOOM`) is required for visualization. Use the "Update Country Map Config" workflow to update these values if needed.
+**Note:** Map configuration (`CENTER_LAT`, `CENTER_LON`, `VIEW_ZOOM`) is required for visualization. Use the "Update Country Config" workflow to update these values if needed.
 
 ### Activating/Deactivating Countries
 
@@ -369,7 +373,23 @@ This takes precedence over the Snowflake table.
 
 ### "No active countries found in Snowflake table"
 
-- Run `snowflake/setup_countries_table.sql` to create the table
+- Create the table if it doesn't exist yet:
+```sql
+CREATE OR REPLACE TABLE PIPELINE_COUNTRIES (
+    COUNTRY_CODE VARCHAR(3) PRIMARY KEY,
+    COUNTRY_NAME VARCHAR(100) NOT NULL,
+    ACTIVE BOOLEAN DEFAULT TRUE,
+    ADDED_DATE TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    LAST_INITIALIZED TIMESTAMP_NTZ,
+    ZOOM_LEVEL INTEGER DEFAULT 14,
+    CENTER_LAT FLOAT,
+    CENTER_LON FLOAT,
+    VIEW_ZOOM INTEGER,
+    NOTES VARCHAR(500),
+    TIMEZONE VARCHAR(100),
+    IS_REGION BOOLEAN DEFAULT FALSE
+);
+```
 - Add countries using the GitHub Actions workflow or SQL
 
 ### "Error retrieving countries from Snowflake"

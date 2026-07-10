@@ -5,7 +5,7 @@ This document lists all files produced and downloaded by the Ahead of the Storm 
 ## Directory Structure Overview
 
 The pipeline uses environment variables to configure base directories:
-- `RESULTS_DIR` - Results and configuration files (default: `project_results/climate/lacro_project`)
+- `RESULTS_DIR` - Results and configuration files (default: `results`)
 - `ROOT_DATA_DIR` - Base data directory (default: `geodb`)
 - `VIEWS_DIR` - Subdirectory for views (default: `aos_views`)
 - `STORMS_FILE` - Processed storms tracking file (default: `storms.json`)
@@ -153,7 +153,7 @@ For each storm/forecast combination processed, the following files are created:
   - `CCI_children`, `E_CCI_children`
   - `CCI_school_age`, `E_CCI_school_age`
   - `CCI_infants`, `E_CCI_infants`
-  - `CCI_adolescent`, `E_CCI_adolescent`
+  - `CCI_adolescents`, `E_CCI_adolescents`
   - `CCI_pop`, `E_CCI_pop`
 - **Created by:** `save_cci_tiles()`
 - **Note:** One file per storm per forecast (aggregates all wind thresholds)
@@ -211,9 +211,12 @@ For each storm/forecast combination processed, the following files are created:
 - **Content:** Ensemble member tracks with severity metrics:
   - `severity_schools`
   - `severity_hcs`
+  - `severity_num_shelters`
+  - `severity_num_wash`
   - `severity_population`
   - `severity_school_age_population`
   - `severity_infant_population`
+  - `severity_adolescent_population`
   - `severity_built_surface_m2`
 - **Created by:** `save_tracks_view()`
 - **Note:** Multiple files per storm (one per wind threshold)
@@ -235,7 +238,7 @@ For each storm/forecast combination processed, the following files are created:
 
 ### 20. JSON Impact Reports (per country, per storm, per forecast)
 **Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
-- **Example:** `project_results/climate/lacro_project/jsons/DOM_LORENZO_20251015120000.json`
+- **Example:** `results/jsons/DOM_LORENZO_20251015120000.json`
 - **Format:** JSON
 - **Content:** Comprehensive impact report data including:
   - Expected impacts by wind threshold: `expected_pop_{wind}`, `expected_children_{wind}`, `expected_school_{wind}`, `expected_infant_{wind}`, `expected_adolescent_{wind}`, `expected_schools_{wind}`, `expected_hcs_{wind}`, `expected_shelters_{wind}`, `expected_wash_{wind}`
@@ -253,7 +256,7 @@ For each storm/forecast combination processed, the following files are created:
 
 ### 21. Processed Storms Tracking File
 **Location:** `{RESULTS_DIR}/{STORMS_FILE}`
-- **Example:** `project_results/climate/lacro_project/storms.json`
+- **Example:** `results/storms.json`
 - **Format:** JSON
 - **Content:** Dictionary tracking which storm/forecast combinations have been processed
 - **Created by:** `save_json_storms()`
@@ -265,13 +268,13 @@ For each storm/forecast combination processed, the following files are created:
 
 These files are downloaded automatically by the GigaSpatial library and stored in the data store. The exact location depends on the data store configuration (LOCAL vs BLOB).
 
-> **Note on raster data storage:** The raw raster files (WorldPop, GHSL, SMOD, RWI) are downloaded
-> and cached internally by giga-spatial in its own local cache directory. They are **not** written to
-> the pipeline's data store or Snowflake stage. However, the aggregated per-tile values derived from
-> these rasters **are** permanently stored in the base mercator view parquet
-> (`mercator_views/{country}_{zoom}.parquet`). This means the spatial distribution of all metrics
-> below can be visualized directly from that parquet — each tile has a geometry and the corresponding
-> aggregated value — without needing access to the original rasters.
+> **Note on raster data storage:** The raw raster files (WorldPop, GHSL, SMOD, RWI) are downloaded via
+> giga-spatial's own handlers, which write through the pipeline's configured data store (`geodb/bronze/`
+> locally, or the Snowflake stage when `DATA_PIPELINE_DB=SNOWFLAKE`), and reused on subsequent runs.
+> The aggregated per-tile values derived from these rasters are additionally permanently stored in the
+> base mercator view parquet (`mercator_views/{country}_{zoom}.parquet`). This means the spatial
+> distribution of all metrics below can be visualized directly from that parquet, each tile has a
+> geometry and the corresponding aggregated value, without needing access to the original rasters.
 
 ### 22. WorldPop Population Data
 - **Source:** WorldPop API (GR2, year=2025)
@@ -316,7 +319,7 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 **Source:** UNICEF GeoRepo (via GigaSpatial)
 - **Fetched by:** `AdminBoundaries.create()`
 - **Note:** Fetched via API, not cached to disk (fetched each time)
-- **Optional:** `GEOREPO_TOKEN` environment variable
+- **Optional:** `GEOREPO_API_KEY` and `GEOREPO_USER_EMAIL` environment variables
 
 ---
 
@@ -385,6 +388,87 @@ produced normally either way, gust availability is fully independent of wind.
 
 ---
 
+## Precipitation/Runoff Impact Views (per country, per forecast cycle, per window, per threshold)
+
+Storm-independent: run once per `--type update` invocation (`run_precip_analysis()` in
+`main_pipeline.py`), not once per storm, and not filtered by `--storm`. Uses the *latest*
+`MET_FORECASTS` tp/ro Zarr forecast by default, or the `MET_FORECASTS` row for the exact calendar
+date if `--date` is passed (mirrors wind/gust's own exact-date-match backfill behavior). Source
+data (`tp` = total precipitation, `ro` = runoff, both ECMWF ENS ~0.25° grids) lives only on
+Snowflake's internal stage via `MET_FORECASTS.STAGE_PATH`, independent of `DATA_PIPELINE_DB`.
+Disable with `--skip-precip`.
+
+Two families of tiers, computed for 4 accumulation windows (`PRECIP_WINDOWS_H` = 6, 24, 72,
+120 hours):
+- **tp exceedance tiers** — probability (fraction of the 51-member ensemble) that accumulated
+  rainfall exceeds a moderate/heavy/extreme mm threshold for that window
+  (`PRECIP_TP_THRESHOLDS_MM`, e.g. 25/50/75mm at 6h, 50/100/150mm at 120h)
+- **ro/tp ratio tiers** — probability that the runoff/precipitation ratio exceeds a dimensionless
+  cut point (`RATIO_THRESHOLDS` = 0.3, 0.6; a Rational Method runoff-coefficient reference,
+  0.3 = "meaningfully elevated" runoff response, 0.6 = "majority of the rain becomes runoff"),
+  a flash-flood-response proxy since no real flood-forecasting system uses one fixed mm cut
+  point. Members with less than `RATIO_MIN_TP_MM` (5mm) accumulated tp are treated as ratio=0, not excluded.
+
+Tile-level and admin-level probability is sampled directly from the raster (centroid-based point
+sampling via `TifProcessor.sample_by_coordinates()`, not the polygon-intersection method wind/gust
+use, since a coarse continuous grid has no polygon to intersect). **Facility-level probability is
+routed through each facility's containing mercator tile** (`assign_facilities_to_tiles()` +
+`create_precip_facility_view()`), not sampled independently: the ~0.25° native grid is far
+coarser than a zoom-14 tile, so a facility's own probability is guaranteed to
+exactly equal its containing tile's probability by construction, rather than by coincidence of
+where its exact coordinate happens to land. This is a deliberate difference from wind/gust
+(whose own facility views have no `tile_id` concept at all, computed independently via buffered-
+polygon-vs-envelope intersection, correct for them since envelope polygons carry real
+fine-grained shape, unlike precip's coarse grid).
+
+`.parquet` (not `.csv`) for facility views specifically, since these carry the facility's real
+geometry (a true point, or a polygon for the minority of health-center OSM records that are
+building footprints). No CCI, vulnerability, or JSON report for precip, same as gust.
+
+### 36. Precip Tile Impact Views (tp)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/precip_views_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv`
+- **Example:** `geodb/aos_views/precip_views_tp/PHL_20260705000000_p50_24h.csv`
+- **Format:** CSV (DataFrame, no geometry)
+- **Content:** `zone_id` (tile_id), `probability`, `native_cell_row`/`native_cell_col` which
+  native ~0.25° precip grid cell this tile's centroid falls in — makes the tile-to-native-cell
+  relationship explicit/queryable, all base mercator parquet columns (population, `num_schools`,
+  etc.), `E_population` (`probability × population`)
+- **Created by:** `create_precip_tile_view()` -> `save_precip_tile_view()`
+- **Note:** One file per window per tp threshold (4 windows × 3 tiers = 12 files per cycle)
+
+### 37. Precip Tile Impact Views (ro/tp ratio)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/precip_views_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.csv`
+- **Example:** `geodb/aos_views/precip_views_ratio/PHL_20260705000000_g30_24h.csv` (ratio 0.3)
+- **Format:** CSV (DataFrame, no geometry), same columns as item 36
+- **Created by:** `create_precip_tile_view()` -> `save_precip_ratio_view()`
+- **Note:** One file per window per ratio tier (4 windows × 2 tiers = 8 files per cycle)
+
+### 38. Precip Admin Impact Views (tp and ratio)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precip_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h_admin{N}.csv`,
+`{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precip_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h_admin{N}.csv`
+- **Example:** `geodb/aos_views/admin_views_precip_tp/PHL_20260705000000_p50_24h_admin1.csv`
+- **Format:** CSV (DataFrame, no geometry)
+- **Content:** `tile_id` (renamed `id` on read), `E_population` (summed across tiles in the admin
+  unit), `probability` (mean across tiles), `name` (admin name)
+- **Created by:** `create_precip_admin_view()` -> `save_precip_admin_view()` / `save_precip_ratio_admin_view()`
+- **Note:** Auto-detected from existing initialized admin levels, same as item 14
+
+### 39. Precip School/HC/Shelter/WASH Impact Views (tp and ratio)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precip_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet`,
+`{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precip_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet`
+- **Example:** `geodb/aos_views/school_views_precip_tp/PHL_20260705000000_p50_24h.parquet`
+- **Format:** Parquet (GeoDataFrame)
+- **Content:** every original attribute column from the facility's own cached location file (item
+  3–6) plus `probability` (from the facility's containing tile, see above) and the facility's own
+  true geometry
+- **Created by:** `create_precip_facility_view()` → `save_precip_school_view()` / `save_precip_hc_view()`
+  / `save_precip_shelter_view()` / `save_precip_wash_view()` (and `_ratio_` equivalents)
+- **Note:** Skipped entirely (no file written) for a country/facility-type combination with zero
+  cached locations (WASH/shelters are frequently sparse in OSM), rather than writing a zero-row
+  file. 8 directories total (4 facility types × tp/ratio).
+
+---
+
 ## Complete Directory Structure Example
 
 ```
@@ -443,8 +527,20 @@ produced normally either way, gust availability is fully independent of wind.
     │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust shelter impact views
     ├── wash_views_gust/
     │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust WASH impact views
-    └── track_views_gust/
-        └── {country}_{storm}_{date}_g{gust}.parquet           # Gust track impact views
+    ├── track_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust track impact views
+    ├── precip_views_tp/
+    │   └── {country}_{forecast_time}_p{mm}_{window}h.csv          # Precip tile views (tp exceedance)
+    ├── precip_views_ratio/
+    │   └── {country}_{forecast_time}_g{ratio*100}_{window}h.csv   # Precip tile views (ro/tp ratio)
+    ├── admin_views_precip_tp/
+    │   └── {country}_{forecast_time}_p{mm}_{window}h_admin{N}.csv
+    ├── admin_views_precip_ratio/
+    │   └── {country}_{forecast_time}_g{ratio*100}_{window}h_admin{N}.csv
+    ├── school_views_precip_tp/ ... wash_views_precip_tp/
+    │   └── {country}_{forecast_time}_p{mm}_{window}h.parquet      # Precip facility views (tp), 4 dirs
+    └── school_views_precip_ratio/ ... wash_views_precip_ratio/
+        └── {country}_{forecast_time}_g{ratio*100}_{window}h.parquet  # Precip facility views (ratio), 4 dirs
 ```
 
 ---
@@ -465,6 +561,16 @@ produced normally either way, gust availability is fully independent of wind.
 - Always written with a `g` prefix in filenames (e.g. `g43`) to distinguish from wind thresholds
   of the same numeric value and to keep gust files out of any path-pattern-based classification
   that assumes wind semantics
+
+### Precip Threshold/Window Values
+- Forecast timestamp uses `forecast_time` (the MET_FORECASTS cycle), not a storm name/date —
+  precip is storm-independent
+- tp exceedance thresholds: `p{mm}` (e.g. `p50`), values vary per window, see `PRECIP_TP_THRESHOLDS_MM`
+  in `main_pipeline.py`
+- ro/tp ratio tiers: `g{ratio*100}` (e.g. `g30` for ratio 0.3, `g60` for ratio 0.6) — note this
+  reuses the same `g` prefix convention as gust but in a completely different directory tree
+  (`*_precip_ratio/` vs `*_gust/`), never ambiguous by path
+- Accumulation window: `{window}h` (6, 24, 72, or 120 hours)
 
 ### Country Codes
 - ISO3 country codes (e.g., `DOM`, `ATG`, `BLZ`)

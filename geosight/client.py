@@ -6,6 +6,7 @@ Minimal GeoSight API client for related-table workflows.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -21,6 +22,8 @@ class GeoSightClient:
         authorization: str,
         user_email: str | None = None,
         timeout: int = 30,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 2.0,
     ):
         if not base_url:
             raise ValueError("base_url is required")
@@ -31,6 +34,11 @@ class GeoSightClient:
         self.authorization = authorization
         self.user_email = user_email
         self.timeout = timeout
+        # Only transient failures are retried (network errors, 5xx): a 401/403/404
+        # will not succeed on retry, retrying those would just waste time and mask
+        # the real problem, they raise immediately on the first attempt.
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def _build_url(self, path: str, query: dict[str, Any] | None = None) -> str:
         api_path = path if path.startswith("/") else f"/{path}"
@@ -63,17 +71,43 @@ class GeoSightClient:
 
         request = Request(url, data=body, headers=headers, method=method.upper())
 
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-        except HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"GeoSight API {method.upper()} {url} failed with "
-                f"{exc.code}: {error_body}"
-            ) from exc
-        except URLError as exc:
-            raise RuntimeError(f"GeoSight API {method.upper()} {url} failed: {exc}") from exc
+        raw = None
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8")
+                last_exc = None
+                break
+            except HTTPError as exc:
+                error_body = exc.read().decode("utf-8", errors="replace")
+                # 5xx is transient (server-side, may resolve on retry); 4xx (auth,
+                # not-found, bad-request) will not succeed on retry, fail immediately.
+                if exc.code < 500 or attempt == self.max_retries:
+                    raise RuntimeError(
+                        f"GeoSight API {method.upper()} {url} failed with "
+                        f"{exc.code}: {error_body}"
+                    ) from exc
+                last_exc = exc
+            except URLError as exc:
+                if attempt == self.max_retries:
+                    raise RuntimeError(f"GeoSight API {method.upper()} {url} failed: {exc}") from exc
+                last_exc = exc
+            except OSError as exc:
+                # Catches TimeoutError/ConnectionResetError/socket.timeout and similar:
+                # urlopen only wraps connection-establishment failures in URLError,
+                # a timeout or reset while reading the response body (after the
+                # connection was already made) raises these as bare OSError
+                # subclasses instead, bypassing the HTTPError/URLError handlers
+                # above entirely if not caught here too. Placed after HTTPError/
+                # URLError (both of which are themselves OSError subclasses) so
+                # this only catches genuinely different transient failures, not
+                # ones already handled above.
+                if attempt == self.max_retries:
+                    raise RuntimeError(f"GeoSight API {method.upper()} {url} failed: {exc}") from exc
+                last_exc = exc
+            if last_exc is not None:
+                time.sleep(self.retry_backoff_seconds * attempt)
 
         if not raw:
             return None

@@ -45,8 +45,9 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRIES: ${{ inputs.countries }}
         run: |
-          if [ -z "${{ inputs.countries }}" ]; then
+          if [ -z "$INPUT_COUNTRIES" ]; then
             COUNTRIES=$(python -c "
             from country_utils import get_active_countries_from_snowflake
             countries = get_active_countries_from_snowflake()
@@ -55,7 +56,7 @@ jobs:
             echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
           else
             # Convert comma-separated to space-separated
-            COUNTRIES=$(echo "${{ inputs.countries }}" | tr ',' ' ')
+            COUNTRIES=$(echo "$INPUT_COUNTRIES" | tr ',' ' ')
             echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
           fi
 
@@ -73,9 +74,12 @@ jobs:
           HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
           GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY }}
           GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL }}
+          INPUT_COUNTRIES_LIST: ${{ steps.get_countries.outputs.countries }}
+          INPUT_ZOOM_LEVEL: ${{ inputs.zoom_level }}
+          INPUT_COLUMNS: ${{ inputs.columns }}
         run: |
           python main_pipeline.py \
             --type patch \
-            --countries ${{ steps.get_countries.outputs.countries }} \
-            --zoom ${{ inputs.zoom_level }} \
-            --columns ${{ inputs.columns }}
+            --countries $INPUT_COUNTRIES_LIST \
+            --zoom "$INPUT_ZOOM_LEVEL" \
+            --columns $INPUT_COLUMNS

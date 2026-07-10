@@ -42,7 +42,10 @@ def get_data_store():
     
     if data_pipeline_db == 'BLOB':
         app_config.validate_azure_config()
-        return ADLSDataStore()
+        return ADLSDataStore(
+            account_url=app_config.ACCOUNT_URL,
+            sas_token=app_config.SAS_TOKEN,
+        )
     elif data_pipeline_db == 'SNOWFLAKE':
         app_config.validate_snowflake_storage_config()
         
@@ -79,5 +82,8 @@ def get_data_store():
     elif data_pipeline_db == 'LOCAL':
         return LocalDataStore()
     else:
-        # Default to local storage
-        return LocalDataStore()
+        # A mistyped DATA_PIPELINE_DB (e.g. 'SNOWFALKE') must fail loudly here
+        raise ValueError(
+            f"Unrecognized DATA_PIPELINE_DB value: '{data_pipeline_db}' "
+            f"(expected LOCAL, BLOB, or SNOWFLAKE)"
+        )

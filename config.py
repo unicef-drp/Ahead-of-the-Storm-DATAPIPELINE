@@ -23,6 +23,14 @@ from dotenv import load_dotenv
 # This assumes the .env file is in the project root directory
 load_dotenv()
 
+
+def _is_missing(value) -> bool:
+    """
+    True for None, empty string, or whitespace-only string.
+    """
+    return value is None or not str(value).strip()
+
+
 class Config:
     """Centralized configuration class"""
     
@@ -38,7 +46,7 @@ class Config:
     # Azure Blob Storage Configuration
     ACCOUNT_URL = os.getenv('ACCOUNT_URL')
     SAS_TOKEN = os.getenv('SAS_TOKEN')
-    DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL')
+    DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL').strip().upper()
     
     # Application Configuration
     RESULTS_DIR = os.getenv('RESULTS_DIR', 'results')
@@ -62,7 +70,7 @@ class Config:
             'SNOWFLAKE_SCHEMA'
         ]
         
-        missing = [var for var in required_vars if not getattr(cls, var)]
+        missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
         if missing:
             raise ValueError(f"Missing Snowflake environment variables: {', '.join(missing)}")
     
@@ -86,7 +94,7 @@ class Config:
         if not spcs_run:
             required_vars.extend(['SNOWFLAKE_USER', 'SNOWFLAKE_PASSWORD'])
         
-        missing = [var for var in required_vars if not getattr(cls, var)]
+        missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
         if missing:
             raise ValueError(f"Missing Snowflake storage environment variables: {', '.join(missing)}")
     
@@ -95,7 +103,7 @@ class Config:
         """Validate that all required Azure configuration is present"""
         if cls.DATA_PIPELINE_DB == 'BLOB':
             required_vars = ['ACCOUNT_URL', 'SAS_TOKEN']
-            missing = [var for var in required_vars if not getattr(cls, var)]
+            missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
             if missing:
                 raise ValueError(f"Missing Azure environment variables: {', '.join(missing)}")
     
@@ -106,6 +114,11 @@ class Config:
             cls.validate_azure_config()
         elif cls.DATA_PIPELINE_DB == 'SNOWFLAKE':
             cls.validate_snowflake_storage_config()
+        elif cls.DATA_PIPELINE_DB != 'LOCAL':
+            raise ValueError(
+                f"Unrecognized DATA_PIPELINE_DB value: '{cls.DATA_PIPELINE_DB}' "
+                f"(expected LOCAL, BLOB, or SNOWFLAKE)"
+            )
 
 # Create a global config instance
 config = Config()

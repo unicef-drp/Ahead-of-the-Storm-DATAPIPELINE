@@ -18,21 +18,21 @@ on:
 jobs:
   manage-country-status:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       - name: ${{ inputs.action == 'activate' && 'Activate' || 'Deactivate' }} country
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -41,17 +41,22 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
         run: |
           python -c "
+          import os
           from country_utils import activate_country, deactivate_country
-          if '${{ inputs.action }}' == 'activate':
-              activate_country('${{ inputs.country_code }}')
-              print('✓ Country ${{ inputs.country_code }} has been activated')
+          action = os.environ['INPUT_ACTION']
+          country_code = os.environ['INPUT_COUNTRY_CODE']
+          if action == 'activate':
+              activate_country(country_code)
+              print(f'Country {country_code} has been activated')
           else:
-              deactivate_country('${{ inputs.country_code }}')
-              print('✓ Country ${{ inputs.country_code }} has been deactivated')
+              deactivate_country(country_code)
+              print(f'Country {country_code} has been deactivated')
           "
-      
+
       - name: Verify status
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -60,26 +65,31 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
         run: |
           python -c "
+          import os
           from snowflake_utils import get_snowflake_connection
           import pandas as pd
-          
+
+          country_code = os.environ['INPUT_COUNTRY_CODE']
           conn = get_snowflake_connection()
+          # Parameterized query, not string interpolation: country_code is an
+          # untrusted workflow_dispatch input, splicing it directly into SQL text
+          # would be a SQL-injection vector.
           query = '''
               SELECT COUNTRY_CODE, COUNTRY_NAME, ACTIVE
               FROM PIPELINE_COUNTRIES
-              WHERE COUNTRY_CODE = '${{ inputs.country_code }}'
+              WHERE COUNTRY_CODE = %s
           '''
-          df = pd.read_sql(query, conn)
+          df = pd.read_sql(query, conn, params=[country_code])
           conn.close()
-          
+
           if len(df) > 0:
               row = df.iloc[0]
               status = 'ACTIVE' if row['ACTIVE'] else 'INACTIVE'
               print(f'Country: {row[\"COUNTRY_CODE\"]} ({row[\"COUNTRY_NAME\"]})')
               print(f'Status: {status}')
           else:
-              print('⚠ Country not found in table')
+              print('Country not found in table')
           "
-

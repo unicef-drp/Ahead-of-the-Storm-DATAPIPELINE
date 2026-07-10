@@ -74,16 +74,18 @@ def _normalize_forecast_time(date: str) -> str:
 def _execute_query(query: str, params: Optional[List[Any]] = None) -> pd.DataFrame:
     """
     Execute a SQL query against Snowflake and return results as DataFrame.
-    
+
     Args:
         query: SQL query string
         params: Optional list of parameters for parameterized query
-    
+
     Returns:
-        pd.DataFrame: Query results, or empty DataFrame on error
-    
+        pd.DataFrame: Query results. An empty DataFrame means the query
+        genuinely returned 0 rows.
+
     Note:
-        Connection is automatically closed after query execution.
+        Connection is automatically closed after query execution (or after a
+        failed attempt), whether this function returns normally or raises.
     """
     conn = None
     try:
@@ -93,9 +95,6 @@ def _execute_query(query: str, params: Optional[List[Any]] = None) -> pd.DataFra
         else:
             df = pd.read_sql(query, conn)
         return df
-    except Exception as e:
-        logger.error(f"Error executing query: {e}")
-        return pd.DataFrame()
     finally:
         if conn:
             conn.close()
@@ -633,7 +632,16 @@ def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: 
     """
     Returns ISO codes of countries whose boundary is within buffer_m metres of the
     combined storm envelope for the given track_id and forecast_time.
-    Returns an empty list if COUNTRY_BOUNDARY is not populated (graceful fallback).
+    Returns an empty list if COUNTRY_BOUNDARY is not populated anywhere (the
+    query's own WHERE clause naturally returns 0 rows in that case, a genuine
+    "confirmed 0 countries in range" result, not an error).
+
+    Raises on a genuine query failure (connection/permission/ST_DWITHIN error)
+    instead of swallowing it: the caller (main_pipeline.py) distinguishes
+    "confirmed empty result" from "query itself failed" specifically to decide
+    whether to fall back to the Python 500km-buffer check, silently returning
+    [] here for BOTH cases would make that fallback dead code, since the
+    caller's own except would never fire.
     """
     forecast_datetime = _normalize_forecast_time(forecast_time)
     sql = """
@@ -649,13 +657,9 @@ def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: 
               %(buffer_m)s
           )
     """
-    try:
-        cursor.execute(sql, {"track_id": track_id, "forecast_time": forecast_datetime, "buffer_m": buffer_m})
-        rows = cursor.fetchall()
-        return [r[0] for r in rows]
-    except Exception as e:
-        logger.warning(f"SQL country pre-filter failed, will fall back to Python: {e}")
-        return []
+    cursor.execute(sql, {"track_id": track_id, "forecast_time": forecast_datetime, "buffer_m": buffer_m})
+    rows = cursor.fetchall()
+    return [r[0] for r in rows]
 
 
 def get_snowflake_data() -> pd.DataFrame:
