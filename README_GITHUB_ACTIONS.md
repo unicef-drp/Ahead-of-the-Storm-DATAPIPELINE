@@ -211,7 +211,7 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 3. Click **"Run workflow"**
 4. Fill in the form:
    - **Countries**: Comma-separated (e.g., `PNG,FJI`) or leave empty for all active countries
-   - **Columns**: Space-separated column names to patch (required — see supported columns below)
+   - **Columns**: Space-separated column names to patch (required, see supported columns below)
    - **Zoom Level**: Must match the existing mercator parquet (default: `14`)
 5. Click **"Run workflow"**
 
@@ -238,10 +238,10 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 - `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Patching any regular column updates the mercator parquet and **all initialized admin parquets** (re-aggregated automatically for every admin level found)
-- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles — no GeoRepo re-fetch of existing levels needed
+- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles, no GeoRepo re-fetch of existing levels needed
 - Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
 - The country must already be initialized (base mercator parquet must exist)
-- Population columns can be patched individually — useful when a new WorldPop dataset is released
+- Population columns can be patched individually, useful when a new WorldPop dataset is released
 
 **Examples:**
 ```

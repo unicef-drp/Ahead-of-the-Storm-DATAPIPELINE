@@ -27,9 +27,9 @@ The pipeline uses environment variables to configure base directories:
   - Relative Wealth Index: `rwi`
   - Facility counts per tile: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Administrative boundary ID (admin level 1): `id`
-  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob` — PCHIP-interpolated child poverty rates per tile from DHS/RWI disaggregation
+  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob`: PCHIP-interpolated child poverty rates per tile from DHS/RWI disaggregation
 - **Created by:** `create_mercator_country_layer()` via `save_mercator_and_admin_views()`
-- **Note:** One file per country per zoom level. This parquet is the single source of truth for all base spatial data including poverty rates — poverty rates are NOT echoed into per-threshold impact CSVs.
+- **Note:** One file per country per zoom level. This parquet is the single source of truth for all base spatial data including poverty rates. Admin/facility per-threshold impact CSVs never carry poverty columns; the mercator tile view (item 12) is an exception, see its own note.
 
 ### 2. Base Admin Views (per country, per admin level)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_admin{N}.parquet`
@@ -40,7 +40,7 @@ The pipeline uses environment variables to configure base directories:
   - Built surface total: `built_surface_m2`
   - Facility counts: `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
   - Average wealth/settlement: `rwi`, `smod_class`, `smod_class_l1`
-  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob` — **population-weighted mean** poverty rate across tiles in the admin unit: `Σ(pop_tile × rate_tile) / Σ(pop_tile)`. Tiles without RWI coverage (NaN poverty rate) are excluded from both numerator and denominator. When all admin tiles lack RWI the column is NaN. Aggregating all admin units population-weighted back to national level exactly recovers the calibrated national target — calibration drops NaN-RWI tiles before quintile assignment and scales PCHIP outputs so `Σ(rate × pop)` matches the DHS-implied count for covered tiles. NaN areas are absent from both the calibration and the aggregation by design, not a source of additional error.
+  - *(Optional, after `--type patch --columns vulnerability`)* `moderate_poverty_prob`, `severe_poverty_prob`: **population-weighted mean** poverty rate across tiles in the admin unit: `Σ(pop_tile × rate_tile) / Σ(pop_tile)`. Tiles without RWI coverage (NaN poverty rate) are excluded from both numerator and denominator. When all admin tiles lack RWI the column is NaN. Aggregating all admin units population-weighted back to national level exactly recovers the calibrated national target: calibration drops NaN-RWI tiles before quintile assignment and scales PCHIP outputs so `Σ(rate × pop)` matches the DHS-implied count for covered tiles. NaN areas are absent from both the calibration and the aggregation by design, not a source of additional error.
   - Administrative names and geometries
 - **Created by:** `create_admin_country_layer()` via `save_mercator_and_admin_views()`
 - **Note:** One file per country per admin level. Default is admin1; use `--admin 1 2` during initialize (or `--type patch --columns admin2`) to create admin2. Admin parquets are automatically re-synced whenever `--type patch` runs, so they pick up any newly patched columns including poverty rates.
@@ -67,7 +67,7 @@ The pipeline uses environment variables to configure base directories:
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** Emergency shelter locations fetched from OSM Overpass (`social_facility=shelter`)
 - **Created by:** `save_shelter_locations()`
-- **Note:** Cached after first fetch. Replaced by `geodb/custom/{country}_shelters.csv` if present. OSM coverage is sparse — providing a custom government shelter registry is recommended.
+- **Note:** Cached after first fetch. Replaced by `geodb/custom/{country}_shelters.csv` if present. OSM coverage is sparse: providing a custom government shelter registry is recommended.
 
 ### 6. WASH Locations (per country, cached)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/wash_views/{country}_wash.parquet`
@@ -86,13 +86,13 @@ The pipeline uses environment variables to configure base directories:
 - **Example:** `geodb/vulnerability/PHL_vulnerability_z14.csv`
 - **Format:** CSV (DataFrame)
 - **Content:** Per-tile child poverty rates from DHS/RWI disaggregation:
-  - `tile_id` — mercator quadkey at the specified zoom level
-  - `moderate_poverty_prob` — moderate child poverty rate per tile (0–1), DHS threshold: ≥2 deprivations
-  - `severe_poverty_prob` — severe child poverty rate per tile (0–1), DHS threshold: ≥3 deprivations
+  - `tile_id`: mercator quadkey at the specified zoom level
+  - `moderate_poverty_prob`: moderate child poverty rate per tile (0–1), DHS threshold: ≥2 deprivations
+  - `severe_poverty_prob`: severe child poverty rate per tile (0–1), DHS threshold: ≥3 deprivations
 - **Created by:** `vulnerability/fetch_vulnerability_probs.py` (downloads from Azure Blob)
 - **Note:** Pre-computed using Meta RWI + DHS quintile anchors + PCHIP interpolation. Tiles without RWI coverage have NaN poverty rates (~30% for PHL). This file is the source for patching the base parquet.
 
-After fetching, patching the base parquet writes `moderate_poverty_prob` and `severe_poverty_prob` into `{country}_{zoom}.parquet`. This is the only location where raw poverty rates live at tile level — they are NOT copied into per-threshold impact CSVs.
+After fetching, patching the base parquet writes `moderate_poverty_prob` and `severe_poverty_prob` into `{country}_{zoom}.parquet`. This is the only location where raw poverty rates live at tile level. Admin/facility per-threshold impact CSVs never carry these; the mercator tile view (item 12) is an exception, see its own note.
 
 ---
 
@@ -143,7 +143,7 @@ For each storm/forecast combination processed, the following files are created:
   - `E_rwi`, `E_smod_class`, `E_smod_class_l1`
   - `probability`
 - **Created by:** `save_tiles_view()`
-- **Note:** Multiple files per storm (one per wind threshold). **Poverty rate columns are not included** — raw poverty rates (`moderate_poverty_prob`, `severe_poverty_prob`) live only in the base parquet; wind-integrated people-in-need estimates live only in the vulnerability output file (item 15). This keeps per-threshold files lean and avoids redundant duplication across 8 threshold files per forecast.
+- **Note:** Multiple files per storm (one per wind threshold). Wind-integrated people-in-need estimates live only in the vulnerability output file (item 15), never here. Raw poverty rates (`moderate_poverty_prob`, `severe_poverty_prob`) are appended as trailing columns ($17/$18) when the country has been patched with vulnerability data `create_mercator_view_from_envelopes()` deliberately keeps them last so the file's first 16 columns stay positionally identical to the pre-poverty format. Wind's own MAT-loading SQL ignores these trailing columns; gust's own MAT table does capture them (see item 33 / `MERCATOR_TILE_GUST_MAT`). Countries without vulnerability data simply don't have these columns in the file at all.
 
 ### 13. CCI (Child Cyclone Index) Tile Views (per country, per storm, per forecast, per zoom)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{storm}_{date}_{zoom_level}_cci.csv`
@@ -170,7 +170,7 @@ For each storm/forecast combination processed, the following files are created:
   - `probability`
   - `name` (admin name)
 - **Created by:** `save_admin_tiles_view()`
-- **Note:** Multiple files per storm per wind threshold per initialized admin level. Auto-detected from existing base admin parquets — no configuration needed at update time. **Poverty rate columns are not included** — people-in-need estimates aggregated by admin are in the vulnerability admin views (item 16).
+- **Note:** Multiple files per storm per wind threshold per initialized admin level. Auto-detected from existing base admin parquets, no configuration needed at update time. **Poverty rate columns are not included**: people-in-need estimates aggregated by admin are in the vulnerability admin views (item 16).
 
 ### 15. CCI Admin Views (per country, per storm, per forecast, per admin level)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/{country}_{storm}_{date}_admin{N}_cci.csv`
@@ -185,15 +185,15 @@ For each storm/forecast combination processed, the following files are created:
 - **Example:** `geodb/aos_views/mercator_views/PHL_FUNG-WONG_20251109060000_14_vulnerability.csv`
 - **Format:** CSV (DataFrame)
 - **Content:** Wind-integrated people/children in need per tile (CHIN methodology):
-  - `zone_id` — mercator quadkey (= tile_id)
-  - `id` — admin1 unit ID (for admin aggregation)
-  - `E_infant_in_need` — expected infants (0–4y) in need
-  - `E_school_age_in_need` — expected school-age children (5–14y) in need
-  - `E_adolescent_in_need` — expected adolescents (15–19y) in need
-  - `E_children_in_need` — expected children (0–19y) in need
-  - `E_people_in_need` — expected total people in need
+  - `zone_id`: mercator quadkey (= tile_id)
+  - `id`: admin1 unit ID (for admin aggregation)
+  - `E_infant_in_need`: expected infants (0–4y) in need
+  - `E_school_age_in_need`: expected school-age children (5–14y) in need
+  - `E_adolescent_in_need`: expected adolescents (15–19y) in need
+  - `E_children_in_need`: expected children (0–19y) in need
+  - `E_people_in_need`: expected total people in need
 - **Created by:** `save_vulnerability_tiles()` (called automatically during `--type update` for patched countries)
-- **Note:** One file per storm per forecast. This is the sole output with E_people_in_need estimates — these are not included in the per-threshold CSVs (item 12). Tiles without RWI/poverty coverage produce NaN and are excluded. Countries not patched with vulnerability data produce an empty file (NaN columns, no error).
+- **Note:** One file per storm per forecast. This is the sole output with E_people_in_need estimates: these are not included in the per-threshold CSVs (item 12). Tiles without RWI/poverty coverage produce NaN and are excluded. Countries not patched with vulnerability data produce an empty file (NaN columns, no error).
 - **Methodology:** Vulnerability weight = Σ P(band k) × rate(k), where bands are mutually exclusive (P(band k) = P(≥k) − P(≥k+1)) and rates follow the CHIN formula: <50kt → severe rate; 50–96kt → `moderate × (1−t) + t, t = (kt−50)/46`; ≥96kt → 1.0.
 
 ### 17. Vulnerability Admin Views (per country, per storm, per forecast, per admin level)
@@ -226,15 +226,26 @@ For each storm/forecast combination processed, the following files are created:
 - **Example:** `geodb/aos_views/track_views/PHL_FUNG-WONG_20251109060000_14_vulnerability_tracks.parquet`
 - **Format:** Parquet (DataFrame)
 - **Content:** Per-ensemble-member people/children in need totals:
-  - `zone_id` — ensemble member number
+  - `zone_id`: ensemble member number
   - `severity_people_in_need`
   - `severity_children_in_need`
   - `severity_infant_in_need`
   - `severity_school_age_in_need`
   - `severity_adolescent_in_need`
 - **Created by:** `calculate_vulnerability_tracks()` → `save_vulnerability_tracks()`
-- **Note:** One file per storm per forecast (not per wind threshold — vulnerability integrates across all thresholds per member). All `severity_*` columns are NaN for countries not patched with vulnerability data. Loaded into **`TRACK_VULNERABILITY_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. The dashboard joins this onto `TRACK_MAT` via `get_track_impacts()` in `snowflake_utils.py` to include in-need columns alongside wind-threshold severity metrics.
-- **Methodology:** For each member, tiles intersecting that member's cumulative wind envelopes are identified via spatial join. Each tile is assigned the rate of its *highest* wind band reached by that member (exclusive assignment, same rate formula as item 16). The per-tile `population × rate` values are then summed. This is the per-member analogue of item 16: item 16 uses ensemble-probability weights to produce expected values per tile; this file uses binary member coverage to produce scenario totals per member (enabling DET/#51 and worst-case display in the dashboard). See `vulnerability/README.md` for the full rate formula and the relationship between these two outputs.
+- **Note:** One file per storm per forecast (not per wind threshold, vulnerability integrates across all thresholds per member). All `severity_*` columns are NaN for countries not patched with vulnerability data. Loaded into **`TRACK_VULNERABILITY_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. The dashboard joins this onto `TRACK_MAT` via `get_track_impacts()` in `snowflake_utils.py` to include in-need columns alongside wind-threshold severity metrics.
+- **Methodology:** For each member, tiles intersecting that member's cumulative wind envelopes are identified via spatial join. Each tile is assigned the rate of its *highest* wind band reached by that member (exclusive assignment, same rate formula as item 16): `severe_poverty_prob` below 50kt, a linear blend from `moderate_poverty_prob` toward 1.0 between 50-96kt, and 1.0 (catastrophic, all people need assistance) at/above 96kt. The per-tile `population × rate` values are then summed. This is the per-member analogue of item 16: item 16 uses ensemble-probability weights to produce one expected value per tile (a spatial map of vulnerability concentration); this file uses binary member coverage to produce one scenario total per member instead (enabling DET/#51 and worst-case display in the dashboard).
+
+### 19b. Tile-Member Bitmask Views (per country, per storm, per forecast, per wind/gust threshold)
+**Location (wind):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
+- **Example:** `geodb/aos_views/track_tile_bitmask_views/PHL_BAVI_20260704000000_34.parquet`
+
+**Location (gust):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
+- **Example:** `geodb/aos_views/track_tile_bitmask_views_gust/PHL_BAVI_20260702000000_g17.parquet`
+- **Format:** Parquet (DataFrame)
+- **Content:** Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask: `tile_id`, `bits` (bit `m-1` set ⇔ member `m`'s envelope covers that tile). One row per DISTINCT tile with ≥1 member's envelope covering it; a tile with zero coverage from every member simply has no row (sparse, same convention as `TRACK_MAT`'s own severity columns).
+- **Created by:** `calculate_tile_member_bitmask()` → `save_tracks_tile_bitmask_view()` (real feature added 2026-08)
+- **Note:** Multiple files per storm (one per threshold, same pattern as item 18). Loaded into **`TILE_WIND_BITMASK_MAT`**/**`TILE_GUST_BITMASK_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. Persists the same envelope-vs-tile spatial join item 18's own `severity_*` columns are computed from (previously discarded immediately after collapsing to a country-wide scalar); this keeps the per-member, per-tile identity instead, enabling a real tile-level union across hazards in the dashboard's "Compare Worst Case By" feature (`pages/map_shell_concept.py`'s `_fetch_family_member_frames`, which unions this bitmask data across Wind/Gust/River/Rain into one real per-member total instead of approximating it from separate marginal totals).
 
 ### 20. JSON Impact Reports (per country, per storm, per forecast)
 **Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
@@ -252,7 +263,7 @@ For each storm/forecast combination processed, the following files are created:
   - Change indicators vs previous forecast: `children_change`, `children_change_perc`, `children_change_direction`
   - Metadata: `storm`, `country`, `forecast_date`, `next_forecast_date`, `report_date`, `expected_landfall`, `storm_category`
 - **Created by:** `do_report()` → `save_json_report()`
-- **Note:** One file per country per storm per forecast. `E_*_in_need` fields are `None` (N/A) for countries not patched with vulnerability data — all other fields are unaffected.
+- **Note:** One file per country per storm per forecast. `E_*_in_need` fields are `None` (N/A) for countries not patched with vulnerability data; all other fields are unaffected.
 
 ### 21. Processed Storms Tracking File
 **Location:** `{RESULTS_DIR}/{STORMS_FILE}`
@@ -279,27 +290,27 @@ These files are downloaded automatically by the GigaSpatial library and stored i
 ### 22. WorldPop Population Data
 - **Source:** WorldPop API (GR2, year=2025)
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store (local filesystem or Snowflake stage). On first init for a country all 62 age-band files (~175 MB) are downloaded and cached; subsequent runs reuse the cache.
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial), written to the active data store (local filesystem or Snowflake stage). On first init for a country all 62 age-band files (~175 MB) are downloaded and cached; subsequent runs reuse the cache.
 - **Stored in mercator parquet as:** `population` (100m res, sum per tile), `school_age_population`, `infant_population`, `adolescent_population` (all 100m res, sum per tile)
 
 ### 23. GHSL Built Surface Data
 - **Source:** Global Human Settlement Layer (GHSL), year=2020, 100m resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial), written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `built_surface_m2` (sum per tile)
 
 ### 24. SMOD Settlement Classification Data
 - **Source:** GHSL Settlement Model (SMOD), year=2020, 1km resolution
 - **Downloaded by:** `MercatorViewGenerator` (giga-spatial internal)
-- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial), written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `smod_class` (raw L2 median per tile, values 10–30) and `smod_class_l1` (derived 3-class: 1=rural, 2=suburban, 3=urban)
 
 ### 25. Relative Wealth Index (RWI) Data
 - **Source:** Facebook/Meta RWI dataset via HDX
 - **Downloaded by:** `RWIHandler` (giga-spatial internal)
-- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial) — written to the active data store on first use, reused on subsequent runs
+- **Raw cache:** `geodb/bronze/` (subdirectory managed by giga-spatial), written to the active data store on first use, reused on subsequent runs
 - **Stored in mercator parquet as:** `rwi` (mean per tile)
-- **Note:** Not available for all countries. Tiles will have NaN for `rwi` where data is unavailable — no error raised.
+- **Note:** Not available for all countries. Tiles will have NaN for `rwi` where data is unavailable; no error raised.
 
 ### 26. School Locations
 **Source:** GIGA School Location API
@@ -400,10 +411,10 @@ Disable with `--skip-precip`.
 
 Two families of tiers, computed for 4 accumulation windows (`PRECIP_WINDOWS_H` = 6, 24, 72,
 120 hours):
-- **tp exceedance tiers** — probability (fraction of the 51-member ensemble) that accumulated
+- **tp exceedance tiers**: probability (fraction of the 51-member ensemble) that accumulated
   rainfall exceeds a moderate/heavy/extreme mm threshold for that window
   (`PRECIP_TP_THRESHOLDS_MM`, e.g. 25/50/75mm at 6h, 50/100/150mm at 120h)
-- **ro/tp ratio tiers** — probability that the runoff/precipitation ratio exceeds a dimensionless
+- **ro/tp ratio tiers**: probability that the runoff/precipitation ratio exceeds a dimensionless
   cut point (`RATIO_THRESHOLDS` = 0.3, 0.6; a Rational Method runoff-coefficient reference,
   0.3 = "meaningfully elevated" runoff response, 0.6 = "majority of the rain becomes runoff"),
   a flash-flood-response proxy since no real flood-forecasting system uses one fixed mm cut
@@ -426,27 +437,27 @@ geometry (a true point, or a polygon for the minority of health-center OSM recor
 building footprints). No CCI, vulnerability, or JSON report for precip, same as gust.
 
 ### 36. Precip Tile Impact Views (tp)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/precip_views_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv`
-- **Example:** `geodb/aos_views/precip_views_tp/PHL_20260705000000_p50_24h.csv`
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv`
+- **Example:** `geodb/aos_views/mercator_views_precip/PHL_20260705000000_p50_24h.csv`
 - **Format:** CSV (DataFrame, no geometry)
 - **Content:** `zone_id` (tile_id), `probability`, `native_cell_row`/`native_cell_col` which
-  native ~0.25° precip grid cell this tile's centroid falls in — makes the tile-to-native-cell
-  relationship explicit/queryable, all base mercator parquet columns (population, `num_schools`,
-  etc.), `E_population` (`probability × population`)
+  native ~0.25° precip grid cell this tile's centroid falls in: makes the tile-to-native-cell
+  relationship explicit/queryable, all base mercator parquet columns except `population` (which
+  is dropped, e.g. `num_schools`, etc.), `E_population` (`probability × population`)
 - **Created by:** `create_precip_tile_view()` -> `save_precip_tile_view()`
 - **Note:** One file per window per tp threshold (4 windows × 3 tiers = 12 files per cycle)
 
 ### 37. Precip Tile Impact Views (ro/tp ratio)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/precip_views_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.csv`
-- **Example:** `geodb/aos_views/precip_views_ratio/PHL_20260705000000_g30_24h.csv` (ratio 0.3)
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.csv`
+- **Example:** `geodb/aos_views/mercator_views_precipratio/PHL_20260705000000_g30_24h.csv` (ratio 0.3)
 - **Format:** CSV (DataFrame, no geometry), same columns as item 36
 - **Created by:** `create_precip_tile_view()` -> `save_precip_ratio_view()`
 - **Note:** One file per window per ratio tier (4 windows × 2 tiers = 8 files per cycle)
 
 ### 38. Precip Admin Impact Views (tp and ratio)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precip_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h_admin{N}.csv`,
-`{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precip_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h_admin{N}.csv`
-- **Example:** `geodb/aos_views/admin_views_precip_tp/PHL_20260705000000_p50_24h_admin1.csv`
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h_admin{N}.csv`,
+`{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h_admin{N}.csv`
+- **Example:** `geodb/aos_views/admin_views_precip/PHL_20260705000000_p50_24h_admin1.csv`
 - **Format:** CSV (DataFrame, no geometry)
 - **Content:** `tile_id` (renamed `id` on read), `E_population` (summed across tiles in the admin
   unit), `probability` (mean across tiles), `name` (admin name)
@@ -454,9 +465,9 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
 - **Note:** Auto-detected from existing initialized admin levels, same as item 14
 
 ### 39. Precip School/HC/Shelter/WASH Impact Views (tp and ratio)
-**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precip_tp/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet`,
-`{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precip_ratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet`
-- **Example:** `geodb/aos_views/school_views_precip_tp/PHL_20260705000000_p50_24h.parquet`
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet`,
+`{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet`
+- **Example:** `geodb/aos_views/school_views_precip/PHL_20260705000000_p50_24h.parquet`
 - **Format:** Parquet (GeoDataFrame)
 - **Content:** every original attribute column from the facility's own cached location file (item
   3–6) plus `probability` (from the facility's containing tile, see above) and the facility's own
@@ -466,6 +477,81 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
 - **Note:** Skipped entirely (no file written) for a country/facility-type combination with zero
   cached locations (WASH/shelters are frequently sparse in OSM), rather than writing a zero-row
   file. 8 directories total (4 facility types × tp/ratio).
+
+---
+
+## River Flood (GloFAS x JRC) Impact Views (per country, per RP tier, per lead-time step)
+
+Storm-independent, same calling convention as precip: run once per `--type update` invocation
+(`run_river_flood_analysis()` in `main_pipeline.py`), not once per storm, and not filtered by
+`--storm`. Uses the *latest* `RIVER_FORECASTS` row per RP tier by default, or the exact calendar
+date if `--date` is passed. Source data (per-member flooded-pixel Parquet files, produced daily by
+the separate TC-ECMWF-Forecast-Pipeline repo from GloFAS river-discharge ensembles matched against
+JRC's global flood-extent maps) lives only on Snowflake's internal stage via
+`RIVER_FORECASTS.STAGE_PATH`, independent of `DATA_PIPELINE_DB`. Disable with `--skip-river-flood`.
+
+Six return-period (RP) tiers (`RIVER_RP_TIERS` = rp2, rp5, rp10, rp20, rp50, rp100, how rare a
+river discharge level is, not a probability), each computed for 7 lead-time steps
+(`RIVER_LEADTIME_STEPS_H` = 24, 48, 72, 96, 120, 144, 168 hours). Unlike precip's coarse ~0.25°
+continuous raster, GloFAS/JRC flood pixels are ~150m resolution, comparable to a zoom-14
+mercator tile or a buffered facility footprint, not much coarser. Because of that, this hazard
+type reuses **wind/gust's** modeling shape, not precip's:
+- Tile/admin probability = `count(distinct flooded members in the zone) / FULL_ENSEMBLE_SIZE`
+  (51-member ensemble, same convention as wind/gust), via point-in-polygon `gpd.sjoin` +
+  `.nunique('member')` (counting distinct members, not rows, since one member can contribute
+  multiple flooded pixels to the same zone at this resolution).
+- **Facility-level probability is independently computed via direct buffer-and-intersect**
+  (`create_river_facility_view()`), the *wind/gust* shape, explicitly **not** precip's
+  tile-routed shape, because the resolution reasoning that justifies tile-routing for precip
+  (grid far coarser than a facility) does not hold here.
+- `below_min_basin` (bool): a JRC-upstream QC flag surfaced per-zone as `.any()`, **never** used
+  to exclude a pixel/tile/facility, only an informational caveat (per upstream's own explicit
+  design principle: "gate on RP tier for relevance, attach as a secondary attribute, not a
+  pre-filter").
+- `is_standin` (bool): sourced from the real `RIVER_FORECASTS.IS_STANDIN` column for that tier/date
+  (not a hardcoded list),  `True` means the upstream pipeline substituted a lower-fidelity
+  placeholder cycle; an upper-bound approximation, not an exact forecast, kept visible rather than
+  silently absorbed.
+
+No CCI, vulnerability, or JSON report for river flood, same as gust/precip.
+
+### 40. River Tile Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.csv`
+- **Example:** `geodb/aos_views/mercator_views_river/PHL_20260714000000_rp10_120h.csv`
+- **Format:** CSV (DataFrame, no geometry)
+- **Content:** `zone_id` (tile_id), `probability`, `below_min_basin`, `is_standin`, and the full
+  `E_*` breakdown (`E_population`, `E_school_age_population`, `E_infant_population`,
+  `E_adolescent_population`, `E_built_surface_m2`, `E_smod_class`, `E_smod_class_l1`, `E_rwi`,
+  `E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`), the exact same `data_cols`
+  loop item 12 (wind) and item 33 (gust) use, so this file's column set matches those exactly,
+  minus the CCI/vulnerability columns (out of scope for river flood, same as gust/precip)
+- **Created by:** `create_river_tile_view()` → `save_river_tile_view()`
+- **Note:** One file per (RP tier × lead-time step) with at least one flooded pixel in the
+  country's bounding box (a common no-file outcome for dry tiers/steps, not an error)
+
+### 41. River Admin Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h_admin{N}.csv`
+- **Example:** `geodb/aos_views/admin_views_river/PHL_20260714000000_rp10_120h_admin1.csv`
+- **Format:** CSV (DataFrame, no geometry)
+- **Content:** `tile_id` (admin zone id), the same full `E_*` breakdown as item 40 (summed across
+  tiles in the admin unit, NaN-preserving via `_optional_sum` for optional columns), `probability`
+  (mean across tiles), `below_min_basin` (OR'd across tiles), `is_standin`, `name` (admin name);
+  matches item 14's (wind) column set exactly, minus CCI/vulnerability
+- **Created by:** `create_river_admin_view()` → `save_river_admin_view()`
+- **Note:** Auto-detected from existing initialized admin levels, same as item 14
+
+### 42. River School/HC/Shelter/WASH Impact Views
+**Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/{school,hc,shelter,wash}_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet`
+- **Example:** `geodb/aos_views/school_views_river/PHL_20260714000000_rp10_120h.parquet`
+- **Format:** Parquet (GeoDataFrame)
+- **Content:** every original attribute column from the facility's own cached location file (item
+  3–6) plus `probability` (independently computed via buffer-and-intersect, not routed through a
+  tile), `below_min_basin`, `is_standin`, and the facility's own true geometry
+- **Created by:** `create_river_facility_view()` → `save_river_school_view()` /
+  `save_river_hc_view()` / `save_river_shelter_view()` / `save_river_wash_view()`
+- **Note:** Skipped entirely (no file written) for a country/facility-type combination with zero
+  cached locations, same as precip. 4 directories total (one per facility type, no tp/ratio
+  split, since river flood has only one hazard variable).
 
 ---
 
@@ -492,7 +578,7 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
 └── {VIEWS_DIR}/                        # e.g., aos_views/
     ├── mercator_views/
     │   ├── {country}_{zoom}.parquet                         # Base mercator views (incl. poverty rates after patch)
-    │   ├── {country}_{storm}_{date}_{wind}_{zoom}.csv       # Per-threshold impact tile views (no poverty rates)
+    │   ├── {country}_{storm}_{date}_{wind}_{zoom}.csv       # Per-threshold impact tile views (poverty rates trailing, if patched)
     │   ├── {country}_{storm}_{date}_{zoom}_cci.csv          # CCI tile views
     │   └── {country}_{storm}_{date}_{zoom}_vulnerability.csv # People/children in need (sole E_*_in_need output)
     ├── admin_views/
@@ -515,6 +601,10 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
     ├── track_views/
     │   ├── {country}_{storm}_{date}_{wind}.parquet                        # Track impact views (per wind threshold)
     │   └── {country}_{storm}_{date}_{zoom}_vulnerability_tracks.parquet   # Per-member vulnerability totals
+    ├── track_tile_bitmask_views/
+    │   └── {country}_{storm}_{date}_{wind}.parquet             # Per-tile, per-member wind coverage bitmask
+    ├── track_tile_bitmask_views_gust/
+    │   └── {country}_{storm}_{date}_g{gust}.parquet            # Per-tile, per-member gust coverage bitmask
     ├── mercator_views_gust/
     │   └── {country}_{storm}_{date}_g{gust}_{zoom}.csv        # Gust tile impact views
     ├── admin_views_gust/
@@ -529,18 +619,24 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
     │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust WASH impact views
     ├── track_views_gust/
     │   └── {country}_{storm}_{date}_g{gust}.parquet           # Gust track impact views
-    ├── precip_views_tp/
+    ├── mercator_views_precip/
     │   └── {country}_{forecast_time}_p{mm}_{window}h.csv          # Precip tile views (tp exceedance)
-    ├── precip_views_ratio/
+    ├── mercator_views_precipratio/
     │   └── {country}_{forecast_time}_g{ratio*100}_{window}h.csv   # Precip tile views (ro/tp ratio)
-    ├── admin_views_precip_tp/
+    ├── admin_views_precip/
     │   └── {country}_{forecast_time}_p{mm}_{window}h_admin{N}.csv
-    ├── admin_views_precip_ratio/
+    ├── admin_views_precipratio/
     │   └── {country}_{forecast_time}_g{ratio*100}_{window}h_admin{N}.csv
-    ├── school_views_precip_tp/ ... wash_views_precip_tp/
+    ├── school_views_precip/ ... wash_views_precip/
     │   └── {country}_{forecast_time}_p{mm}_{window}h.parquet      # Precip facility views (tp), 4 dirs
-    └── school_views_precip_ratio/ ... wash_views_precip_ratio/
-        └── {country}_{forecast_time}_g{ratio*100}_{window}h.parquet  # Precip facility views (ratio), 4 dirs
+    ├── school_views_precipratio/ ... wash_views_precipratio/
+    │   └── {country}_{forecast_time}_g{ratio*100}_{window}h.parquet  # Precip facility views (ratio), 4 dirs
+    ├── mercator_views_river/
+    │   └── {country}_{forecast_time}_{rp_tier}_{step_h}h.csv          # River-flood tile views
+    ├── admin_views_river/
+    │   └── {country}_{forecast_time}_{rp_tier}_{step_h}h_admin{N}.csv # River-flood admin views
+    └── school_views_river/ ... wash_views_river/
+        └── {country}_{forecast_time}_{rp_tier}_{step_h}h.parquet      # River-flood facility views, 4 dirs
 ```
 
 ---
@@ -563,14 +659,22 @@ building footprints). No CCI, vulnerability, or JSON report for precip, same as 
   that assumes wind semantics
 
 ### Precip Threshold/Window Values
-- Forecast timestamp uses `forecast_time` (the MET_FORECASTS cycle), not a storm name/date —
+- Forecast timestamp uses `forecast_time` (the MET_FORECASTS cycle), not a storm name/date:
   precip is storm-independent
 - tp exceedance thresholds: `p{mm}` (e.g. `p50`), values vary per window, see `PRECIP_TP_THRESHOLDS_MM`
   in `main_pipeline.py`
-- ro/tp ratio tiers: `g{ratio*100}` (e.g. `g30` for ratio 0.3, `g60` for ratio 0.6) — note this
+- ro/tp ratio tiers: `g{ratio*100}` (e.g. `g30` for ratio 0.3, `g60` for ratio 0.6); note this
   reuses the same `g` prefix convention as gust but in a completely different directory tree
-  (`*_precip_ratio/` vs `*_gust/`), never ambiguous by path
+  (`*_precipratio/` vs `*_gust/`), never ambiguous by path
 - Accumulation window: `{window}h` (6, 24, 72, or 120 hours)
+
+### River Flood (GloFAS x JRC) Threshold/Window Values
+- Forecast timestamp uses `forecast_time` (the `RIVER_FORECASTS` cycle for that RP tier), not a
+  storm name/date: river flood is storm-independent, same as precip
+- RP tier: `{rp_tier}` (`rp2`, `rp5`, `rp10`, `rp20`, `rp50`, `rp100`, how rare a river discharge
+  level is, e.g. `rp100` = a 1-in-100-year discharge level for that river reach); no numeric-value
+  collision risk with wind/gust thresholds, so no letter-prefix disambiguation is needed
+- Lead-time step: `{step_h}h` (24, 48, 72, 96, 120, 144, or 168 hours)
 
 ### Country Codes
 - ISO3 country codes (e.g., `DOM`, `ATG`, `BLZ`)

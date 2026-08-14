@@ -95,6 +95,16 @@ def _execute_query(query: str, params: Optional[List[Any]] = None) -> pd.DataFra
     Note:
         Connection is automatically closed after query execution (or after a
         failed attempt), whether this function returns normally or raises.
+        Raises on a genuine query failure rather than swallowing it into an
+        empty DataFrame (deliberate fail-loud design, matches
+        get_countries_in_range()'s own reasoning below) -- every CURRENT
+        caller already wraps its own call site in try/except (main_pipeline.py's
+        update_storms()/run_precip_analysis()/run_river_flood_analysis(), and
+        glofas_utils.py's/precip_utils.py's own Snowflake-reading functions,
+        which are themselves only ever called from those wrapped call sites).
+        A FUTURE direct caller that bypasses those wrapped entry points will
+        get an unhandled exception here instead of a silent empty result --
+        wrap your own call site, don't rely on this function to swallow errors.
     """
     conn = None
     try:
@@ -467,7 +477,7 @@ def get_tracks_local(date: str, storm: str) -> pd.DataFrame:
     run_str = dt.strftime('%H')
     # step3_transform's _transform_worker always writes flat with a
     # "transformed_" prefix (pipeline_core.py:320), for both GHA and SPCS
-    # entry points -- confirmed directly, not assumed.
+    # entry points.
     filename = f"transformed_tc_tracks_{date_str}_r{run_str}_storm_{storm}_extracted_transformed.csv"
     raw = _read_hazard_file('tracks', filename, storm=storm)
     if raw is None:
@@ -843,6 +853,42 @@ def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: 
     return [r[0] for r in rows]
 
 
+def get_countries_with_null_boundary(cursor, countries: list) -> list:
+    """
+    Of the given ISO3 country codes, return the subset whose COUNTRY_BOUNDARY is
+    NULL in PIPELINE_COUNTRIES.
+
+    get_countries_in_range()'s own WHERE COUNTRY_BOUNDARY IS NOT NULL means a
+    country with no boundary populated yet (e.g. a transient GeoRepo failure
+    during its one-time --type initialize run) is silently indistinguishable
+    from "confirmed out of range", it never appears in that function's result
+    either way. This lets the caller (main_pipeline.py) detect that ambiguity
+    specifically for the countries it actually requested, and route only those
+    through the Python 500km-buffer fallback instead of trusting a NULL-boundary
+    country was correctly excluded.
+
+    Args:
+        cursor: Open Snowflake cursor.
+        countries: List of ISO3 country codes actually requested this run.
+
+    Returns:
+        list: Subset of `countries` whose COUNTRY_BOUNDARY is NULL. Empty list
+              if every requested country has a real boundary populated.
+    """
+    if not countries:
+        return []
+    placeholders = ", ".join(["%s"] * len(countries))
+    sql = f"""
+        SELECT COUNTRY_CODE
+        FROM AOTS.TC_ECMWF.PIPELINE_COUNTRIES
+        WHERE COUNTRY_BOUNDARY IS NULL
+          AND COUNTRY_CODE IN ({placeholders})
+    """
+    cursor.execute(sql, countries)
+    rows = cursor.fetchall()
+    return [r[0] for r in rows]
+
+
 def get_snowflake_data() -> pd.DataFrame:
     """
     Get hurricane metadata directly from Snowflake.
@@ -856,7 +902,10 @@ def get_snowflake_data() -> pd.DataFrame:
             - TRACK_ID: Storm identifier
             - FORECAST_TIME: Forecast issue time
             - ENSEMBLE_COUNT: Number of ensemble members
-        Returns empty DataFrame with these columns on error.
+        Returns an empty (but correctly-shaped) DataFrame when the query
+        genuinely returns 0 rows. Raises on a genuine query failure (see
+        _execute_query()'s own docstring) -- callers must wrap their own
+        call site in try/except.
     """
     query = '''
     SELECT DISTINCT 

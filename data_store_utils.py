@@ -31,15 +31,34 @@ from gigaspatial.core.io.snowflake_data_store import SnowflakeDataStore
 from config import config as app_config
 import os
 
+
+def get_snowflake_auth_kwargs() -> dict:
+    """
+    Returns {'user':..., 'password':...} for SnowflakeDataStore construction:
+    both None under SPCS_RUN=true (OAuth handles identity, passing real
+    credentials is unnecessary and the values may not even be set), else the
+    configured username/password.
+
+    Single source of truth for the SPCS_RUN branch, shared by every module
+    that constructs its own SnowflakeDataStore directly: this module's own
+    SNOWFLAKE case below, glofas_utils.get_river_forecasts_data_store(),
+    and precip_utils.get_met_forecasts_data_store().
+    """
+    spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
+    if spcs_run:
+        return {'user': None, 'password': None}
+    return {'user': app_config.SNOWFLAKE_USER, 'password': app_config.SNOWFLAKE_PASSWORD}
+
+
 def get_data_store():
     """
     Get the appropriate data store based on centralized configuration
-    
+
     Returns:
         DataStore: Configured data store instance
     """
     data_pipeline_db = app_config.DATA_PIPELINE_DB
-    
+
     if data_pipeline_db == 'BLOB':
         app_config.validate_azure_config()
         return ADLSDataStore(
@@ -48,37 +67,14 @@ def get_data_store():
         )
     elif data_pipeline_db == 'SNOWFLAKE':
         app_config.validate_snowflake_storage_config()
-        
-        # Check if running in SPCS mode
-        spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
-        
-        # In SPCS mode, user/password are not required (OAuth handles authentication)
-        # But SnowflakeDataStore still needs them for initialization
-        # Pass empty strings and let the connection use SPCS OAuth via snowflake_utils
-        if spcs_run:
-            # For SPCS mode, use a connection that supports OAuth
-            # SnowflakeDataStore will need to be updated to support SPCS, but for now
-            # pass None and handle it in the connection creation
-            return SnowflakeDataStore(
-                account=app_config.SNOWFLAKE_ACCOUNT,
-                user=None,  # Not needed in SPCS mode
-                password=None,  # Not needed in SPCS mode
-                warehouse=app_config.SNOWFLAKE_WAREHOUSE,
-                database=app_config.SNOWFLAKE_DATABASE,
-                schema=app_config.SNOWFLAKE_SCHEMA,
-                stage_name=app_config.SNOWFLAKE_STAGE_NAME
-            )
-        else:
-            # Non-SPCS mode: use password authentication
-            return SnowflakeDataStore(
-                account=app_config.SNOWFLAKE_ACCOUNT,
-                user=app_config.SNOWFLAKE_USER,
-                password=app_config.SNOWFLAKE_PASSWORD,
-                warehouse=app_config.SNOWFLAKE_WAREHOUSE,
-                database=app_config.SNOWFLAKE_DATABASE,
-                schema=app_config.SNOWFLAKE_SCHEMA,
-                stage_name=app_config.SNOWFLAKE_STAGE_NAME
-            )
+        return SnowflakeDataStore(
+            account=app_config.SNOWFLAKE_ACCOUNT,
+            warehouse=app_config.SNOWFLAKE_WAREHOUSE,
+            database=app_config.SNOWFLAKE_DATABASE,
+            schema=app_config.SNOWFLAKE_SCHEMA,
+            stage_name=app_config.SNOWFLAKE_STAGE_NAME,
+            **get_snowflake_auth_kwargs(),
+        )
     elif data_pipeline_db == 'LOCAL':
         return LocalDataStore()
     else:
@@ -101,7 +97,7 @@ def get_hazard_data_store(base_path: str = ''):
 
     Args:
         base_path: for LOCAL only, the specific directory this call needs
-            (wind, tracks, or met — they can differ), passed to LocalDataStore
+            (wind, tracks, or met; they can differ), passed to LocalDataStore
             so callers can use paths relative to that directory.
 
     Returns:

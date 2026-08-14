@@ -215,13 +215,15 @@ def find_previous_report(country: str, storm: str, date: str, max_lookback_hours
     standard 6-hour forecast cadence rather than assuming exactly one
     PREVIOUS_FORECAST_HOURS-ago report exists.
 
-    get_previous_date() + a single load_json_report() call used to be exact:
-    if any forecast cycle was skipped (pipeline downtime, a missed run), the
-    report exactly 6h back never existed, load_json_report() returned {}, and
-    every "if not d_previous" branch in do_report()/_calculate_children_change()/
-    _calculate_admin_rows() treated the NEXT report as if it were the storm's
-    very first, resetting all "change" fields to a fresh-baseline computation
-    even though a legitimate earlier report existed a few cycles further back.
+    A single get_previous_date() + load_json_report() lookup only finds a
+    previous report when the forecast cycle immediately before this one
+    exists. If a cycle was skipped (pipeline downtime, a missed run), that
+    lookup returns {}, and every "if not d_previous" branch in
+    do_report()/_calculate_children_change()/_calculate_admin_rows() would
+    treat the current report as the storm's very first, resetting all
+    "change" fields to a fresh-baseline computation even when a legitimate
+    earlier report exists a few cycles further back. Searching backward
+    through multiple cycles avoids that.
 
     Args:
         country: ISO3 country code
@@ -470,7 +472,7 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
             urban_tiles = tiles_with_prob[urban_mask]
             rural_tiles = tiles_with_prob[rural_mask]
             
-            # SMOD data exists — set to actual counts (0 = confirmed no urban/rural population)
+            # SMOD data exists: set to actual counts (0 = confirmed no urban/rural population)
             result['expected_pop_urban'] = int(urban_tiles['E_population'].sum()) if not urban_tiles.empty else 0
             result['expected_school_urban'] = int(urban_tiles['E_school_age_population'].sum()) if not urban_tiles.empty else 0
             result['expected_infant_urban'] = int(urban_tiles['E_infant_population'].sum()) if not urban_tiles.empty else 0
@@ -493,7 +495,7 @@ def _calculate_vulnerability_metrics(tiles_df: pd.DataFrame) -> Dict[str, int]:
             poverty_tiles = tiles_with_prob[poverty_mask]
             severe_tiles = tiles_with_prob[severe_mask]
             
-            # RWI data exists — set to actual counts (0 = confirmed no poverty/severe population)
+            # RWI data exists: set to actual counts (0 = confirmed no poverty/severe population)
             result['expected_pop_poverty'] = int(poverty_tiles['E_population'].sum()) if not poverty_tiles.empty else 0
             result['expected_school_poverty'] = int(poverty_tiles['E_school_age_population'].sum()) if not poverty_tiles.empty else 0
             result['expected_infant_poverty'] = int(poverty_tiles['E_infant_population'].sum()) if not poverty_tiles.empty else 0
@@ -525,7 +527,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
               'rows_admins_infant', 'rows_schools_winds', 'rows_hcs_winds',
               'rows_shelters_winds', 'rows_wash_winds'.
               Population rows include 'change_{wind}' keys (vs previous forecast).
-              Facility wind rows (schools, HCs, shelters, WASH) contain counts only — no
+              Facility wind rows (schools, HCs, shelters, WASH) contain counts only, no
               change tracking at admin level.
     """
     rows_admins_pop_total = []
@@ -564,7 +566,7 @@ def _calculate_admin_rows(wind_admin_views: Dict[int, pd.DataFrame],
         # Calculate values for each wind threshold
         for wind in STORM_CATEGORIES.keys():
             if wind not in wind_admin_views:
-                # Wind threshold has no impact data — use 0 for required fields, None for optional
+                # Wind threshold has no impact data: use 0 for required fields, None for optional
                 d_rows_admins_pop_total[f"{wind}"] = 0
                 d_rows_admins_school[f"{wind}"] = 0
                 d_rows_admins_infant[f"{wind}"] = 0

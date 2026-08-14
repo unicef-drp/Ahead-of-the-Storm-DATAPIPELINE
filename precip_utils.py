@@ -37,6 +37,7 @@ import rasterio
 import zarr
 
 from snowflake_utils import _execute_query
+from data_store_utils import get_snowflake_auth_kwargs
 from config import config as app_config
 
 logger = logging.getLogger(__name__)
@@ -66,15 +67,13 @@ def get_met_forecasts_data_store():
     """
     from gigaspatial.core.io.snowflake_data_store import SnowflakeDataStore
 
-    spcs_run = os.getenv('SPCS_RUN', 'false').lower() == 'true'
     return SnowflakeDataStore(
         account=app_config.SNOWFLAKE_ACCOUNT,
-        user=None if spcs_run else app_config.SNOWFLAKE_USER,
-        password=None if spcs_run else app_config.SNOWFLAKE_PASSWORD,
         warehouse=app_config.SNOWFLAKE_WAREHOUSE,
         database=app_config.SNOWFLAKE_DATABASE,
         schema=app_config.SNOWFLAKE_SCHEMA,
         stage_name=app_config.SNOWFLAKE_STAGE_NAME,
+        **get_snowflake_auth_kwargs(),
     )
 
 def get_latest_met_forecast_snowflake(param: str) -> Optional[dict]:
@@ -127,7 +126,7 @@ def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dic
         {'forecast_time':..., 'stage_path':...} or None if no MET_FORECASTS
         row exists for this param on this date (e.g. the date predates when
         MET_FORECASTS ingestion started, or Zarr retention on the stage has
-        since expired for that cycle) — an expected, normal outcome for an
+        since expired for that cycle): an expected, normal outcome for an
         old-enough backfill date, not an error.
     """
     query = (
@@ -149,10 +148,10 @@ def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dic
 # =============================================================================
 # HAZARD_DATA_SOURCE=LOCAL/BLOB: read the same tp/ro Zarr files directly from
 # TC-ECMWF-Forecast-Pipeline's own met_data/ output instead of MET_FORECASTS.
-# Path convention confirmed directly against ecmwf_met_downloader.py:
+# Path convention matches TC-ECMWF-Forecast-Pipeline's ecmwf_met_downloader.py:
 # `run_str = f'{forecast_date:%Y%m%d}_{run_time:02d}'`,
 # `zip_path = output_dir / f'{param}_{run_str}.zarr.zip'` -- flat, no
-# subdirectory, matching real sample files (met_data/tp_20260701_18.zarr.zip).
+# subdirectory (e.g. met_data/tp_20260701_18.zarr.zip).
 # =============================================================================
 
 _MET_FILENAME_RE = re.compile(r'^([a-z]+)_(\d{8})_(\d{2})\.zarr\.zip$')
@@ -324,6 +323,50 @@ def exceedance_probability(period_grid: np.ndarray, threshold_mm: float) -> np.n
             "per the fixed-51-denominator convention, not excluded from it"
         )
     return (period_grid > threshold_mm).sum(axis=0) / FULL_ENSEMBLE_SIZE
+
+
+def exceedance_bitmask(period_grid: np.ndarray, threshold_mm: float, member_numbers) -> np.ndarray:
+    """
+    Per-grid-cell 64-bit ensemble-member bitmask (bit `member_numbers[i]-1`
+    set <=> member i's own accumulated rainfall exceeds threshold_mm at that
+    cell), the same real per-member exceedance data exceedance_probability()
+    collapses via `.sum(axis=0)/51`, kept instead of discarded. Exists to
+    let a downstream tile-level bitmask (calculate_precip_tile_member_
+    bitmask, impact_analysis.py) be computed and persisted, mirroring
+    Wind/River's own per-member bitmask outputs -- this is the same real
+    per-member exceedance check `_combine_bitmask_aware`'s own rain branch
+    (services/tile_server.py, the dashboard repo) already does live, per
+    request, moved here so it becomes a real pipeline output instead.
+
+    `member_numbers` (NOT a plain 0-50 range) matters: read_precip_window()
+    returns this from the Zarr's own `member_numbers` attribute, defaulting
+    to `range(1, 52)` only when that attribute is absent -- a real ensemble
+    member's own number, not its array position, is what determines which
+    bit gets set, so a Zarr with a genuinely non-contiguous or reordered
+    member axis (e.g. a missing perturbed member for this cycle) still sets
+    the CORRECT bit for each real member present, rather than silently
+    mis-numbering by array position.
+
+    Args:
+        period_grid: (n_members, n_lat, n_lon) accumulated mm per member.
+        threshold_mm: accumulated rainfall threshold in mm.
+        member_numbers: real 1-indexed member numbers, len == period_grid.shape[0],
+            aligned 1:1 with period_grid's own member axis (same list
+            read_precip_window() returns alongside period_grid itself).
+
+    Returns:
+        (n_lat, n_lon) uint64 array, bit `m-1` set <=> member `m` exceeds
+        threshold_mm at that cell. A cell with zero exceeding members is
+        0, not a special/missing value -- a real, common outcome.
+    """
+    member_arr = np.asarray(member_numbers, dtype=np.uint64)
+    member_bits = np.uint64(1) << (member_arr - np.uint64(1))
+    exceeds = period_grid > threshold_mm  # (n_members, n_lat, n_lon) bool
+    # Same vectorized per-member-bit OR-reduction _combine_bitmask_aware's
+    # own rain branch already uses (dashboard repo, services/tile_server.py):
+    # broadcast each member's own bit value across its own exceedance mask,
+    # then OR-reduce across the member axis.
+    return np.bitwise_or.reduce(exceeds.astype(np.uint64) * member_bits[:, None, None], axis=0)
 
 
 def ratio_exceedance_probability(

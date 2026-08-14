@@ -172,13 +172,10 @@ def fetch_latest_forecast_time(client: GeoSightClient, table_id) -> dict:
     Scan GeoSight RT once; return the latest forecast_time per (country_code,
     storm), not a single global scalar across the whole table.
 
-    A single global latest silently breaks incremental sync whenever two
-    storms are active with different forecast cadences: a Pacific storm's
-    genuinely-never-uploaded file could be skipped as "already up to date"
-    just because an Atlantic storm's newer cycle already pushed a later
-    forecast_time into the same shared table. Scoping per (country, storm)
-    matches this module's own docstring, which already promised this
-    granularity.
+    Scoping per (country, storm) is required for incremental sync to work
+    correctly when two storms are active with different forecast cadences:
+    a global latest would let an Atlantic storm's newer cycle mask a
+    Pacific storm's genuinely-never-uploaded file as "already up to date".
 
     Returns: {(country_code, storm): latest_forecast_time}. A key absent
     from this dict (or an empty string value) means no rows exist yet for
@@ -230,12 +227,12 @@ def upload_rows(
     already retries transient failures internally (see GeoSightClient's own
     max_retries), so an exception here means those retries were exhausted for
     this specific row, not that the whole batch should abort. Continuing past
-    one failed row (instead of letting the exception propagate and kill the
-    whole run) matters most in --backfill/--replace mode specifically, where
-    dedup is intentionally disabled, a full-batch crash there previously meant
-    a rerun would re-upload every already-succeeded row as a duplicate; failed
-    rows are collected and reported so a rerun can be scoped precisely to just
-    what actually failed instead of redoing everything.
+    one failed row instead of letting the exception propagate and kill the
+    whole run matters most in --backfill/--replace mode, where dedup is
+    intentionally disabled: a full-batch crash there would force a rerun to
+    re-upload every already-succeeded row as a duplicate. Failed rows are
+    collected and reported instead, so a rerun can be scoped precisely to
+    just what actually failed.
     """
     existing_ids: set[str] = set()
     if not backfill:
@@ -343,7 +340,7 @@ def main() -> None:
                 to_date=args.to_date,
             )
         else:
-            print("Related table does not exist yet — skipping delete step.")
+            print("Related table does not exist yet, skipping delete step.")
         # Upload all matching files unconditionally (no dedup needed after delete)
         args.backfill = True
 
@@ -357,7 +354,7 @@ def main() -> None:
         if latest_by_key:
             print(f"  Found existing data for {len(latest_by_key)} country/storm combination(s).")
         else:
-            print("  GeoSight RT is empty — will upload all matching files.")
+            print("  GeoSight RT is empty, will upload all matching files.")
 
     # 6. Process each admin level into the single RT
     all_rows: list[dict] = []

@@ -15,7 +15,7 @@ When adding custom WASH data, use these exact column names so downstream consume
 |--------|------|-------|
 | `latitude` | float | WGS84 decimal degrees |
 | `longitude` | float | WGS84 decimal degrees |
-| `wash_type` | string | Facility type — see values below. Used in top-5 at-risk reporting. |
+| `wash_type` | string | Facility type, see values below. Used in top-5 at-risk reporting. |
 
 **`wash_type` values** (matching OSM tags fetched by the pipeline):
 
@@ -48,7 +48,7 @@ Include them in custom CSVs where available.
 ## Well-known optional columns
 
 Use these exact names when adding attributes from government or humanitarian datasets.
-These are not returned by OSM — only relevant for custom CSVs.
+These are not returned by OSM, only relevant for custom CSVs.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -56,5 +56,5 @@ These are not returned by OSM — only relevant for custom CSVs.
 | `managing_agency` | string | Operating organisation, e.g. `UNICEF`, `government`, `community` |
 | `water_source` | string | e.g. `borehole`, `spring`, `river`, `rainwater`, `piped` |
 | `operational_status` | string | `operational`, `non-operational`, `seasonal` |
-| `has_handwashing` | string | `yes` / `no` — handwashing station present |
+| `has_handwashing` | string | `yes` / `no` (handwashing station present) |
 | `population_served` | int | Estimated population relying on this facility |

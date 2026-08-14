@@ -34,7 +34,7 @@ All backends use the same relative path convention:
 | `<COUNTRY>_shelters.csv` | OSM Overpass (`social_facility=shelter`) | No | **Preserved** in parquet cache |
 | `<COUNTRY>_wash.csv` | OSM Overpass (WASH infrastructure types) | No | **Preserved** in parquet cache |
 
-**Point data extra columns:** The entire CSV is written to the facility parquet cache (e.g. `school_views/PNG_schools.parquet`). Any columns beyond the required ones — such as `school_name`, `school_data_source`, `shelter_type`, `capacity` — are preserved and available for downstream use (e.g. display in the visualization app). They are not used by the pipeline's impact calculations.
+**Point data extra columns:** The entire CSV is written to the facility parquet cache (e.g. `school_views/PNG_schools.parquet`). Any columns beyond the required ones (such as `school_name`, `school_data_source`, `shelter_type`, `capacity`) are preserved and available for downstream use (e.g. display in the visualization app). They are not used by the pipeline's impact calculations.
 
 ### Tile-level data (pre-aggregated to mercator tiles)
 
@@ -88,7 +88,7 @@ See `template_schools.csv` for a header-only template and `example_schools.csv` 
 ### `<COUNTRY>_health_centers.csv`
 
 The full dataset (all facility types) is stored in the cache. Filtering to relevant
-facility types (`HC_FACILITY_TYPES`) happens at analysis time when generating impact views —
+facility types (`HC_FACILITY_TYPES`) happens at analysis time when generating impact views;
 the same filter applies to both API-sourced and custom data.
 
 Filtering uses the **`amenity`** column, matching the HealthSites.io API documented values.
@@ -111,7 +111,7 @@ See `template_health_centers.csv` and `example_health_centers.csv`.
 ### `<COUNTRY>_shelters.csv`
 
 Custom emergency shelter locations. Replaces the OSM Overpass query for `social_facility=shelter`.
-OSM coverage for this tag is sparse in most countries — providing a government shelter registry
+OSM coverage for this tag is sparse in most countries, so providing a government shelter registry
 as a custom file is the recommended approach.
 
 All facilities in this file enter impact calculations (no type filtering is applied).
@@ -169,7 +169,7 @@ at the specified zoom level for the country boundary.
 | `infant_population` | Yes | float | Infant population 0–4 years (sum within tile) |
 | `adolescent_population` | Yes | float | Adolescent population 15–19y (sum within tile) |
 
-All four population columns are required together — they are hard requirements for the pipeline.
+All four population columns are required together: they are hard requirements for the pipeline.
 Use `NaN` for tiles with no data (e.g. ocean tiles).
 
 > **Extra columns:** Ignored. Only the four required columns are read and merged into the mercator parquet.

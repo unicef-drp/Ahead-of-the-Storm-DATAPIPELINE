@@ -11,6 +11,9 @@ pyproj>=3.4.0
 zarr>=3.0.0
 rasterio>=1.3.0
 
+# Bbox-filtered Parquet reads (GloFAS river-flood extent files)
+duckdb>=1.2.0
+
 # For Snowflake
 snowflake-connector-python[pandas]>=3.0.0
 

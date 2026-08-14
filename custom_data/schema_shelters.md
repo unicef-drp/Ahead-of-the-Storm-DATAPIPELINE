@@ -35,7 +35,7 @@ Include them in custom CSVs where available.
 ## Well-known optional columns
 
 Use these exact names when adding attributes from government shelter registries or other sources.
-These are not returned by OSM — only relevant for custom CSVs.
+These are not returned by OSM, only relevant for custom CSVs.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -44,4 +44,4 @@ These are not returned by OSM — only relevant for custom CSVs.
 | `has_water` | string | `yes` / `no` |
 | `has_sanitation` | string | `yes` / `no` |
 | `has_electricity` | string | `yes` / `no` |
-| `accessible` | string | `yes` / `no` — wheelchair / disability accessible |
+| `accessible` | string | `yes` / `no` (wheelchair / disability accessible) |

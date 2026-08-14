@@ -58,7 +58,7 @@ class Config:
     # hurricane data.
     HAZARD_DATA_SOURCE = os.getenv('HAZARD_DATA_SOURCE', 'SNOWFLAKE').strip().upper()
 
-    # HAZARD_DATA_SOURCE=LOCAL — directories matching TC-ECMWF-Forecast-Pipeline's
+    # HAZARD_DATA_SOURCE=LOCAL: directories matching TC-ECMWF-Forecast-Pipeline's
     # own output locations (WIND_EXTRACTED_DIR/TRANSFORMED_DATA_DIR/MET_DATA_DIR
     # in that repo, all flat, one file per cycle). No defaults here: these are
     # arbitrary local paths on whatever machine is running this repo, there is
@@ -68,7 +68,7 @@ class Config:
     HAZARD_LOCAL_TRACKS_DIR = os.getenv('HAZARD_LOCAL_TRACKS_DIR')
     HAZARD_LOCAL_MET_DIR = os.getenv('HAZARD_LOCAL_MET_DIR')
 
-    # HAZARD_DATA_SOURCE=BLOB — deliberately separate from this app's own
+    # HAZARD_DATA_SOURCE=BLOB: deliberately separate from this app's own
     # ACCOUNT_URL/SAS_TOKEN (which configure THIS app's own output storage);
     # the upstream repo's hazard data typically lives in a different storage
     # account/container entirely.
@@ -151,9 +151,9 @@ class Config:
     @classmethod
     def validate_hazard_data_source_config(cls):
         """Validate configuration for HAZARD_DATA_SOURCE (upstream hazard
-        source data read mode) — independent of validate_storage_config(),
+        source data read mode), independent of validate_storage_config(),
         which is about this repo's own output/cache instead. Only ever
-        called for LOCAL/BLOB (via get_hazard_data_store()) — the SNOWFLAKE
+        called for LOCAL/BLOB (via get_hazard_data_store()); the SNOWFLAKE
         case needs no extra validation beyond the existing Snowflake
         credential checks already performed elsewhere."""
         if cls.HAZARD_DATA_SOURCE == 'LOCAL':

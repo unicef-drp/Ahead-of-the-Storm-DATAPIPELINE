@@ -35,12 +35,12 @@ where available so queries work consistently across countries.
 | `beds` | int | Number of inpatient beds |
 | `staff_doctors` | int | Number of doctors |
 | `staff_nurses` | int | Number of nurses |
-| `emergency` | string | `yes` / `no` — whether emergency services are available |
+| `emergency` | string | `yes` / `no`: whether emergency services are available |
 | `operational_status` | string | e.g. `operational`, `closed` |
 | `opening_hours` | string | OSM opening hours format |
 | `contact_number` | string | Phone number |
 | `wheelchair` | string | `yes` / `no` / `limited` |
-| `dispensing` | string | `yes` / `no` — pharmacy dispensing |
+| `dispensing` | string | `yes` / `no`: pharmacy dispensing |
 | `insurance` | string | Insurance accepted |
 | `water_source` | string | Water supply type |
 | `electricity` | string | Electricity availability |
@@ -65,5 +65,5 @@ Use these exact names for attributes not covered by the HealthSites.io API.
 | Column | Type | Notes |
 |--------|------|-------|
 | `num_icu_beds` | int | Number of ICU beds |
-| `has_generator` | string | `yes` / `no` — backup power available |
+| `has_generator` | string | `yes` / `no`: backup power available |
 | `catchment_population` | int | Estimated population served |

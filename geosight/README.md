@@ -11,7 +11,7 @@ admin levels 1–5:
 
 - `{COUNTRY}_{STORM}_{FORECAST}_{WIND}_admin{N}.csv`
 
-CCI files (`*_cci.csv`) are intentionally ignored — only the core impact
+CCI files (`*_cci.csv`) are intentionally ignored: only the core impact
 metrics are uploaded to GeoSight.
 
 Each related-table row represents one admin region × forecast time × wind
@@ -33,7 +33,7 @@ Plus all impact metric columns found in the CSV (e.g. `E_population`,
 ## Environment
 
 ```bash
-# Storage backend — must match the main pipeline setting
+# Storage backend, must match the main pipeline setting
 export DATA_PIPELINE_DB=SNOWFLAKE   # or LOCAL for development
 
 # GeoSight credentials
@@ -53,7 +53,7 @@ export SNOWFLAKE_STAGE_NAME=AOTS_ANALYSIS
 
 ## Running
 
-### Incremental (default) — safe to run as a cron job
+### Incremental (default), safe to run as a cron job
 
 ```bash
 python geosight/upload_admin_related_table.py
@@ -63,7 +63,7 @@ Scans GeoSight for the latest `forecast_time` already present per
 `(country_code, storm)`, then downloads and uploads only files
 with a newer forecast time from the stage.
 
-### Backfill — upload everything without dedup
+### Backfill: upload everything without dedup
 
 ```bash
 python geosight/upload_admin_related_table.py --backfill
@@ -92,7 +92,7 @@ python geosight/upload_admin_related_table.py --backfill \
 
 Filters also work in incremental mode to restrict which files are considered.
 
-### Replace — overwrite existing rows after a pipeline re-run
+### Replace: overwrite existing rows after a pipeline re-run
 
 ```bash
 python geosight/upload_admin_related_table.py --replace --storm MELISSA
