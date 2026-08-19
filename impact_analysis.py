@@ -670,7 +670,7 @@ def fetch_health_centers(country, rewrite=0):
         gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
         if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
             logger.warning(f"{country}: HealthSites API returned no data")
-            return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
         gdf_hcs = gdf_hcs.set_crs(4326)
         gdf_hcs['source'] = 'HealthSites.io'
         logger.info(f"{country}: Fetched {len(gdf_hcs)} health facilities from HealthSites API "
@@ -685,7 +685,7 @@ def fetch_health_centers(country, rewrite=0):
                          f"geodb/custom/{country}_health_centers.csv (see custom_data/README.md)")
         else:
             logger.error(f"{country}: Error fetching health centers from HealthSites API: {e}")
-        return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
 
 
 def fetch_schools(country, rewrite=0):
@@ -752,7 +752,7 @@ def fetch_schools(country, rewrite=0):
                 result = gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326')
             else:
                 logger.warning(f"{country}: GIGA API returned no usable school data")
-                return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+                return gpd.GeoDataFrame(columns=['geometry', 'school_id_giga'], crs='EPSG:4326')
         gdf_schools = result
         if 'giga_id_school' in gdf_schools.columns:
             gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
@@ -774,7 +774,7 @@ def fetch_schools(country, rewrite=0):
         return gdf_schools
     except Exception as e:
         logger.error(f"{country}: Error fetching schools from GIGA API: {e}")
-        return gpd.GeoDataFrame(columns=['geometry'], crs='EPSG:4326')
+        return gpd.GeoDataFrame(columns=['geometry', 'school_id_giga'], crs='EPSG:4326')
 
 
 def fetch_shelters(country, rewrite=0):
@@ -4777,11 +4777,18 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         created during --type initialize. Add new levels with --type patch --columns adminN.
 
     Returns:
-        tuple[bool, int]: (wrote_base_parquet, files_written). files_written is a
-            real running count of impact files actually saved this call (varies
-            with active wind thresholds, admin levels, and gust presence), not a
-            fixed placeholder, feeds TC_PIPELINE_RUN_LOG/TC_PIPELINE_COMPLETE_LOG's
-            FILES_WRITTEN column.
+        tuple[bool, int, str | None]: (wrote_base_parquet, files_written, gust_error).
+            files_written is a real running count of impact files actually saved
+            this call (varies with active wind thresholds, admin levels, and gust
+            presence), not a fixed placeholder, feeds TC_PIPELINE_RUN_LOG/
+            TC_PIPELINE_COMPLETE_LOG's FILES_WRITTEN column. gust_error is None on
+            success (including the normal "no gust data for this storm" case) or
+            the exception message if gust processing raised -- wind views are
+            still saved and files_written still reflects them (see the gust
+            try/except below), but the caller can surface gust_error into
+            TC_PIPELINE_RUN_LOG's error_message so a gust-specific failure is
+            visible even on an otherwise STATUS=SUCCESS run, rather than only
+            ever reaching a container's own stdout log.
     """
     admin_levels = get_initialized_admin_levels(country)
     if not admin_levels:
@@ -5016,6 +5023,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # has already fully succeeded and saved, an uncaught exception here must not
     # propagate to the per-country try/except in run_complete_impact_analysis(),
     # which would otherwise discard the wind results from this same call.
+    gust_error = None
     if gdf_envelopes_gust is not None and not gdf_envelopes_gust.empty:
         try:
             logger.info(f"    Processing gust envelopes ({len(gdf_envelopes_gust)} records)...")
@@ -5075,11 +5083,16 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
 
             logger.info(f"    Created gust views ({len(gust_school_views)} thresholds)")
         except Exception as e:
-            logger.warning(f"    Gust envelope processing failed for {country}/{storm}/{date}, gust views skipped this run, wind views unaffected: {e}")
+            gust_error = str(e)
+            logger.warning(
+                f"    Gust envelope processing failed for {country}/{storm}/{date}, "
+                f"gust views skipped this run, wind views unaffected: {e}",
+                exc_info=True,
+            )
     else:
         logger.info(f"    No gust envelope data for {country}/{storm}/{date}, skipping gust views")
 
-    return wrote_base_parquet, files_written
+    return wrote_base_parquet, files_written, gust_error
 
 
 # =============================================================================
@@ -5138,5 +5151,5 @@ def load_gust_envelopes_from_snowflake(storm, date):
         return gdf_gust_envelopes
 
     except Exception as e:
-        logger.warning(f"Error loading gust envelopes: {str(e)}")
+        logger.warning(f"Error loading gust envelopes: {str(e)}", exc_info=True)
         return pd.DataFrame()

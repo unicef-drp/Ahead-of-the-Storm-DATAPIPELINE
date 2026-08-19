@@ -335,12 +335,20 @@ def run_complete_impact_analysis(storm, date, countries, logger, zoom, skip_gust
         any_base_parquet_written = False
         for country in affected_countries:
             try:
-                wrote_base, country_files_written = create_views_from_envelopes_in_country(
+                wrote_base, country_files_written, gust_error = create_views_from_envelopes_in_country(
                     country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=gdf_envelopes_gust)
                 if wrote_base:
                     any_base_parquet_written = True
                 total_views += country_files_written
                 succeeded_countries.append(country)
+                # Gust failures are isolated inside create_views_from_envelopes_in_country()
+                # so a gust-only error never discards the wind results above (this country
+                # still counts as succeeded, files_written still reflects the real wind
+                # output), but it must still surface into country_errors so it reaches
+                # TC_PIPELINE_RUN_LOG's error_message even though STATUS stays SUCCESS,
+                # rather than only ever existing in the container's own stdout log.
+                if gust_error:
+                    country_errors.append(f"{country} gust: {gust_error}")
             except Exception as country_exc:
                 import traceback as _tb
                 logger.error(f"Pipeline with errors for storm {storm} at {date}")
