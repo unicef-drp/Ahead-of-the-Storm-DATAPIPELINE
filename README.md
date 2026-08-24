@@ -4,20 +4,6 @@
 - **[Ahead-of-the-Storm](https://github.com/unicef-drp/Ahead-of-the-Storm)**: Dash web application for visualizing hurricane impact forecasts. The application displays interactive maps, probabilistic analysis, and impact reports based on pre-processed hurricane data
 - **[TC-ECMWF-Forecast-Pipeline](https://github.com/unicef-drp/TC-ECMWF-Forecast-Pipeline)**: Pipeline for processing ECMWF BUFR tropical cyclone and wind forecast data
 
-## Production Scheduling
-
-Three separate mechanisms exist in this repo for running the pipeline; only one of them is the real,
-live, recurring production path today:
-
-| Mechanism | Status | What it's for |
-|---|---|---|
-| **Databricks Job** (`databricks/04_production_scheduler.py`) | **Live production scheduler** | Recurring, automatic processing of new storm/precip/river data on a fixed 16x/day cron. See `databricks/README.md` for the full setup/deployment reference. |
-| **SPCS** (`snowflake/test_spcs_job.sql`, `deploy_to_spcs.sh`) | Available, not scheduled | An `EXECUTE JOB SERVICE` spec that can run the pipeline in a Snowflake container. Its own `CREATE JOB` (the part that would make it recurring) is commented out -- it is not the live scheduling mechanism, only a manual/on-demand run path. |
-| **GitHub Actions** (workflows below) | Live, but manual-only | `workflow_dispatch`-triggered one-off operations (initialize a new country, patch columns, reprocess past storms, manage country status) -- not a recurring pipeline trigger. |
-
-See `CLAUDE.md`'s "Databricks Scheduling" section for how the live scheduler's discovery/compute/
-signal-completion logic works.
-
 ## GitHub Action Workflows
 **[GitHub Actions Workflows](README_GITHUB_ACTIONS.md)**: Guide for using GitHub Actions to manage countries and trigger pipeline runs
 
@@ -467,3 +453,14 @@ python main_pipeline.py --type update --countries TWN --zoom 15
 ```
 
 **Important:** The pipeline will load the base mercator view for the specified zoom level. If it doesn't exist, initialization will be triggered automatically (if `rewrite=0`).
+
+## Production Scheduling
+
+Three separate mechanisms exist in this repo for running the pipeline; only one of them is the real,
+live, recurring production path today:
+
+| Mechanism | Status | What it's for |
+|---|---|---|
+| **Databricks Job** | **Live production scheduler** | Recurring, automatic processing of new storm/precip/river data on a fixed 16x/day cron, running on an existing (not job) cluster for fast startup. Each run discovers unprocessed wind/gust storm cycles and precip/river backlog by checking real output-table existence (not just a logged status), computes them by calling the same pipeline functions this repo's own `main()` uses, and signals completion the same way production always has. |
+| **SPCS** (`snowflake/test_spcs_job.sql`, `deploy_to_spcs.sh`) | Available, not scheduled | An `EXECUTE JOB SERVICE` spec that can run the pipeline in a Snowflake container. Its own `CREATE JOB` (the part that would make it recurring) is commented out -- it is not the live scheduling mechanism, only a manual/on-demand run path. |
+| **GitHub Actions** (workflows above) | Live, but manual-only | `workflow_dispatch`-triggered one-off operations (initialize a new country, patch columns, reprocess past storms, manage country status) -- not a recurring pipeline trigger. |
