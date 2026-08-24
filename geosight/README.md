@@ -26,9 +26,16 @@ threshold, with these base fields:
 | `wind_threshold` | Wind speed in knots |
 | `geom_id` | GeoRepo admin ucode (e.g. `TWN_0001_V2`) |
 
-Plus all impact metric columns found in the CSV (e.g. `E_population`,
-`E_num_schools`, `E_num_hcs`). The columns `E_rwi`, `E_smod_class`, and
-`E_smod_class_l1` are intentionally excluded. CCI files are ignored entirely.
+Plus a fixed allowlist of impact metric columns (`ALLOWED_METRIC_COLUMNS` in
+`admin_related_table.py`: `E_population`, `E_school_age_population`,
+`E_infant_population`, `E_adolescent_population`, `E_built_surface_m2`,
+`E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`, `probability`) --
+not a denylist of everything except a few named columns, so a new metric column
+added to the CSV in the future needs to also be added to this allowlist to be
+uploaded, or it will be silently dropped. `E_rwi`/`E_smod_class`/`E_smod_class_l1`
+happen to already be excluded by this mechanism today, but that's a consequence
+of the allowlist, not a separate explicit exclusion rule. CCI files are ignored
+entirely.
 
 ## Environment
 

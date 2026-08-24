@@ -14,7 +14,7 @@ The pipeline uses environment variables to configure base directories:
 
 ## Files Produced During Initialize (`--type initialize`)
 
-**Note:** The pipeline no longer requires a separate bounding box file. Country boundaries are checked directly with a 1500km buffer during processing.
+**Note:** The pipeline no longer requires a separate bounding box file. Country boundaries are checked directly with a 500km buffer during processing.
 
 ### 1. Base Mercator Views (per country)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{zoom_level}.parquet`
@@ -236,16 +236,25 @@ For each storm/forecast combination processed, the following files are created:
 - **Note:** One file per storm per forecast (not per wind threshold, vulnerability integrates across all thresholds per member). All `severity_*` columns are NaN for countries not patched with vulnerability data. Loaded into **`TRACK_VULNERABILITY_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. The dashboard joins this onto `TRACK_MAT` via `get_track_impacts()` in `snowflake_utils.py` to include in-need columns alongside wind-threshold severity metrics.
 - **Methodology:** For each member, tiles intersecting that member's cumulative wind envelopes are identified via spatial join. Each tile is assigned the rate of its *highest* wind band reached by that member (exclusive assignment, same rate formula as item 16): `severe_poverty_prob` below 50kt, a linear blend from `moderate_poverty_prob` toward 1.0 between 50-96kt, and 1.0 (catastrophic, all people need assistance) at/above 96kt. The per-tile `population × rate` values are then summed. This is the per-member analogue of item 16: item 16 uses ensemble-probability weights to produce one expected value per tile (a spatial map of vulnerability concentration); this file uses binary member coverage to produce one scenario total per member instead (enabling DET/#51 and worst-case display in the dashboard).
 
-### 19b. Tile-Member Bitmask Views (per country, per storm, per forecast, per wind/gust threshold)
+### 19b. Tile-Member Bitmask Views (per country, per storm/cycle, per forecast, per hazard threshold/tier)
 **Location (wind):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views/{country}_{storm}_{date}_{wind_threshold}.parquet`
 - **Example:** `geodb/aos_views/track_tile_bitmask_views/PHL_BAVI_20260704000000_34.parquet`
 
 **Location (gust):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views_gust/{country}_{storm}_{date}_g{gust_threshold}.parquet`
 - **Example:** `geodb/aos_views/track_tile_bitmask_views_gust/PHL_BAVI_20260702000000_g17.parquet`
+
+**Location (river flood):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet`
+- **Example:** `geodb/aos_views/track_tile_bitmask_views_river/PHL_20260714000000_rp100_120h.parquet`
+- **Created by:** `calculate_river_tile_member_bitmask()` → `save_river_tile_bitmask_view()`
+
+**Location (precip):** `{ROOT_DATA_DIR}/{VIEWS_DIR}/track_tile_bitmask_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet`
+- **Example:** `geodb/aos_views/track_tile_bitmask_views_precip/PHL_20260814000000_p100_120h.parquet`
+- **Created by:** `calculate_precip_tile_member_bitmask()` → `save_precip_tile_bitmask_view()`
+
 - **Format:** Parquet (DataFrame)
-- **Content:** Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask: `tile_id`, `bits` (bit `m-1` set ⇔ member `m`'s envelope covers that tile). One row per DISTINCT tile with ≥1 member's envelope covering it; a tile with zero coverage from every member simply has no row (sparse, same convention as `TRACK_MAT`'s own severity columns).
-- **Created by:** `calculate_tile_member_bitmask()` → `save_tracks_tile_bitmask_view()` (real feature added 2026-08)
-- **Note:** Multiple files per storm (one per threshold, same pattern as item 18). Loaded into **`TILE_WIND_BITMASK_MAT`**/**`TILE_GUST_BITMASK_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. Persists the same envelope-vs-tile spatial join item 18's own `severity_*` columns are computed from (previously discarded immediately after collapsing to a country-wide scalar); this keeps the per-member, per-tile identity instead, enabling a real tile-level union across hazards in the dashboard's "Compare Worst Case By" feature (`pages/map_shell_concept.py`'s `_fetch_family_member_frames`, which unions this bitmask data across Wind/Gust/River/Rain into one real per-member total instead of approximating it from separate marginal totals).
+- **Content:** Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask: `tile_id`, `bits` (bit `m-1` set ⇔ member `m`'s envelope/exceedance covers that tile). One row per DISTINCT tile with ≥1 member's coverage; a tile with zero coverage from every member simply has no row (sparse, same convention as `TRACK_MAT`'s own severity columns).
+- **Created by (wind):** `calculate_tile_member_bitmask()` → `save_tracks_tile_bitmask_view()`
+- **Note:** Multiple files per storm/cycle (one per threshold/tier-window, same pattern as item 18). Loaded into **`TILE_WIND_BITMASK_MAT`**/**`TILE_GUST_BITMASK_MAT`**/**`TILE_RIVER_BITMASK_MAT`**/**`TILE_PRECIP_BITMASK_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. Persists the same envelope-vs-tile spatial join item 18's own `severity_*` columns are computed from (previously discarded immediately after collapsing to a country-wide scalar); this keeps the per-member, per-tile identity instead, enabling a real tile-level union across hazards in the dashboard's "Compare Worst Case By" feature (`pages/map_shell_concept.py`'s `_fetch_family_member_frames`, which unions this bitmask data across Wind/Gust/River/Rain into one real per-member total instead of approximating it from separate marginal totals).
 
 ### 20. JSON Impact Reports (per country, per storm, per forecast)
 **Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
@@ -491,8 +500,10 @@ JRC's global flood-extent maps) lives only on Snowflake's internal stage via
 `RIVER_FORECASTS.STAGE_PATH`, independent of `DATA_PIPELINE_DB`. Disable with `--skip-river-flood`.
 
 Six return-period (RP) tiers (`RIVER_RP_TIERS` = rp2, rp5, rp10, rp20, rp50, rp100, how rare a
-river discharge level is, not a probability), each computed for 7 lead-time steps
-(`RIVER_LEADTIME_STEPS_H` = 24, 48, 72, 96, 120, 144, 168 hours). Unlike precip's coarse ~0.25°
+river discharge level is, not a probability), each computed for 4 of the 7 lead-time steps the
+upstream RIVER_FORECASTS Parquet actually has (`RIVER_LEADTIME_STEPS_H` = 24, 72, 120, 168 hours;
+48/96/144h are dropped to keep materialized-view compute/storage proportional to the windows the
+dashboard UI exposes). Unlike precip's coarse ~0.25°
 continuous raster, GloFAS/JRC flood pixels are ~150m resolution, comparable to a zoom-14
 mercator tile or a buffered facility footprint, not much coarser. Because of that, this hazard
 type reuses **wind/gust's** modeling shape, not precip's:
@@ -605,6 +616,10 @@ No CCI, vulnerability, or JSON report for river flood, same as gust/precip.
     │   └── {country}_{storm}_{date}_{wind}.parquet             # Per-tile, per-member wind coverage bitmask
     ├── track_tile_bitmask_views_gust/
     │   └── {country}_{storm}_{date}_g{gust}.parquet            # Per-tile, per-member gust coverage bitmask
+    ├── track_tile_bitmask_views_river/
+    │   └── {country}_{forecast_time}_{rp_tier}_{step_h}h.parquet   # Per-tile, per-member river coverage bitmask
+    ├── track_tile_bitmask_views_precip/
+    │   └── {country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet   # Per-tile, per-member precip coverage bitmask
     ├── mercator_views_gust/
     │   └── {country}_{storm}_{date}_g{gust}_{zoom}.csv        # Gust tile impact views
     ├── admin_views_gust/
@@ -674,7 +689,8 @@ No CCI, vulnerability, or JSON report for river flood, same as gust/precip.
 - RP tier: `{rp_tier}` (`rp2`, `rp5`, `rp10`, `rp20`, `rp50`, `rp100`, how rare a river discharge
   level is, e.g. `rp100` = a 1-in-100-year discharge level for that river reach); no numeric-value
   collision risk with wind/gust thresholds, so no letter-prefix disambiguation is needed
-- Lead-time step: `{step_h}h` (24, 48, 72, 96, 120, 144, or 168 hours)
+- Lead-time step: `{step_h}h` (24, 72, 120, or 168 hours -- 4 of the 7 raw hours the upstream data has,
+  see `RIVER_LEADTIME_STEPS_H` above)
 
 ### Country Codes
 - ISO3 country codes (e.g., `DOM`, `ATG`, `BLZ`)

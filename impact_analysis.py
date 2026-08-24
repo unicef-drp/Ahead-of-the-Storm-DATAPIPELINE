@@ -279,8 +279,8 @@ _HEALTHSITES_BBOX_OVERRIDES = {
     "BHS": [(-80.5259, 20.8631, -72.6624, 27.3229)],  # Bahamas (archipelago; also
     # resolvable by name as "The Bahamas", but HealthSitesFetcher re-runs any
     # country string through pycountry, which does not recognize that name
-    # either — the bbox path avoids that second lookup entirely).
-    "BES": [  # Bonaire, Sint Eustatius and Saba — two disjoint clusters ~500km
+    # either -- the bbox path avoids that second lookup entirely).
+    "BES": [  # Bonaire, Sint Eustatius and Saba: two disjoint clusters ~500km
         # apart (see _BES_GEOREPO_UCODES below); bounds taken from the real
         # per-island GeoRepo geometries, not PIPELINE_COUNTRIES.COUNTRY_BOUNDARY
         # (whose own bbox spans the huge gap between the two clusters).
@@ -290,7 +290,7 @@ _HEALTHSITES_BBOX_OVERRIDES = {
 }
 
 # GeoRepo's "Global Administrative Boundaries" dataset has no single level-0
-# entity for BES (Bonaire, Sint Eustatius and Saba) — it models the three
+# entity for BES (Bonaire, Sint Eustatius and Saba): it models the three
 # islands as separate level-0 "Territory" entities, each independently
 # tagged ISO3=BES but with its own ucode (BES1/BES2/BES3), not one combined
 # "BES_..." entity. AdminBoundaries.create()'s ISO3 lookup expects a ucode
@@ -714,7 +714,7 @@ def fetch_health_centers(country, rewrite=0):
     # 3. Fetch from HealthSites.io API
     try:
         if country in _HEALTHSITES_BBOX_OVERRIDES:
-            # Query each bbox separately and concatenate — a disjoint territory
+            # Query each bbox separately and concatenate: a disjoint territory
             # (e.g. BES) needs more than one tight box, not one huge box spanning
             # the gap between clusters.
             parts = [
@@ -988,7 +988,7 @@ def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
 
     Used in the Python fallback path of run_complete_impact_analysis when the SQL
     pre-filter (ST_DWITHIN on COUNTRY_BOUNDARY) is unavailable. The zone geometry
-    is typically a 1,500 km buffer around a country boundary.
+    is typically a 500 km buffer around a country boundary.
 
     Args:
         zone_geom: Shapely geometry representing the zone to check against
@@ -3320,10 +3320,10 @@ def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_m
     # from_bounds(), so tif_processor.bounds (what create_precip_tile_view()
     # actually reads) is systematically half a cell wider than the raw
     # min/max on each side. An earlier version of this function divided by
-    # n (not n-1) and skipped the half-cell expansion entirely -- a real,
-    # caught-in-review bug that silently mis-assigned a real fraction of
-    # tiles to the wrong native cell, since it re-derived a parallel
-    # formula instead of replicating grid_to_geotiff()'s own real math.
+    # n (not n-1) and skipped the half-cell expansion entirely -- a real bug
+    # that silently mis-assigned a real fraction of tiles to the wrong
+    # native cell, since it re-derived a parallel formula instead of
+    # replicating grid_to_geotiff()'s own real math.
     # This must stay byte-for-byte consistent with that function, not an
     # independently-plausible-looking approximation.
     dlat = (lat_max - lat_min) / (n_lat - 1) if n_lat > 1 else 0.0

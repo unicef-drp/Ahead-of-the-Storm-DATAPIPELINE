@@ -31,6 +31,7 @@ CLAUDE.md
 geodb/
 scripts
 project_results/
+results/
 test_files/
 snowflake/data_sharing/
 test-scripts/

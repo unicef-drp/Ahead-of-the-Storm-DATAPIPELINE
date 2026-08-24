@@ -37,6 +37,16 @@ export SNOWFLAKE_DATABASE=your_database
 export SNOWFLAKE_SCHEMA=your_schema
 
 # ---------------------------
+# SPCS OAuth authentication (only for Snowflake Container Services deployment;
+# leave unset for local/Databricks runs, which use the password auth above)
+# ---------------------------
+# export SPCS_RUN=true
+# export SPCS_TOKEN_PATH=/snowflake/session/token
+# export SNOWFLAKE_HOST=your_account.snowflakecomputing.com
+# export SNOWFLAKE_PORT=443
+# export SNOWFLAKE_INSECURE_MODE=false
+
+# ---------------------------
 # Snowflake Stage (only if DATA_PIPELINE_DB=SNOWFLAKE)
 # ---------------------------
 # Name of the Snowflake stage to use for file storage

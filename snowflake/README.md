@@ -254,6 +254,11 @@ EXECUTE JOB SERVICE
 
 ### Option 3: Running as a Scheduled Job (Automatic Processing)
 
+**Not the live production scheduling mechanism** -- the real live scheduler is a Databricks Job
+(`databricks/04_production_scheduler.py`, see `databricks/README.md`), which calls the pipeline
+functions directly rather than launching an SPCS container. This option remains available as a
+manual/on-demand SPCS run path; the `CREATE JOB` below is illustrative, not deployed.
+
 Create a scheduled job that automatically processes the latest storms:
 
 ```sql
@@ -359,6 +364,7 @@ The pipeline accepts command-line arguments:
 - `--skip-analysis`: Skip the analysis step (for testing pipeline structure without processing data)
 - `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
 - `--skip-precip`: Skip precipitation/runoff analysis even if `MET_FORECASTS` data is available (storm processing is unaffected)
+- `--skip-river-flood`: Skip GloFAS river-flood analysis even if `RIVER_FORECASTS` data is available
 - `--log-level`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`; default: `INFO`)
 
 ## Example: Initialize Pipeline for Taiwan

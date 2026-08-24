@@ -229,12 +229,12 @@ See `template_rwi_z14.csv` and `example_rwi_z14.csv`.
 To generate the list of valid quadkey tile IDs for a country at a given zoom level, run:
 
 ```python
-from gigaspatial.core.tiles import MercatorTiles
+from gigaspatial.grid.mercator_tiles import MercatorTiles
 from gigaspatial.handlers.boundaries import AdminBoundaries
 
 boundaries = AdminBoundaries.create(country_code='PNG', admin_level=0)
 tiles = MercatorTiles.from_geometry(boundaries.to_geodataframe().geometry.union_all(), zoom_level=14)
-tile_ids = [t.quadkey for t in tiles]
+tile_ids = tiles.quadkeys
 ```
 
 Alternatively, read the tile IDs from the existing base mercator parquet if already initialized:

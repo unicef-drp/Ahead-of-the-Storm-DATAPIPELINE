@@ -26,6 +26,8 @@ GitHub Actions workflows allow you to:
    - `GEOREPO_API_KEY` (optional)
    - `GEOREPO_USER_EMAIL` (optional, required if using GEOREPO_API_KEY)
 
+(The 6th workflow, GeoSight Sync -- see below, currently disabled -- needs its own separate secrets:
+`GEOSIGHT_API_KEY`, `GEOSIGHT_BASE_URL`, `GEOSIGHT_USER_EMAIL`, not required for the 5 workflows above.)
 
 ## Workflows
 
@@ -260,6 +262,14 @@ Countries: TWN,DOM
 Columns: population school_age_population infant_population adolescent_population
 Zoom Level: 14
 ```
+
+### 6. GeoSight Sync
+
+`.github/workflows/geosight-sync.yml` -- syncs data to GeoSight, triggered both on a cron
+(`0 0,6,12,18 * * *`) and via `workflow_dispatch` (with real inputs: `backfill`, `country`,
+`from_date`, `to_date`, `date`, for manual/backfill runs). Currently disabled (manually turned off in
+GitHub, not deleted). Requires its own secrets, not listed above: `GEOSIGHT_API_KEY`,
+`GEOSIGHT_BASE_URL`, `GEOSIGHT_USER_EMAIL`.
 
 ## Country Management
 
