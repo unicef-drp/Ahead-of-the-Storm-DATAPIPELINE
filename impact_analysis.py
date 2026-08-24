@@ -76,10 +76,13 @@ from gigaspatial.processing import convert_to_geodataframe, buffer_geodataframe
 from gigaspatial.handlers import GigaSchoolLocationFetcher
 from gigaspatial.generators import GeometryBasedZonalViewGenerator, MercatorViewGenerator, AdminBoundariesViewGenerator
 from gigaspatial.handlers.healthsites import HealthSitesFetcher
+from gigaspatial.handlers.unicef.georepo import GeoRepoClient
 from gigaspatial.core.io.readers import read_dataset
 from gigaspatial.core.io.writers import write_dataset
 from gigaspatial.processing.tif_processor import TifProcessor
 from gigaspatial.core.io.local_data_store import LocalDataStore
+from shapely.geometry import shape
+from shapely.ops import unary_union
 
 # Import centralized data store utility
 from data_store_utils import get_data_store
@@ -255,6 +258,49 @@ CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_spee
 # Hard-coded so probability denominators stay correct even when individual members fail
 # to produce wind polygons or are missing from GRIB files.
 FULL_ENSEMBLE_SIZE = 51
+
+# HealthSites.io's own `country` filter does not recognize every active country's
+# name, regardless of spelling/case/ISO-code form tried (confirmed via direct API
+# testing: 'Aruba'/'aruba'/'AW'/'ABW' and 'Curacao'/'Curaçao'/'Netherlands Antilles'
+# all return 400 "not found or not a country", this is a gap in HealthSites' own
+# country list, not a name-resolution bug on our side). The underlying facility data
+# does exist there; a bounding-box (`extent`) query reaches it where a country-name
+# query cannot. Bounds taken from each country's real PIPELINE_COUNTRIES.COUNTRY_BOUNDARY
+# (ST_XMIN/YMIN/XMAX/YMAX in Snowflake), padded 0.05 degrees to avoid clipping
+# coastal facilities. Keyed by ISO3; extend if another active country is found to
+# have the same gap (see 'PIPELINE_COUNTRIES active-country HealthSites sweep' in
+# project history for the sweep method).
+# Each value is a list of bboxes (usually one) so a disjoint territory like BES
+# can be covered by several tight boxes instead of one huge one spanning empty
+# ocean and other countries' territory in between.
+_HEALTHSITES_BBOX_OVERRIDES = {
+    "ABW": [(-70.1138, 12.3618, -69.8155, 12.6734)],  # Aruba
+    "CUW": [(-69.2127, 11.9283, -68.5899, 12.4427)],  # Curaçao
+    "BHS": [(-80.5259, 20.8631, -72.6624, 27.3229)],  # Bahamas (archipelago; also
+    # resolvable by name as "The Bahamas", but HealthSitesFetcher re-runs any
+    # country string through pycountry, which does not recognize that name
+    # either — the bbox path avoids that second lookup entirely).
+    "BES": [  # Bonaire, Sint Eustatius and Saba — two disjoint clusters ~500km
+        # apart (see _BES_GEOREPO_UCODES below); bounds taken from the real
+        # per-island GeoRepo geometries, not PIPELINE_COUNTRIES.COUNTRY_BOUNDARY
+        # (whose own bbox spans the huge gap between the two clusters).
+        (-68.4709, 11.9747, -68.1455, 12.3622),   # Bonaire
+        (-63.3085, 17.4146, -62.8959, 17.7003),   # Sint Eustatius + Saba
+    ],
+}
+
+# GeoRepo's "Global Administrative Boundaries" dataset has no single level-0
+# entity for BES (Bonaire, Sint Eustatius and Saba) — it models the three
+# islands as separate level-0 "Territory" entities, each independently
+# tagged ISO3=BES but with its own ucode (BES1/BES2/BES3), not one combined
+# "BES_..." entity. AdminBoundaries.create()'s ISO3 lookup expects a ucode
+# starting with "BES_" and finds nothing. Confirmed via a direct GeoRepo API
+# query against the "Global Administrative Boundaries (Latest)" view.
+_BES_GEOREPO_UCODES = {
+    "BES1_V2": "Saba",
+    "BES2_V2": "Sint Eustatius",
+    "BES3_V2": "Bonaire",
+}
 
 
 #==============================================================================
@@ -667,7 +713,18 @@ def fetch_health_centers(country, rewrite=0):
 
     # 3. Fetch from HealthSites.io API
     try:
-        gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
+        if country in _HEALTHSITES_BBOX_OVERRIDES:
+            # Query each bbox separately and concatenate — a disjoint territory
+            # (e.g. BES) needs more than one tight box, not one huge box spanning
+            # the gap between clusters.
+            parts = [
+                HealthSitesFetcher().fetch_facilities(extent=bbox, output_format='geojson')
+                for bbox in _HEALTHSITES_BBOX_OVERRIDES[country]
+            ]
+            parts = [p for p in parts if not p.empty]
+            gdf_hcs = pd.concat(parts, ignore_index=True) if parts else gpd.GeoDataFrame()
+        else:
+            gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
         if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
             logger.warning(f"{country}: HealthSites API returned no data")
             return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
@@ -1378,16 +1435,34 @@ def write_country_boundary(country: str):
     Fetch admin level 0 boundary from GeoRepo and write it to
     PIPELINE_COUNTRIES.COUNTRY_BOUNDARY in Snowflake.
     Called automatically during --type initialize for each new country.
+
+    BES is a special case: see _BES_GEOREPO_UCODES above. Its three real
+    sub-territory geometries are fetched directly by ucode and unioned,
+    bypassing AdminBoundaries.create()'s single-ISO3 lookup entirely.
     """
     conn = None
     try:
-        boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
-        gdf = boundaries.to_geodataframe()
-        if gdf.empty or gdf.geometry.isna().all():
-            logger.warning(f"{country}: GeoRepo returned no boundary, COUNTRY_BOUNDARY not updated")
-            return
-        # Union all rows in case GeoRepo returns multiple polygons for admin_level=0
-        geom = gdf.geometry.union_all()
+        if country == "BES":
+            client = GeoRepoClient()
+            geoms = []
+            for ucode, name in _BES_GEOREPO_UCODES.items():
+                feature = client.get_entity_by_ucode(ucode, geom="full_geom", format="geojson")
+                if feature and feature.get("geometry"):
+                    geoms.append(shape(feature["geometry"]))
+                else:
+                    logger.warning(f"{country}: GeoRepo returned no geometry for {name} ({ucode})")
+            if not geoms:
+                logger.warning(f"{country}: GeoRepo returned no boundary for any BES sub-territory, COUNTRY_BOUNDARY not updated")
+                return
+            geom = unary_union(geoms)
+        else:
+            boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
+            gdf = boundaries.to_geodataframe()
+            if gdf.empty or gdf.geometry.isna().all():
+                logger.warning(f"{country}: GeoRepo returned no boundary, COUNTRY_BOUNDARY not updated")
+                return
+            # Union all rows in case GeoRepo returns multiple polygons for admin_level=0
+            geom = gdf.geometry.union_all()
         wkt = geom.wkt
         center_lat = geom.centroid.y
         center_lon = geom.centroid.x
