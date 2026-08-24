@@ -54,15 +54,22 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
+          INPUT_COUNTRY_NAME: ${{ inputs.country_name }}
+          INPUT_CENTER_LAT: ${{ inputs.center_lat }}
+          INPUT_CENTER_LON: ${{ inputs.center_lon }}
+          INPUT_VIEW_ZOOM: ${{ inputs.view_zoom }}
+          INPUT_TIMEZONE: ${{ inputs.timezone }}
         run: |
           python -c "
+          import os
           from country_utils import update_country_config
 
-          country_name_str = '${{ inputs.country_name }}'.strip()
-          center_lat_str   = '${{ inputs.center_lat }}'.strip()
-          center_lon_str   = '${{ inputs.center_lon }}'.strip()
-          view_zoom_str    = '${{ inputs.view_zoom }}'.strip()
-          timezone_str     = '${{ inputs.timezone }}'.strip()
+          country_name_str = os.environ.get('INPUT_COUNTRY_NAME', '').strip()
+          center_lat_str   = os.environ.get('INPUT_CENTER_LAT', '').strip()
+          center_lon_str   = os.environ.get('INPUT_CENTER_LON', '').strip()
+          view_zoom_str    = os.environ.get('INPUT_VIEW_ZOOM', '').strip()
+          timezone_str     = os.environ.get('INPUT_TIMEZONE', '').strip()
 
           country_name = country_name_str if country_name_str else None
           center_lat   = float(center_lat_str) if center_lat_str else None
@@ -75,7 +82,7 @@ jobs:
               exit(1)
 
           success = update_country_config(
-              '${{ inputs.country_code }}',
+              os.environ['INPUT_COUNTRY_CODE'],
               country_name=country_name,
               center_lat=center_lat,
               center_lon=center_lon,
@@ -97,18 +104,24 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
         run: |
           python -c "
+          import os
           from snowflake_utils import get_snowflake_connection
           import pandas as pd
 
+          country_code = os.environ['INPUT_COUNTRY_CODE']
           conn = get_snowflake_connection()
+          # Parameterized query, not string interpolation: country_code is an
+          # untrusted workflow_dispatch input, splicing it directly into SQL text
+          # would be a SQL-injection vector.
           query = '''
               SELECT COUNTRY_CODE, COUNTRY_NAME, CENTER_LAT, CENTER_LON, VIEW_ZOOM, TIMEZONE
               FROM PIPELINE_COUNTRIES
-              WHERE COUNTRY_CODE = '${{ inputs.country_code }}'
+              WHERE COUNTRY_CODE = %s
           '''
-          df = pd.read_sql(query, conn)
+          df = pd.read_sql(query, conn, params=[country_code])
           conn.close()
 
           if len(df) > 0:

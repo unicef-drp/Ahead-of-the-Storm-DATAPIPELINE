@@ -65,23 +65,28 @@ jobs:
           GEOSIGHT_BASE_URL: ${{ secrets.GEOSIGHT_BASE_URL }}
           GEOSIGHT_API_KEY: ${{ secrets.GEOSIGHT_API_KEY }}
           GEOSIGHT_USER_EMAIL: ${{ secrets.GEOSIGHT_USER_EMAIL }}
+          INPUT_BACKFILL: ${{ inputs.backfill }}
+          INPUT_COUNTRY: ${{ inputs.country }}
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_FROM_DATE: ${{ inputs.from_date }}
+          INPUT_TO_DATE: ${{ inputs.to_date }}
         run: |
           CMD="python geosight/upload_admin_related_table.py"
 
-          if [ "${{ inputs.backfill }}" = "true" ]; then
+          if [ "$INPUT_BACKFILL" = "true" ]; then
             CMD="$CMD --backfill"
           fi
-          if [ -n "${{ inputs.country }}" ]; then
-            CMD="$CMD --country ${{ inputs.country }}"
+          if [ -n "$INPUT_COUNTRY" ]; then
+            CMD="$CMD --country $INPUT_COUNTRY"
           fi
-          if [ -n "${{ inputs.date }}" ]; then
-            CMD="$CMD --date ${{ inputs.date }}"
+          if [ -n "$INPUT_DATE" ]; then
+            CMD="$CMD --date $INPUT_DATE"
           fi
-          if [ -n "${{ inputs.from_date }}" ]; then
-            CMD="$CMD --from-date ${{ inputs.from_date }}"
+          if [ -n "$INPUT_FROM_DATE" ]; then
+            CMD="$CMD --from-date $INPUT_FROM_DATE"
           fi
-          if [ -n "${{ inputs.to_date }}" ]; then
-            CMD="$CMD --to-date ${{ inputs.to_date }}"
+          if [ -n "$INPUT_TO_DATE" ]; then
+            CMD="$CMD --to-date $INPUT_TO_DATE"
           fi
 
           echo "Running: $CMD"

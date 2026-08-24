@@ -45,21 +45,21 @@ on:
 jobs:
   initialize-country:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       - name: Add country to Snowflake table
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -70,20 +70,27 @@ jobs:
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           DATA_PIPELINE_DB: ${{ secrets.DATA_PIPELINE_DB }}
           SNOWFLAKE_STAGE_NAME: ${{ secrets.SNOWFLAKE_STAGE_NAME }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
+          INPUT_COUNTRY_NAME: ${{ inputs.country_name }}
+          INPUT_ZOOM_LEVEL: ${{ inputs.zoom_level }}
+          INPUT_CENTER_LAT: ${{ inputs.center_lat }}
+          INPUT_CENTER_LON: ${{ inputs.center_lon }}
+          INPUT_VIEW_ZOOM: ${{ inputs.view_zoom }}
         run: |
           python -c "
+          import os
           from country_utils import add_country_to_snowflake
           add_country_to_snowflake(
-              '${{ inputs.country_code }}',
-              '${{ inputs.country_name }}',
-              ${{ inputs.zoom_level }},
-              ${{ inputs.center_lat }},
-              ${{ inputs.center_lon }},
-              ${{ inputs.view_zoom }},
+              os.environ['INPUT_COUNTRY_CODE'],
+              os.environ['INPUT_COUNTRY_NAME'],
+              int(os.environ['INPUT_ZOOM_LEVEL']),
+              float(os.environ['INPUT_CENTER_LAT']),
+              float(os.environ['INPUT_CENTER_LON']),
+              int(os.environ['INPUT_VIEW_ZOOM']),
               'Added via GitHub Actions'
           )
           "
-      
+
       - name: Initialize country data
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -98,14 +105,18 @@ jobs:
           HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
           GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY }}
           GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
+          INPUT_ZOOM_LEVEL: ${{ inputs.zoom_level }}
+          INPUT_ADMIN_LEVELS: ${{ inputs.admin_levels }}
+          INPUT_REWRITE: ${{ inputs.rewrite }}
         run: |
           python main_pipeline.py \
             --type initialize \
-            --countries ${{ inputs.country_code }} \
-            --zoom ${{ inputs.zoom_level }} \
-            --admin ${{ inputs.admin_levels }} \
-            --rewrite ${{ inputs.rewrite }}
-      
+            --countries "$INPUT_COUNTRY_CODE" \
+            --zoom "$INPUT_ZOOM_LEVEL" \
+            --admin $INPUT_ADMIN_LEVELS \
+            --rewrite "$INPUT_REWRITE"
+
       - name: Verify initialization tracking
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -114,13 +125,15 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRY_CODE: ${{ inputs.country_code }}
+          INPUT_ZOOM_LEVEL: ${{ inputs.zoom_level }}
         run: |
           python -c "
+          import os
           from country_utils import get_initialized_zoom_levels
-          zoom_levels = get_initialized_zoom_levels('${{ inputs.country_code }}')
-          if ${{ inputs.zoom_level }} in zoom_levels:
-              print('✓ Initialization automatically tracked in Snowflake')
+          zoom_levels = get_initialized_zoom_levels(os.environ['INPUT_COUNTRY_CODE'])
+          if int(os.environ['INPUT_ZOOM_LEVEL']) in zoom_levels:
+              print('Initialization automatically tracked in Snowflake')
           else:
-              print('⚠ Initialization may not have been tracked - check logs above')
+              print('Initialization may not have been tracked - check logs above')
           "
-

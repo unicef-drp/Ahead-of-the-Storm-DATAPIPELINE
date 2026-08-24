@@ -9,6 +9,8 @@
 # ...except the files explicitly COPY'd in snowflake/Dockerfile:
 !main_pipeline.py
 !impact_analysis.py
+!precip_utils.py
+!glofas_utils.py
 !config.py
 !data_store_utils.py
 !snowflake_utils.py

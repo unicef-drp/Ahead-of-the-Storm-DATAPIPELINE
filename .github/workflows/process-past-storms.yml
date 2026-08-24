@@ -33,21 +33,21 @@ on:
 jobs:
   process-past-storms:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+
       - name: Get countries list
         id: get_countries
         env:
@@ -57,8 +57,9 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          INPUT_COUNTRIES: ${{ inputs.countries }}
         run: |
-          if [ -z "${{ inputs.countries }}" ]; then
+          if [ -z "$INPUT_COUNTRIES" ]; then
             COUNTRIES=$(python -c "
             from country_utils import get_active_countries_from_snowflake
             countries = get_active_countries_from_snowflake()
@@ -67,10 +68,10 @@ jobs:
             echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
           else
             # Convert comma-separated to space-separated
-            COUNTRIES=$(echo "${{ inputs.countries }}" | tr ',' ' ')
+            COUNTRIES=$(echo "$INPUT_COUNTRIES" | tr ',' ' ')
             echo "countries=$COUNTRIES" >> $GITHUB_OUTPUT
           fi
-      
+
       - name: Process storms for date range
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -85,45 +86,64 @@ jobs:
           HEALTHSITES_API_KEY: ${{ secrets.HEALTHSITES_API_KEY }}
           GEOREPO_API_KEY: ${{ secrets.GEOREPO_API_KEY }}
           GEOREPO_USER_EMAIL: ${{ secrets.GEOREPO_USER_EMAIL }}
+          # Same env-var indirection as above: all workflow_dispatch inputs are
+          # consumed via os.environ inside the Python script below, never spliced
+          # into its source text.
+          INPUT_START_DATE: ${{ inputs.start_date }}
+          INPUT_END_DATE: ${{ inputs.end_date }}
+          INPUT_STORM: ${{ inputs.storm }}
+          INPUT_REWRITE: ${{ inputs.rewrite }}
+          INPUT_COUNTRIES_LIST: ${{ steps.get_countries.outputs.countries }}
         run: |
-          # Process each date in the range
-          START_DATE="${{ inputs.start_date }}"
-          END_DATE="${{ inputs.end_date }}"
-          
           python -c "
+          import os
+          import sys
           from datetime import datetime, timedelta
           from country_utils import get_active_countries_from_snowflake
           import subprocess
-          import sys
-          
-          start = datetime.strptime('${{ inputs.start_date }}', '%Y-%m-%d')
-          end = datetime.strptime('${{ inputs.end_date }}', '%Y-%m-%d')
-          
-          countries = '${{ steps.get_countries.outputs.countries }}'.split()
+
+          start = datetime.strptime(os.environ['INPUT_START_DATE'], '%Y-%m-%d')
+          end = datetime.strptime(os.environ['INPUT_END_DATE'], '%Y-%m-%d')
+          if start > end:
+              print(f'start_date ({os.environ[\"INPUT_START_DATE\"]}) is after end_date ({os.environ[\"INPUT_END_DATE\"]}), nothing to process.', file=sys.stderr)
+              sys.exit(1)
+
+          countries = os.environ.get('INPUT_COUNTRIES_LIST', '').split()
           if not countries:
               countries = get_active_countries_from_snowflake()
-          
+
+          storm = os.environ.get('INPUT_STORM', '')
+          rewrite = os.environ.get('INPUT_REWRITE', '0')
+
+          any_failed = False
           current = start
           while current <= end:
               date_str = current.strftime('%Y-%m-%d')
               print(f'Processing date: {date_str}')
-              
+
+              # run_precip_analysis() now respects --date (MET_FORECASTS retains one row
+              # per past forecast cycle, same as TC_ENVELOPES_COMBINED retains historical
+              # envelopes), so this correctly backfills precip for date_str's own cycle
+              # instead of redundantly reprocessing today's latest cycle each iteration.
               cmd = [
                   'python', 'main_pipeline.py',
                   '--type', 'update',
                   '--countries'] + countries + [
                   '--date', date_str,
-                  '--rewrite', '${{ inputs.rewrite }}'
+                  '--rewrite', rewrite
               ]
-              
-              if '${{ inputs.storm }}':
-                  cmd.extend(['--storm', '${{ inputs.storm }}'])
-              
+
+              if storm:
+                  cmd.extend(['--storm', storm])
+
               result = subprocess.run(cmd, capture_output=True, text=True)
               print(result.stdout)
               if result.returncode != 0:
                   print(f'Error processing {date_str}:', result.stderr, file=sys.stderr)
-              
-              current += timedelta(days=1)
-          "
+                  any_failed = True
 
+              current += timedelta(days=1)
+
+          if any_failed:
+              sys.exit(1)
+          "

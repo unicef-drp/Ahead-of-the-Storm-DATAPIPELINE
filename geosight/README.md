@@ -11,7 +11,7 @@ admin levels 1–5:
 
 - `{COUNTRY}_{STORM}_{FORECAST}_{WIND}_admin{N}.csv`
 
-CCI files (`*_cci.csv`) are intentionally ignored — only the core impact
+CCI files (`*_cci.csv`) are intentionally ignored: only the core impact
 metrics are uploaded to GeoSight.
 
 Each related-table row represents one admin region × forecast time × wind
@@ -26,14 +26,21 @@ threshold, with these base fields:
 | `wind_threshold` | Wind speed in knots |
 | `geom_id` | GeoRepo admin ucode (e.g. `TWN_0001_V2`) |
 
-Plus all impact metric columns found in the CSV (e.g. `E_population`,
-`E_num_schools`, `E_num_hcs`). The columns `E_rwi`, `E_smod_class`, and
-`E_smod_class_l1` are intentionally excluded. CCI files are ignored entirely.
+Plus a fixed allowlist of impact metric columns (`ALLOWED_METRIC_COLUMNS` in
+`admin_related_table.py`: `E_population`, `E_school_age_population`,
+`E_infant_population`, `E_adolescent_population`, `E_built_surface_m2`,
+`E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`, `probability`) --
+not a denylist of everything except a few named columns, so a new metric column
+added to the CSV in the future needs to also be added to this allowlist to be
+uploaded, or it will be silently dropped. `E_rwi`/`E_smod_class`/`E_smod_class_l1`
+happen to already be excluded by this mechanism today, but that's a consequence
+of the allowlist, not a separate explicit exclusion rule. CCI files are ignored
+entirely.
 
 ## Environment
 
 ```bash
-# Storage backend — must match the main pipeline setting
+# Storage backend, must match the main pipeline setting
 export DATA_PIPELINE_DB=SNOWFLAKE   # or LOCAL for development
 
 # GeoSight credentials
@@ -45,22 +52,25 @@ export GEOSIGHT_USER_EMAIL="your.email@example.org"
 export SNOWFLAKE_ACCOUNT=...
 export SNOWFLAKE_USER=...
 export SNOWFLAKE_PASSWORD=...
+export SNOWFLAKE_WAREHOUSE=...
+export SNOWFLAKE_DATABASE=...
+export SNOWFLAKE_SCHEMA=...
 export SNOWFLAKE_STAGE_NAME=AOTS_ANALYSIS
 ```
 
 ## Running
 
-### Incremental (default) — safe to run as a cron job
+### Incremental (default), safe to run as a cron job
 
 ```bash
 python geosight/upload_admin_related_table.py
 ```
 
 Scans GeoSight for the latest `forecast_time` already present per
-`(country_code, storm, admin_level)`, then downloads and uploads only files
+`(country_code, storm)`, then downloads and uploads only files
 with a newer forecast time from the stage.
 
-### Backfill — upload everything without dedup
+### Backfill: upload everything without dedup
 
 ```bash
 python geosight/upload_admin_related_table.py --backfill
@@ -89,7 +99,7 @@ python geosight/upload_admin_related_table.py --backfill \
 
 Filters also work in incremental mode to restrict which files are considered.
 
-### Replace — overwrite existing rows after a pipeline re-run
+### Replace: overwrite existing rows after a pipeline re-run
 
 ```bash
 python geosight/upload_admin_related_table.py --replace --storm MELISSA

@@ -26,6 +26,8 @@ GitHub Actions workflows allow you to:
    - `GEOREPO_API_KEY` (optional)
    - `GEOREPO_USER_EMAIL` (optional, required if using GEOREPO_API_KEY)
 
+(The 6th workflow, GeoSight Sync -- see below, currently disabled -- needs its own separate secrets:
+`GEOSIGHT_API_KEY`, `GEOSIGHT_BASE_URL`, `GEOSIGHT_USER_EMAIL`, not required for the 5 workflows above.)
 
 ## Workflows
 
@@ -118,6 +120,7 @@ Rewrite: 0
    - **Center Lat**: Latitude for map center (e.g., `23.50`) - **Optional**
    - **Center Lon**: Longitude for map center (e.g., `121.00`) - **Optional**
    - **View Zoom**: Zoom level for visualization map (e.g., `8`) - **Optional**
+   - **Timezone**: IANA timezone name for local time display in alerts (e.g., `America/Jamaica`) - **Optional**, defaults to UTC
 5. Click **"Run workflow"**
 
 **What it does:**
@@ -210,7 +213,7 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 3. Click **"Run workflow"**
 4. Fill in the form:
    - **Countries**: Comma-separated (e.g., `PNG,FJI`) or leave empty for all active countries
-   - **Columns**: Space-separated column names to patch (required — see supported columns below)
+   - **Columns**: Space-separated column names to patch (required, see supported columns below)
    - **Zoom Level**: Must match the existing mercator parquet (default: `14`)
 5. Click **"Run workflow"**
 
@@ -230,16 +233,17 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | `hcs` | HealthSites API → updates `num_hcs` column |
 | `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
 | `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
+| `vulnerability` | `geodb/vulnerability/` → updates `moderate_poverty_prob` + `severe_poverty_prob` (run `vulnerability/fetch_vulnerability_probs.py` first) |
 | `admin<N>` (e.g. `admin2`) | Adds a new admin level base parquet without re-initializing |
 
 **Notes:**
 - `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Patching any regular column updates the mercator parquet and **all initialized admin parquets** (re-aggregated automatically for every admin level found)
-- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles — no GeoRepo re-fetch of existing levels needed
+- Patching `admin<N>` creates a new admin level base parquet from the existing mercator tiles, no GeoRepo re-fetch of existing levels needed
 - Custom CSVs in `geodb/custom/` take priority over API/raster re-processing
 - The country must already be initialized (base mercator parquet must exist)
-- Population columns can be patched individually — useful when a new WorldPop dataset is released
+- Population columns can be patched individually, useful when a new WorldPop dataset is released
 
 **Examples:**
 ```
@@ -259,6 +263,14 @@ Columns: population school_age_population infant_population adolescent_populatio
 Zoom Level: 14
 ```
 
+### 6. GeoSight Sync
+
+`.github/workflows/geosight-sync.yml` -- syncs data to GeoSight, triggered both on a cron
+(`0 0,6,12,18 * * *`) and via `workflow_dispatch` (with real inputs: `backfill`, `country`,
+`from_date`, `to_date`, `date`, for manual/backfill runs). Currently disabled (manually turned off in
+GitHub, not deleted). Requires its own secrets, not listed above: `GEOSIGHT_API_KEY`,
+`GEOSIGHT_BASE_URL`, `GEOSIGHT_USER_EMAIL`.
+
 ## Country Management
 
 ### Countries Stored in Snowflake
@@ -277,6 +289,8 @@ Countries are stored in the `PIPELINE_COUNTRIES` table:
 | `CENTER_LON` | Longitude for visualization map center |
 | `VIEW_ZOOM` | Zoom level for visualization map (different from analysis ZOOM_LEVEL) |
 | `NOTES` | Optional notes |
+| `TIMEZONE` | IANA timezone name for local time display in alerts (e.g. `America/Jamaica`), defaults to UTC |
+| `IS_REGION` | Excludes a row from the active-countries list when TRUE (e.g. a regional grouping row rather than a real country) |
 
 ### Viewing Countries
 
@@ -302,7 +316,7 @@ VALUES ('PHL', 'Philippines', 14, 12.88, 121.77, 6);
 -- Then initialize via GitHub Actions or manually
 ```
 
-**Note:** Map configuration (`CENTER_LAT`, `CENTER_LON`, `VIEW_ZOOM`) is required for visualization. Use the "Update Country Map Config" workflow to update these values if needed.
+**Note:** Map configuration (`CENTER_LAT`, `CENTER_LON`, `VIEW_ZOOM`) is required for visualization. Use the "Update Country Config" workflow to update these values if needed.
 
 ### Activating/Deactivating Countries
 
@@ -369,7 +383,23 @@ This takes precedence over the Snowflake table.
 
 ### "No active countries found in Snowflake table"
 
-- Run `snowflake/setup_countries_table.sql` to create the table
+- Create the table if it doesn't exist yet:
+```sql
+CREATE OR REPLACE TABLE PIPELINE_COUNTRIES (
+    COUNTRY_CODE VARCHAR(3) PRIMARY KEY,
+    COUNTRY_NAME VARCHAR(100) NOT NULL,
+    ACTIVE BOOLEAN DEFAULT TRUE,
+    ADDED_DATE TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    LAST_INITIALIZED TIMESTAMP_NTZ,
+    ZOOM_LEVEL INTEGER DEFAULT 14,
+    CENTER_LAT FLOAT,
+    CENTER_LON FLOAT,
+    VIEW_ZOOM INTEGER,
+    NOTES VARCHAR(500),
+    TIMEZONE VARCHAR(100),
+    IS_REGION BOOLEAN DEFAULT FALSE
+);
+```
 - Add countries using the GitHub Actions workflow or SQL
 
 ### "Error retrieving countries from Snowflake"

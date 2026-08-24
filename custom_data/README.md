@@ -34,7 +34,7 @@ All backends use the same relative path convention:
 | `<COUNTRY>_shelters.csv` | OSM Overpass (`social_facility=shelter`) | No | **Preserved** in parquet cache |
 | `<COUNTRY>_wash.csv` | OSM Overpass (WASH infrastructure types) | No | **Preserved** in parquet cache |
 
-**Point data extra columns:** The entire CSV is written to the facility parquet cache (e.g. `school_views/PNG_schools.parquet`). Any columns beyond the required ones — such as `school_name`, `school_data_source`, `shelter_type`, `capacity` — are preserved and available for downstream use (e.g. display in the visualization app). They are not used by the pipeline's impact calculations.
+**Point data extra columns:** The entire CSV is written to the facility parquet cache (e.g. `school_views/PNG_schools.parquet`). Any columns beyond the required ones (such as `school_name`, `school_data_source`, `shelter_type`, `capacity`) are preserved and available for downstream use (e.g. display in the visualization app). They are not used by the pipeline's impact calculations.
 
 ### Tile-level data (pre-aggregated to mercator tiles)
 
@@ -88,7 +88,7 @@ See `template_schools.csv` for a header-only template and `example_schools.csv` 
 ### `<COUNTRY>_health_centers.csv`
 
 The full dataset (all facility types) is stored in the cache. Filtering to relevant
-facility types (`HC_FACILITY_TYPES`) happens at analysis time when generating impact views —
+facility types (`HC_FACILITY_TYPES`) happens at analysis time when generating impact views;
 the same filter applies to both API-sourced and custom data.
 
 Filtering uses the **`amenity`** column, matching the HealthSites.io API documented values.
@@ -111,7 +111,7 @@ See `template_health_centers.csv` and `example_health_centers.csv`.
 ### `<COUNTRY>_shelters.csv`
 
 Custom emergency shelter locations. Replaces the OSM Overpass query for `social_facility=shelter`.
-OSM coverage for this tag is sparse in most countries — providing a government shelter registry
+OSM coverage for this tag is sparse in most countries, so providing a government shelter registry
 as a custom file is the recommended approach.
 
 All facilities in this file enter impact calculations (no type filtering is applied).
@@ -169,7 +169,7 @@ at the specified zoom level for the country boundary.
 | `infant_population` | Yes | float | Infant population 0–4 years (sum within tile) |
 | `adolescent_population` | Yes | float | Adolescent population 15–19y (sum within tile) |
 
-All four population columns are required together — they are hard requirements for the pipeline.
+All four population columns are required together: they are hard requirements for the pipeline.
 Use `NaN` for tiles with no data (e.g. ocean tiles).
 
 > **Extra columns:** Ignored. Only the four required columns are read and merged into the mercator parquet.
@@ -185,7 +185,7 @@ Pre-aggregated GHSL built surface per tile.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `built_surface_m2` | Yes | float | Total built surface area in m² (sum within tile). Use `NaN` for missing. |
+| `built_surface_m2` | Not enforced | float | Total built surface area in m² (sum within tile). Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the GHSL raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `built_surface_m2` is read and merged into the mercator parquet.
 
@@ -201,7 +201,7 @@ derives `smod_class_l1` (1=rural, 2=suburban, 3=urban) automatically.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `smod_class` | Yes | float | GHS-SMOD L2 class (median within tile). Values: 10=water, 11=very low density rural, 12=low density rural, 13=rural cluster, 21=suburban, 22=semi-dense urban, 23=dense urban, 30=urban centre. Use `NaN` for missing. |
+| `smod_class` | Not enforced | float | GHS-SMOD L2 class (median within tile). Values: 10=water, 11=very low density rural, 12=low density rural, 13=rural cluster, 21=suburban, 22=semi-dense urban, 23=dense urban, 30=urban centre. Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the GHSL raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `smod_class` is read; `smod_class_l1` is always derived automatically.
 
@@ -216,7 +216,7 @@ Pre-aggregated Relative Wealth Index per tile.
 | Column | Required | Type | Notes |
 |--------|----------|------|-------|
 | `tile_id` | Yes | string | Mercator quadkey at zoom `<ZOOM>` |
-| `rwi` | Yes | float | Mean RWI within tile (range approximately -2.5 to +2.5). Use `NaN` for missing. |
+| `rwi` | Not enforced | float | Mean RWI within tile (range approximately -2.5 to +2.5). Use `NaN` for missing. **If this column is absent, no error is raised**, the pipeline silently falls back to the raster/API path as if no custom file existed at all, so a typo'd column name will not be caught. |
 
 > **Extra columns:** Ignored. Only `rwi` is read and merged into the mercator parquet.
 
@@ -229,12 +229,12 @@ See `template_rwi_z14.csv` and `example_rwi_z14.csv`.
 To generate the list of valid quadkey tile IDs for a country at a given zoom level, run:
 
 ```python
-from gigaspatial.core.tiles import MercatorTiles
+from gigaspatial.grid.mercator_tiles import MercatorTiles
 from gigaspatial.handlers.boundaries import AdminBoundaries
 
 boundaries = AdminBoundaries.create(country_code='PNG', admin_level=0)
 tiles = MercatorTiles.from_geometry(boundaries.to_geodataframe().geometry.union_all(), zoom_level=14)
-tile_ids = [t.quadkey for t in tiles]
+tile_ids = tiles.quadkeys
 ```
 
 Alternatively, read the tile IDs from the existing base mercator parquet if already initialized:

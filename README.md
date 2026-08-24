@@ -4,6 +4,20 @@
 - **[Ahead-of-the-Storm](https://github.com/unicef-drp/Ahead-of-the-Storm)**: Dash web application for visualizing hurricane impact forecasts. The application displays interactive maps, probabilistic analysis, and impact reports based on pre-processed hurricane data
 - **[TC-ECMWF-Forecast-Pipeline](https://github.com/unicef-drp/TC-ECMWF-Forecast-Pipeline)**: Pipeline for processing ECMWF BUFR tropical cyclone and wind forecast data
 
+## Production Scheduling
+
+Three separate mechanisms exist in this repo for running the pipeline; only one of them is the real,
+live, recurring production path today:
+
+| Mechanism | Status | What it's for |
+|---|---|---|
+| **Databricks Job** (`databricks/04_production_scheduler.py`) | **Live production scheduler** | Recurring, automatic processing of new storm/precip/river data on a fixed 16x/day cron. See `databricks/README.md` for the full setup/deployment reference. |
+| **SPCS** (`snowflake/test_spcs_job.sql`, `deploy_to_spcs.sh`) | Available, not scheduled | An `EXECUTE JOB SERVICE` spec that can run the pipeline in a Snowflake container. Its own `CREATE JOB` (the part that would make it recurring) is commented out -- it is not the live scheduling mechanism, only a manual/on-demand run path. |
+| **GitHub Actions** (workflows below) | Live, but manual-only | `workflow_dispatch`-triggered one-off operations (initialize a new country, patch columns, reprocess past storms, manage country status) -- not a recurring pipeline trigger. |
+
+See `CLAUDE.md`'s "Databricks Scheduling" section for how the live scheduler's discovery/compute/
+signal-completion logic works.
+
 ## GitHub Action Workflows
 **[GitHub Actions Workflows](README_GITHUB_ACTIONS.md)**: Guide for using GitHub Actions to manage countries and trigger pipeline runs
 
@@ -48,9 +62,12 @@ pip install -r requirements.txt
 - ROOT_DATA_DIR (default: `geodb`)
 - VIEWS_DIR (default: `aos_views`)
 - SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
-- DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` for Azure, `SNOWFLAKE` for Snowflake stage)
+- DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` for Azure, `SNOWFLAKE` for Snowflake stage): where THIS repo's own output/cache is written
   - If `BLOB`, also set: `ACCOUNT_URL`, `SAS_TOKEN`
   - If `SNOWFLAKE`, also set: `SNOWFLAKE_STAGE_NAME` (stage must exist in the database/schema)
+- HAZARD_DATA_SOURCE (`SNOWFLAKE` by default; use `LOCAL` or `BLOB` to read upstream hurricane wind/gust/tracks/precip data from somewhere other than Snowflake): independent of `DATA_PIPELINE_DB`, mainly a local dev/testing convenience
+  - If `LOCAL`, also set: `HAZARD_LOCAL_WIND_DIR`, `HAZARD_LOCAL_TRACKS_DIR`, `HAZARD_LOCAL_MET_DIR` (point at TC-ECMWF-Forecast-Pipeline's own local output directories)
+  - If `BLOB`, also set: `HAZARD_BLOB_ACCOUNT_URL`, `HAZARD_BLOB_SAS_TOKEN`, `HAZARD_BLOB_CONTAINER` (separate from this app's own `ACCOUNT_URL`/`SAS_TOKEN` above)
 
 ### API tokens
 - GIGA_SCHOOL_LOCATION_API_KEY (required to fetch school locations)
@@ -61,7 +78,7 @@ pip install -r requirements.txt
 
 ## Step 1: Initialize Base Data
 
-This step creates the mercator tile views and admin level views with demographic and infrastructure data for each country. The pipeline uses direct country boundary checks with a 1500km buffer, eliminating the need for a separate bounding box file. Countries are specified when initializing.
+This step creates the mercator tile views and admin level views with demographic and infrastructure data for each country. The pipeline uses direct country boundary checks with a 500km buffer, eliminating the need for a separate bounding box file. Countries are specified when initializing.
 
 **Command:**
 ```bash
@@ -82,7 +99,7 @@ python main_pipeline.py --type initialize
 - Fetches school locations (via GIGA API)
 - Fetches health center locations (via HealthSites API)
 - Fetches emergency shelter locations (via OSM Overpass, `social_facility=shelter`)
-- Fetches WASH infrastructure locations (via OSM Overpass — drinking water, toilets, water works, pumping stations, etc.)
+- Fetches WASH infrastructure locations (via OSM Overpass: drinking water, toilets, water works, pumping stations, etc.)
 - Saves base views to `geodb/aos_views/mercator_views/` and `geodb/aos_views/admin_views/`
 
 **Custom data overrides:** Any data source can be replaced with a custom CSV file placed at `geodb/custom/<COUNTRY>_<type>.csv` (e.g. `PNG_shelters.csv`, `PNG_health_centers.csv`). Custom files take priority over all API/raster sources and are never overwritten by the pipeline. See `custom_data/README.md` for schemas and examples.
@@ -105,36 +122,42 @@ python main_pipeline.py --type update
 
 **Parameters:**
 - `--type` (default: update): Pipeline mode (initialize, update, or patch)
-- `--time_delta` (default: 9): Number of days in the past to consider storms for analysis
+- `--time_delta` (default: 2): Number of days in the past to consider storms for analysis
 - `--date` (optional): Process only storms on a specific date (YYYY-MM-DD format, e.g., `2025-11-10`). Overrides `time_delta`.
 - `--storm` (optional): Process only a specific storm (e.g., `FUNG-WONG`). Can be combined with `--date`.
 - `--rewrite` (default: 0): Set to 1 to force reprocessing of existing storms, 0 to skip already processed
 - `--countries`: List of country codes to process (e.g., `TWN` or `DOM VNM`)
 - `--zoom` (default: 14): Zoom level for tiles
 - `--skip-analysis`: Skip analysis step (for testing)
+- `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
+- `--skip-precip`: Skip precipitation/runoff analysis even if MET_FORECASTS data is available (storm processing is unaffected)
+- `--skip-river-flood`: Skip GloFAS river-flood analysis even if RIVER_FORECASTS data is available (storm processing is unaffected)
 
 **What it does:**
 - Connects to Snowflake and retrieves available storm data
 - Filters storms by time delta or specific date/storm (if provided)
 - For each storm/forecast combination:
   - Loads hurricane envelope data
-  - **Per-country filtering**: Checks each country individually with a 1500km buffer
+  - **Per-country filtering**: Checks each country individually with a 500km buffer
   - **Only processes affected countries**: If a storm affects Taiwan but not Vietnam, only Taiwan is processed
   - Creates per-facility impact views for schools, health centers, shelters, and WASH infrastructure
   - Creates tile-level and admin-level impact views
   - Calculates Child Cyclone Index (CCI) values
   - Generates JSON impact reports
   - Saves views to the configured data store (local/Azure/Snowflake)
-  - Records processed storms in `storms.json`
+  - Records processed storms in `storms.json` (`DATA_PIPELINE_DB=LOCAL`/`BLOB`) or the
+    `TC_PIPELINE_RUN_LOG` Snowflake table (`DATA_PIPELINE_DB=SNOWFLAKE`, the real production mode --
+    see below)
 
-**Process Flow:**
+**Process Flow** (`DATA_PIPELINE_DB=LOCAL`/`BLOB` shown; in production, `DATA_PIPELINE_DB=SNOWFLAKE`
+uses the `TC_PIPELINE_RUN_LOG` table in place of `storms.json` at every step below, same logic):
 1. Reads `storms.json` to track which storms have been processed
 2. Queries Snowflake for new storms
 3. Filters by time delta or specific date/storm (if provided)
 4. For each storm not yet processed (or if `rewrite=1`):
    - Loads envelope data (wind impact areas at different thresholds)
    - **Per-country intersection check**: For each specified country:
-     - Creates a 1500km buffer around the country boundary
+     - Creates a 500km buffer around the country boundary
      - Checks if storm envelopes intersect the buffered zone
      - Only processes countries that are actually affected
    - Creates impact views for each affected country:
@@ -143,8 +166,47 @@ python main_pipeline.py --type update
      - Admin-level impact views (aggregated to admin level 1)
      - CCI views (Child Cyclone Index values)
      - Track views (severity metrics per ensemble member)
+     - Gust views: the same per-facility, tile, admin, and track views mirrored for wind gust
+       envelopes (17-70 m/s thresholds), written to separate `*_views_gust/` directories with a
+       `g`-prefixed threshold token. Runs automatically whenever gust data exists for the
+       storm/forecast (disable with `--skip-gust`). No CCI, vulnerability, or JSON report for
+       gust; see `FILE_STRUCTURE.md` for the full gust file reference.
    - Generates JSON impact reports
    - Marks storm as processed in `storms.json`
+5. Sequentially after storm processing completes (not filtered by `--storm`), storm-independent
+   precip/runoff analysis (`run_precip_analysis()`) runs once per invocation, against the
+   *latest* `MET_FORECASTS` tp/ro Zarr forecast by default, or against the `MET_FORECASTS` row for
+   the exact calendar date if `--date` is passed (mirrors wind/gust's own exact-date-match
+   backfill behavior):
+   - tp exceedance-probability tiles/admin/facility views (moderate/heavy/extreme mm thresholds,
+     4 accumulation windows: 6h/24h/72h/120h)
+   - ro/tp ratio exceedance-probability tiles/admin/facility views (0.3/0.6 runoff-coefficient
+     tiers, same 4 windows)
+   - Facility-level exposure (schools/HCs/shelters/WASH) is routed through each facility's
+     containing mercator tile rather than sampled independently, since precip's native ~0.25°
+     grid is far coarser than a tile, this guarantees a facility always agrees with the tile it
+     physically sits inside
+   - Written to `mercator_views_precip/`, `mercator_views_precipratio/`, `admin_views_precip/`,
+     `admin_views_precipratio/`, and 8 facility directories
+     (`{school,hc,shelter,wash}_views_{precip,precipratio}/`)
+   - Disable with `--skip-precip`. A precip failure never affects storm (wind/gust) processing's
+     exit code and vice versa. No CCI, vulnerability, or JSON report for precip; see
+     `FILE_STRUCTURE.md` for the full precip file reference.
+6. Sequentially after that, storm-independent river-flood analysis (`run_river_flood_analysis()`) runs
+   once per invocation, against the *latest* `RIVER_FORECASTS` row per RP tier by default (or the
+   exact calendar date if `--date` is passed):
+   - Six return-period tiers (rp2/rp5/rp10/rp20/rp50/rp100) x four lead-time steps (24/72/120/168h)
+   - GloFAS/JRC flood pixels are ~150m resolution, comparable to a tile or facility footprint, so
+     this reuses wind/gust's `count(distinct members)/51` model, not precip's raster-sampling
+     model: tile/admin probability via point-in-polygon, **facility-level probability computed
+     independently via buffer-and-intersect** (not routed through a containing tile, unlike precip)
+   - Each RP tier's global flooded-pixel Parquet file is downloaded once per (tier, date), then
+     queried per country via a DuckDB bbox filter
+   - Written to `mercator_views_river/`, `admin_views_river/`, and 4 facility directories
+     (`{school,hc,shelter,wash}_views_river/`)
+   - Disable with `--skip-river-flood`. A river-flood failure never affects storm (wind/gust) or
+     precip processing's exit code and vice versa. No CCI, vulnerability, or JSON report for river
+     flood; see `FILE_STRUCTURE.md` for the full river-flood file reference.
 
 Requirements:
 - Valid Snowflake credentials (`SNOWFLAKE_*`)
@@ -158,31 +220,24 @@ Note:
 ======================================================================
 HURRICANE IMPACT ANALYSIS PIPELINE
 ======================================================================
-Storm: LORENZO
-Forecast Time: 20251015120000
-Countries: ATG, BLZ, NIC, DOM, DMA, GRD, MSR, KNA, LCA, VCT, AIA, VGB
+Storm: BAVI
+Forecast Time: 20260702000000
+Countries: ['PHL']
 Skip Analysis: False
 ======================================================================
 STEP 1: Impact Analysis
 --------------------------------------------------
-Running impact analysis for LORENZO at 20251015120000
-Countries: ATG, BLZ, NIC, DOM, DMA, GRD, MSR, KNA, LCA, VCT, AIA, VGB
+Running impact analysis for BAVI at 20260702000000
+Countries: PHL
 Loading envelope data from Snowflake...
-Loaded 23 envelope records
-Envelopes already converted to GeoDataFrame
-Checking which countries are affected (1500km buffer per country)...
-  TWN: Affected
-Processing 1 affected country/countries: TWN
+Loaded 317 envelope records
+Loaded 391 gust envelope records
+Processing 1 affected country/countries: PHL
 Creating impact views for affected countries...
-  Processing ATG...
     Processing schools...
-    Created 3 school views
     Processing health centers...
-    Created 3 health center views
     Processing tiles...
-    Created 3 tile views
     Processing tracks...
-    Created 3 track views
 Impact analysis completed successfully
 ======================================================================
 ```
@@ -196,12 +251,13 @@ Backfills one or more optional columns in existing mercator and admin parquets w
 python main_pipeline.py --type patch --countries PNG --columns shelters wash
 ```
 
-**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`, `admin<N>` (e.g. `admin2` — adds a new admin level base parquet without re-initializing)
+**Supported columns:** `population`, `school_age_population`, `infant_population`, `adolescent_population`, `built_surface_m2`, `smod_class`, `smod_class_l1`, `rwi`, `schools`, `hcs`, `shelters`, `wash`, `vulnerability`, `admin<N>` (e.g. `admin2`, adds a new admin level base parquet without re-initializing)
 
 **Notes:**
 - Patching any regular column updates both the mercator parquet and all initialized admin parquets (re-aggregated automatically for every admin level found)
-- Patching `admin<N>` (e.g. `--columns admin2`) creates a new admin level base parquet from the existing mercator tiles — useful when a country was initialized with admin1 only and admin2 data is now needed
+- Patching `admin<N>` (e.g. `--columns admin2`) creates a new admin level base parquet from the existing mercator tiles, useful when a country was initialized with admin1 only and admin2 data is now needed
 - `schools`, `hcs`, `shelters`, `wash` re-fetch the full facility location cache (OSM or custom CSV) and recompute per-tile counts; the parquet columns they update are `num_schools`, `num_hcs`, `num_shelters`, `num_wash`
+- `vulnerability` patches `moderate_poverty_prob` + `severe_poverty_prob` from `geodb/vulnerability/` (run `vulnerability/fetch_vulnerability_probs.py` first to produce that data)
 - Patching `smod_class` always updates `smod_class_l1` at the same time (derived field)
 - Custom CSVs in `geodb/custom/` take priority over raster/API re-processing in patch mode too
 - Raises an error if no base mercator parquet exists for the country (must initialize first)
@@ -212,17 +268,17 @@ python main_pipeline.py --type patch --countries PNG --columns shelters wash
 
 ## How Country Filtering Works
 
-The pipeline uses **per-country filtering** with a **1500km buffer** to determine which countries are affected by a storm. Two paths are used:
+The pipeline uses **per-country filtering** with a **500km buffer** to determine which countries are affected by a storm. Two paths are used:
 
 **Primary: SQL pre-filter (fast)**
 - Queries Snowflake using `ST_DWITHIN` on `PIPELINE_COUNTRIES.COUNTRY_BOUNDARY` against the storm envelope
-- Returns ISO codes within 1,500 km in a single SQL call
-- Requires `COUNTRY_BOUNDARY` to be populated (run `scripts/init_country_boundaries.py` once after adding countries)
+- Returns ISO codes within 500 km in a single SQL call
+- Requires `COUNTRY_BOUNDARY` to be populated; this happens automatically for every country during `--type initialize` (see `write_country_boundary()`), no separate manual step needed
 
 **Fallback: Python buffer check (if SQL pre-filter fails)**
 1. **For each country** specified (e.g., `--countries TWN DOM VNM`):
    - Fetches the actual country boundary from UNICEF GeoRepo
-   - Applies a 1500km buffer around the boundary
+   - Applies a 500km buffer around the boundary
    - Checks if storm envelopes intersect this buffered zone
 
 **Only affected countries are processed:**
@@ -267,10 +323,16 @@ The pipeline supports three storage backends (configured via `DATA_PIPELINE_DB`)
 - **Tile impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/`
 - **Admin impact views:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/admin_views/`
 - **CCI views:** `mercator_views/` and `admin_views/` (with `_cci` suffix)
-- **Custom data overrides:** `{ROOT_DATA_DIR}/custom/` — place `<COUNTRY>_<type>.csv` here (see `custom_data/README.md`)
+- **Gust impact views:** `school_views_gust/`, `hc_views_gust/`, `shelter_views_gust/`, `wash_views_gust/`, `mercator_views_gust/`, `admin_views_gust/`, `track_views_gust/` (mirror the wind directories, `g`-prefixed thresholds, no CCI/vulnerability/JSON report)
+- **Tile-member bitmask views:** `track_tile_bitmask_views/` (wind), `track_tile_bitmask_views_gust/` (gust), `track_tile_bitmask_views_river/` (river flood), `track_tile_bitmask_views_precip/` (precip): per-z14-tile, per-ensemble-member 64-bit coverage bitmask; see `FILE_STRUCTURE.md` item 19b for the full schema
+- **Precip impact views (storm-independent):** `mercator_views_precip/`, `mercator_views_precipratio/` (tile-level), `admin_views_precip/`, `admin_views_precipratio/` (admin-level), `{school,hc,shelter,wash}_views_{precip,precipratio}/` (8 facility-level directories, `.parquet` not `.csv` since these carry real geometry). No CCI/vulnerability/JSON report; see `FILE_STRUCTURE.md` for full naming conventions
+- **River-flood impact views (storm-independent):** `mercator_views_river/` (tile-level), `admin_views_river/` (admin-level), `{school,hc,shelter,wash}_views_river/` (4 facility-level directories, `.parquet` not `.csv`, no tp/ratio split since river flood has only one hazard variable). No CCI/vulnerability/JSON report; see `FILE_STRUCTURE.md` for full naming conventions
+- **Custom data overrides:** `{ROOT_DATA_DIR}/custom/`: place `<COUNTRY>_<type>.csv` here (see `custom_data/README.md`)
 - **Impact reports:** `{RESULTS_DIR}/jsons/` (JSON files per country/storm/forecast)
-- **Processed storms:** `{ROOT_DATA_DIR}/{STORMS_FILE}` (default: `geodb/storms.json`)
-- **Raw rasters:** WorldPop, GHSL, SMOD, RWI are cached internally by giga-spatial — not stored on the Snowflake stage. Their aggregated per-tile values are permanently stored in the base mercator parquet (`mercator_views/{country}_{zoom}.parquet`) and can be used directly for visualization
+- **Processed storms:** `{RESULTS_DIR}/{STORMS_FILE}` (default: `results/storms.json`) -- only used
+  when `DATA_PIPELINE_DB=LOCAL`/`BLOB`; the real production `DATA_PIPELINE_DB=SNOWFLAKE` mode tracks
+  the same information in the `TC_PIPELINE_RUN_LOG` Snowflake table instead
+- **Raw rasters:** WorldPop, GHSL, SMOD, RWI are cached via giga-spatial's own data-store handlers, which write through the pipeline's configured data store, so they land on the Snowflake stage too when `DATA_PIPELINE_DB=SNOWFLAKE`. Their aggregated per-tile values are permanently stored in the base mercator parquet (`mercator_views/{country}_{zoom}.parquet`) and can be used directly for visualization
 
 See `FILE_STRUCTURE.md` for detailed file structure and naming conventions.
 
@@ -295,6 +357,8 @@ The pipeline uses a Snowflake-based country management system to track which cou
 - `CENTER_LON` (FLOAT): Longitude for visualization map center
 - `VIEW_ZOOM` (INTEGER): Zoom level for visualization map (different from analysis ZOOM_LEVEL)
 - `NOTES` (VARCHAR(500)): Optional notes
+- `TIMEZONE` (VARCHAR): IANA timezone name for local time display in alerts (e.g. `America/Jamaica`), defaults to UTC
+- `IS_REGION` (BOOLEAN): Excludes a row from the active-countries list when TRUE (e.g. a regional grouping row rather than a real country)
 
 **PIPELINE_COUNTRY_ZOOM_LEVELS** - Tracks initialization per zoom level:
 - `COUNTRY_CODE` (VARCHAR(3)): ISO3 country code
@@ -306,8 +370,8 @@ The pipeline uses a Snowflake-based country management system to track which cou
 
 **Option 1: Initialize via Command Line**
 ```bash
-# Initialize Taiwan at zoom level 14 (tracking happens automatically)
-python main_pipeline.py --type initialize --countries TWN --zoom 14 --rewrite 0
+# Initialize PHL at zoom level 14 (tracking happens automatically)
+python main_pipeline.py --type initialize --countries PHL --zoom 14 --rewrite 0
 ```
 
 **Option 2: Initialize via GitHub Actions** (Recommended for production)
@@ -323,8 +387,8 @@ python main_pipeline.py --type initialize --countries TWN --zoom 14 --rewrite 0
 ```bash
 # Via GitHub Actions: Use "Manage Country Status" workflow
 # Or via Python:
-python -c "from country_utils import activate_country; activate_country('TWN')"
-python -c "from country_utils import deactivate_country; deactivate_country('VNM')"
+python -c "from country_utils import activate_country; activate_country('PHL')"
+python -c "from country_utils import deactivate_country; deactivate_country('PHL')"
 ```
 
 ### Automatic Country Detection

@@ -75,6 +75,8 @@ WORKDIR /app
 # Copy core pipeline modules
 COPY main_pipeline.py /app/
 COPY impact_analysis.py /app/
+COPY precip_utils.py /app/
+COPY glofas_utils.py /app/
 COPY config.py /app/
 COPY data_store_utils.py /app/
 COPY snowflake_utils.py /app/

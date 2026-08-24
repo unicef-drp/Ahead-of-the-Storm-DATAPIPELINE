@@ -75,7 +75,7 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
 
 `TC_PIPELINE_COMPLETE_LOG` is the handshake between DATAPIPELINE and the `*_MAT` table refresh.
 
-**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the `AOTS_ANALYSIS` stage, something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready — it can only poll on a fixed cron.
+**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the `AOTS_ANALYSIS` stage, something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready: it can only poll on a fixed cron.
 
 **The chain:**
 ```
@@ -87,7 +87,7 @@ DATAPIPELINE finishes writing Parquet to stage
     → Dash app and AI agent see fresh data
 ```
 
-Without it, the only alternative is `TRIGGER_REFRESH_INTERIM` — a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
+Without it, the only alternative is `TRIGGER_REFRESH_INTERIM`, a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
 
 **Table schema:**
 ```sql
@@ -240,10 +240,6 @@ EXECUTE JOB SERVICE
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
           
-          # Pipeline parameters
-          ZOOM_LEVEL: "14"
-          REWRITE: "0"
-          
           # Optional: SSL/certificate handling (set to true if experiencing certificate issues)
           # SNOWFLAKE_INSECURE_MODE: false
        args:
@@ -257,6 +253,11 @@ EXECUTE JOB SERVICE
 ```
 
 ### Option 3: Running as a Scheduled Job (Automatic Processing)
+
+**Not the live production scheduling mechanism** -- the real live scheduler is a Databricks Job
+(`databricks/04_production_scheduler.py`, see `databricks/README.md`), which calls the pipeline
+functions directly rather than launching an SPCS container. This option remains available as a
+manual/on-demand SPCS run path; the `CREATE JOB` below is illustrative, not deployed.
 
 Create a scheduled job that automatically processes the latest storms:
 
@@ -283,8 +284,6 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
           SNOWFLAKE_WAREHOUSE: your_warehouse
           DATA_PIPELINE_DB: SNOWFLAKE
           SNOWFLAKE_STAGE_NAME: your_stage
-          ZOOM_LEVEL: "14"
-          REWRITE: "0"
           # API Keys (required for data fetching)
           GIGA_SCHOOL_LOCATION_API_KEY: <your_giga_api_key>
           HEALTHSITES_API_KEY: <your_healthsites_api_key>
@@ -344,8 +343,6 @@ CREATE OR REPLACE JOB impact_analysis_auto_latest_storms
 
 ### Optional
 
-- `ZOOM_LEVEL`: Zoom level for mercator tiles (default: `14`)
-- `REWRITE`: Set to `1` to force reprocessing, `0` to skip existing (default: `0`)
 - `ROOT_DATA_DIR`: Base data directory (default: `geodb`)
 - `VIEWS_DIR`: Views subdirectory (default: `aos_views`)
 - `RESULTS_DIR`: Results directory (default: `results`)
@@ -359,10 +356,16 @@ The pipeline accepts command-line arguments:
 - `--zoom`: Zoom level for tiles (default: `14`)
 - `--admin`: Admin levels to initialize, space-separated (default: `1`; use `1 2` for admin1 + admin2). Only applies to `--type initialize`. Logs an error and skips gracefully if a level is unavailable in GeoRepo.
 - `--rewrite`: Set to `1` to force reprocessing (default: `0`)
-- `--time_delta`: Number of days in the past to consider storms (default: `9`)
+- `--time_delta`: Number of days in the past to consider storms (default: `2`)
 - `--date`: Process only storms on a specific date (YYYY-MM-DD format)
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
-- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet)
+- `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet, or `vulnerability` to patch poverty probabilities)
+- `--hazard`: Hazard type to process (currently only `hurricane` is supported)
+- `--skip-analysis`: Skip the analysis step (for testing pipeline structure without processing data)
+- `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
+- `--skip-precip`: Skip precipitation/runoff analysis even if `MET_FORECASTS` data is available (storm processing is unaffected)
+- `--skip-river-flood`: Skip GloFAS river-flood analysis even if `RIVER_FORECASTS` data is available
+- `--log-level`: Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`; default: `INFO`)
 
 ## Example: Initialize Pipeline for Taiwan
 
