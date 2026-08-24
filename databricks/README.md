@@ -1,10 +1,8 @@
 # Databricks Notebooks
 
 This directory holds the real, live production scheduler for DATAPIPELINE's compute, plus standalone
-diagnostic/backfill tools that share its code paths. See the root `CLAUDE.md`'s "Databricks Scheduling"
-section for how this fits into the pipeline's overall architecture, and the root `README.md`'s
-"Production Scheduling" section for how this compares to the other deployment options (SPCS, GitHub
-Actions).
+diagnostic/backfill tools that share its code paths. See the root `README.md`'s "Production
+Scheduling" section for how this compares to the other deployment options (SPCS, GitHub Actions).
 
 ## Files
 
