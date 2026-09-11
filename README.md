@@ -49,7 +49,7 @@ pip install -r requirements.txt
 - VIEWS_DIR (default: `aos_views`)
 - SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
 - DATA_PIPELINE_DB (`LOCAL` by default; use `BLOB` for Azure, `SNOWFLAKE` for Snowflake stage): where THIS repo's own output/cache is written
-  - If `BLOB`, also set: `ACCOUNT_URL`, `SAS_TOKEN`
+  - If `BLOB`, also set: `ACCOUNT_URL`, `SAS_TOKEN`, `CONTAINER_NAME`
   - If `SNOWFLAKE`, also set: `SNOWFLAKE_STAGE_NAME` (stage must exist in the database/schema)
 - HAZARD_DATA_SOURCE (`SNOWFLAKE` by default; use `LOCAL` or `BLOB` to read upstream hurricane wind/gust/tracks/precip data from somewhere other than Snowflake): independent of `DATA_PIPELINE_DB`, mainly a local dev/testing convenience
   - If `LOCAL`, also set: `HAZARD_LOCAL_WIND_DIR`, `HAZARD_LOCAL_TRACKS_DIR`, `HAZARD_LOCAL_MET_DIR` (point at TC-ECMWF-Forecast-Pipeline's own local output directories)
@@ -64,7 +64,7 @@ pip install -r requirements.txt
 
 ## Step 1: Initialize Base Data
 
-This step creates the mercator tile views and admin level views with demographic and infrastructure data for each country. The pipeline uses direct country boundary checks with a 500km buffer, eliminating the need for a separate bounding box file. Countries are specified when initializing.
+This step creates the mercator tile views and admin level views with demographic and infrastructure data for each country. The pipeline uses direct country boundary checks with a 100km buffer, eliminating the need for a separate bounding box file. Countries are specified when initializing.
 
 **Command:**
 ```bash
@@ -124,15 +124,14 @@ python main_pipeline.py --type update
 - Filters storms by time delta or specific date/storm (if provided)
 - For each storm/forecast combination:
   - Loads hurricane envelope data
-  - **Per-country filtering**: Checks each country individually with a 500km buffer
+  - **Per-country filtering**: Checks each country individually with a 100km buffer
   - **Only processes affected countries**: If a storm affects Taiwan but not Vietnam, only Taiwan is processed
   - Creates per-facility impact views for schools, health centers, shelters, and WASH infrastructure
   - Creates tile-level and admin-level impact views
   - Calculates Child Cyclone Index (CCI) values
-  - Generates JSON impact reports
   - Saves views to the configured data store (local/Azure/Snowflake)
   - Records processed storms in `storms.json` (`DATA_PIPELINE_DB=LOCAL`/`BLOB`) or the
-    `TC_PIPELINE_RUN_LOG` Snowflake table (`DATA_PIPELINE_DB=SNOWFLAKE`, the real production mode --
+    `TC_PIPELINE_RUN_LOG` Snowflake table (`DATA_PIPELINE_DB=SNOWFLAKE`, the real production mode;
     see below)
 
 **Process Flow** (`DATA_PIPELINE_DB=LOCAL`/`BLOB` shown; in production, `DATA_PIPELINE_DB=SNOWFLAKE`
@@ -143,7 +142,7 @@ uses the `TC_PIPELINE_RUN_LOG` table in place of `storms.json` at every step bel
 4. For each storm not yet processed (or if `rewrite=1`):
    - Loads envelope data (wind impact areas at different thresholds)
    - **Per-country intersection check**: For each specified country:
-     - Creates a 500km buffer around the country boundary
+     - Creates a 100km buffer around the country boundary
      - Checks if storm envelopes intersect the buffered zone
      - Only processes countries that are actually affected
    - Creates impact views for each affected country:
@@ -157,7 +156,6 @@ uses the `TC_PIPELINE_RUN_LOG` table in place of `storms.json` at every step bel
        `g`-prefixed threshold token. Runs automatically whenever gust data exists for the
        storm/forecast (disable with `--skip-gust`). No CCI, vulnerability, or JSON report for
        gust; see `FILE_STRUCTURE.md` for the full gust file reference.
-   - Generates JSON impact reports
    - Marks storm as processed in `storms.json`
 5. Sequentially after storm processing completes (not filtered by `--storm`), storm-independent
    precip/runoff analysis (`run_precip_analysis()`) runs once per invocation, against the
@@ -254,17 +252,22 @@ python main_pipeline.py --type patch --countries PNG --columns shelters wash
 
 ## How Country Filtering Works
 
-The pipeline uses **per-country filtering** with a **500km buffer** to determine which countries are affected by a storm. Two paths are used:
+The pipeline uses **per-country filtering** with a **100km buffer** to determine which countries are affected by a storm. Three paths are used, depending on `HAZARD_DATA_SOURCE`:
 
-**Primary: SQL pre-filter (fast)**
+**Primary (`HAZARD_DATA_SOURCE=SNOWFLAKE`): SQL pre-filter (fast)**
 - Queries Snowflake using `ST_DWITHIN` on `PIPELINE_COUNTRIES.COUNTRY_BOUNDARY` against the storm envelope
-- Returns ISO codes within 500 km in a single SQL call
+- Returns ISO codes within 100 km in a single SQL call
 - Requires `COUNTRY_BOUNDARY` to be populated; this happens automatically for every country during `--type initialize` (see `write_country_boundary()`), no separate manual step needed
 
-**Fallback: Python buffer check (if SQL pre-filter fails)**
+**Primary for any other `HAZARD_DATA_SOURCE`: cached pre-filter**
+- Reads `geodb/pipeline_countries_boundaries.parquet` (via `data_store`, so it follows `DATA_PIPELINE_DB`) and does a spatially-indexed join against the storm envelope, zero live network calls
+- The cache stores each country's **buffered convex hull**, not its literal boundary, precomputed once whenever `write_country_boundary()` runs (`_update_pipeline_countries_cache()`); an archipelago nation with hundreds of island parts (e.g. Solomon Islands) buffers its literal boundary in tens of seconds, versus under a millisecond for its convex hull
+- A convex hull is always equal-or-larger than the real shape, so this can only make a country match slightly more often than the literal boundary would, never less
+
+**Fallback: Python buffer check (if the above returns no result)**
 1. **For each country** specified (e.g., `--countries TWN DOM VNM`):
    - Fetches the actual country boundary from UNICEF GeoRepo
-   - Applies a 500km buffer around the boundary
+   - Applies a 100km buffer around the boundary
    - Checks if storm envelopes intersect this buffered zone
 
 **Only affected countries are processed:**
@@ -299,7 +302,7 @@ python main_pipeline.py --type patch --countries PNG --columns admin2
 
 The pipeline supports three storage backends (configured via `DATA_PIPELINE_DB`):
 - **LOCAL**: Files stored on local filesystem
-- **BLOB**: Files stored in Azure Blob Storage (requires `ACCOUNT_URL` and `SAS_TOKEN`)
+- **BLOB**: Files stored in Azure Blob Storage (requires `ACCOUNT_URL`, `SAS_TOKEN`, and `CONTAINER_NAME`)
 - **SNOWFLAKE**: Files stored in Snowflake internal stage (requires `SNOWFLAKE_STAGE_NAME`)
 
 **Storage locations:**
@@ -314,8 +317,7 @@ The pipeline supports three storage backends (configured via `DATA_PIPELINE_DB`)
 - **Precip impact views (storm-independent):** `mercator_views_precip/`, `mercator_views_precipratio/` (tile-level), `admin_views_precip/`, `admin_views_precipratio/` (admin-level), `{school,hc,shelter,wash}_views_{precip,precipratio}/` (8 facility-level directories, `.parquet` not `.csv` since these carry real geometry). No CCI/vulnerability/JSON report; see `FILE_STRUCTURE.md` for full naming conventions
 - **River-flood impact views (storm-independent):** `mercator_views_river/` (tile-level), `admin_views_river/` (admin-level), `{school,hc,shelter,wash}_views_river/` (4 facility-level directories, `.parquet` not `.csv`, no tp/ratio split since river flood has only one hazard variable). No CCI/vulnerability/JSON report; see `FILE_STRUCTURE.md` for full naming conventions
 - **Custom data overrides:** `{ROOT_DATA_DIR}/custom/`: place `<COUNTRY>_<type>.csv` here (see `custom_data/README.md`)
-- **Impact reports:** `{RESULTS_DIR}/jsons/` (JSON files per country/storm/forecast)
-- **Processed storms:** `{RESULTS_DIR}/{STORMS_FILE}` (default: `results/storms.json`) -- only used
+- **Processed storms:** `{RESULTS_DIR}/{STORMS_FILE}` (default: `results/storms.json`), only used
   when `DATA_PIPELINE_DB=LOCAL`/`BLOB`; the real production `DATA_PIPELINE_DB=SNOWFLAKE` mode tracks
   the same information in the `TC_PIPELINE_RUN_LOG` Snowflake table instead
 - **Raw rasters:** WorldPop, GHSL, SMOD, RWI are cached via giga-spatial's own data-store handlers, which write through the pipeline's configured data store, so they land on the Snowflake stage too when `DATA_PIPELINE_DB=SNOWFLAKE`. Their aggregated per-tile values are permanently stored in the base mercator parquet (`mercator_views/{country}_{zoom}.parquet`) and can be used directly for visualization
@@ -462,5 +464,5 @@ live, recurring production path today:
 | Mechanism | Status | What it's for |
 |---|---|---|
 | **Databricks Job** | **Live production scheduler** | Recurring, automatic processing of new storm/precip/river data on a fixed 16x/day cron, running on an existing (not job) cluster for fast startup. Each run discovers unprocessed wind/gust storm cycles and precip/river backlog by checking real output-table existence (not just a logged status), computes them by calling the same pipeline functions this repo's own `main()` uses, and signals completion the same way production always has. |
-| **SPCS** (`snowflake/test_spcs_job.sql`, `deploy_to_spcs.sh`) | Available, not scheduled | An `EXECUTE JOB SERVICE` spec that can run the pipeline in a Snowflake container. Its own `CREATE JOB` (the part that would make it recurring) is commented out -- it is not the live scheduling mechanism, only a manual/on-demand run path. |
-| **GitHub Actions** (workflows above) | Live, but manual-only | `workflow_dispatch`-triggered one-off operations (initialize a new country, patch columns, reprocess past storms, manage country status) -- not a recurring pipeline trigger. |
+| **SPCS** (`snowflake/test_spcs_job.sql`, `deploy_to_spcs.sh`) | Available, not scheduled | An `EXECUTE JOB SERVICE` spec that can run the pipeline in a Snowflake container. Its own `CREATE JOB` (the part that would make it recurring) is commented out: it is not the live scheduling mechanism, only a manual/on-demand run path. |
+| **GitHub Actions** (workflows above) | Live, but manual-only | `workflow_dispatch`-triggered one-off operations (initialize a new country, patch columns, reprocess past storms, manage country status), not a recurring pipeline trigger. |

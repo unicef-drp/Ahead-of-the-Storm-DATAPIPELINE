@@ -2,11 +2,11 @@ name: GeoSight Sync
 
 on:
   schedule:
-    - cron: '0 0,6,12,18 * * *'  # 00/06/12/18 UTC — 3h after TC pipeline runs (03/09/15/21 UTC)
+    - cron: '0 0,6,12,18 * * *'  # 00/06/12/18 UTC, 3h after TC pipeline runs (03/09/15/21 UTC)
   workflow_dispatch:
     inputs:
       backfill:
-        description: 'Backfill mode — upload without dedup'
+        description: 'Backfill mode: upload without dedup'
         required: false
         default: 'false'
         type: choice

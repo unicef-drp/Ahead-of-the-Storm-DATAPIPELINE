@@ -17,9 +17,6 @@
 # MAGIC discovery queries close that gap by looking back `LOOKBACK_DAYS` and finding every real cycle
 # MAGIC not yet logged in `AMBIENT_HAZARD_RUN_LOG`, not just the latest one.
 # MAGIC
-# MAGIC This same discovery query logic (wind/gust, precip, and river) is the logic used inside the
-# MAGIC live production scheduler notebook, `04_production_scheduler.py`.
-# MAGIC
 # MAGIC Entirely read-only: this notebook only reports what work a real scheduled poll would find. It
 # MAGIC does not call any compute functions and does not write anything.
 # MAGIC
@@ -68,7 +65,7 @@ try:
         text = text.replace(old4, new4)
         patch_results["list_quoting"] = "PATCHED"
     else:
-        patch_results["list_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["list_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     old5 = 'get_command = f"GET {stage_path} \'file://{temp_dir_normalized}\'"'
     new5 = "get_command = f\"GET '{stage_path}' 'file://{temp_dir_normalized}'\""
@@ -78,7 +75,7 @@ try:
         text = text.replace(old5, new5)
         patch_results["get_quoting"] = "PATCHED"
     else:
-        patch_results["get_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["get_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     p.write_text(text)
 except Exception as e:

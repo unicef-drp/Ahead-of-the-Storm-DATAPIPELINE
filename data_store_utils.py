@@ -7,7 +7,7 @@ It consolidates data store initialization logic and provides a single source of 
 
 The module supports three storage backends:
 - LOCAL: Local filesystem storage (default)
-- BLOB: Azure Blob Storage (requires ACCOUNT_URL and SAS_TOKEN)
+- BLOB: Azure Blob Storage (requires ACCOUNT_URL, SAS_TOKEN, and CONTAINER_NAME)
 - SNOWFLAKE: Snowflake internal stage (requires SNOWFLAKE_STAGE_NAME)
 
 Storage backend is configured via the DATA_PIPELINE_DB environment variable.
@@ -30,6 +30,119 @@ from gigaspatial.core.io.snowflake_data_store import SnowflakeDataStore
 # Import centralized configuration
 from config import config as app_config
 import os
+import threading
+import queue
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# A raw OS-level socket write()/read() (Azure Blob upload/download) can hang
+# indefinitely on a dead/black-holed connection, past azure-storage-blob's own
+# connect/read timeouts (those don't cover a stuck syscall waiting on kernel-
+# level TCP retransmission). gigaspatial's ADLSDataStore has no protection
+# against this, so it's added here: an external watchdog runs the real call in
+# a daemon worker thread and raises TimeoutError if it doesn't return within
+# _BLOB_OP_TIMEOUT_SECONDS. Python can't kill a thread stuck in a blocking
+# syscall, so the worker is abandoned rather than joined - acceptable since the
+# pipeline's existing per-country/per-operation try/except already handles the
+# raised exception, which beats hanging the whole process. daemon=True (not
+# ThreadPoolExecutor, whose workers are non-daemon) so an abandoned worker
+# never blocks process exit. Applied by monkeypatching the class, so every
+# ADLSDataStore instance is covered regardless of which factory constructed it.
+_BLOB_OP_TIMEOUT_SECONDS = 120  # well above typical operation time, well below a stuck-connection hang
+
+
+def _with_hard_timeout(func, timeout=_BLOB_OP_TIMEOUT_SECONDS):
+    def wrapper(*args, **kwargs):
+        result_q = queue.Queue(maxsize=1)
+
+        def _run():
+            try:
+                result_q.put(('ok', func(*args, **kwargs)))
+            except Exception as e:
+                result_q.put(('error', e))
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        try:
+            status, value = result_q.get(timeout=timeout)
+        except queue.Empty:
+            logger.error(
+                f"{func.__qualname__} exceeded {timeout}s, likely a stuck Azure Blob "
+                f"connection (see this module's own header comment), aborting this "
+                f"operation rather than hanging indefinitely"
+            )
+            raise TimeoutError(f"{func.__qualname__} exceeded {timeout}s (stuck Blob connection)")
+        if status == 'error':
+            raise value
+        return value
+    return wrapper
+
+
+# Six ADLSDataStore methods carry the same stuck-connection risk: read_file,
+# list_files, file_exists, remove, exists (used by the stale-file retry path in
+# create_views_from_envelopes_in_country()), and is_dir (called by gigaspatial's
+# WorldPopConfig.get_data_unit_paths() under DATA_PIPELINE_DB=BLOB; safe to wrap
+# directly since it returns a plain bool after fully consuming its own generator).
+# list_files_iter() is deliberately left unwrapped - it's lazy, so wrapping its
+# creation wouldn't guard the real I/O that happens later, item by item, during
+# iteration.
+#
+# write_file is wrapped separately below, around a faster replacement
+# implementation rather than the original gigaspatial method.
+for _method_name in ('read_file', 'list_files', 'file_exists', 'remove', 'exists', 'is_dir'):
+    setattr(ADLSDataStore, _method_name, _with_hard_timeout(getattr(ADLSDataStore, _method_name)))
+
+
+# gigaspatial's ADLSDataStore.write_file() uploads with no max_concurrency, so every
+# upload is single-connection and non-chunked - and azure-storage-blob only chunks
+# payloads above max_single_put_size (64MB default), so WorldPop .tif files (~25MB)
+# would never trigger it even if max_concurrency were added alone. There's no public
+# way to lower max_single_put_size on ADLSDataStore (no constructor param, no per-call
+# upload_blob() kwarg), so this replacement sets it directly on the shared BlobClient's
+# _config once per call (a private-by-convention attribute, but the only reachable one;
+# idempotent, so concurrent write_file calls racing on it is harmless) before uploading
+# with max_concurrency. 4MB matches azure-storage-blob's own default block size
+# (guarantees chunking for any file above a few MB, not just today's ~25MB); concurrency
+# 4 matches TC-ECMWF-Forecast-Pipeline's own upload_to_blob() and gives real parallelism
+# for a ~25MB/4MB-block file without over-provisioning idle workers. _BLOB_OP_TIMEOUT_
+# SECONDS is left unchanged here - it exists to catch a genuinely stuck connection, not
+# to bound expected-case duration, and a real (not stuck) network can legitimately take
+# tens of seconds to push ~25MB even chunked.
+#
+# Known, reviewed side effect: a parallel upload drops conditional-access kwargs
+# (etag/if-match), irrelevant today since this call always passes overwrite=True with no
+# conditional kwargs. A mid-upload chunk failure still leaves the target blob untouched
+# either way, since commit_block_list() only runs after every chunk succeeds. This is a
+# local override of gigaspatial's write_file(), not a change to the installed library;
+# it also mutates the shared config for any future upload_file()/upload_directory() call
+# on the same instance (unused in this repo) - same correctness, no parallelism gain,
+# since those don't pass max_concurrency.
+_WRITE_MAX_CONCURRENCY = 4
+_WRITE_MAX_SINGLE_PUT_SIZE = 4 * 1024 * 1024  # 4MB, matches azure-storage-blob's own max_block_size default
+
+
+def _write_file_with_concurrency(self, path, data) -> None:
+    blob_key = self._to_blob_key(path)
+    blob_client = self.blob_service_client.get_blob_client(
+        container=self.container, blob=blob_key, snapshot=None
+    )
+    # Required for max_concurrency below to have any effect at this payload size -
+    # see this block's own header comment above _WRITE_MAX_CONCURRENCY.
+    blob_client._config.max_single_put_size = _WRITE_MAX_SINGLE_PUT_SIZE
+
+    if isinstance(data, str):
+        binary_data = data.encode()
+    elif isinstance(data, bytes):
+        binary_data = data
+    else:
+        raise ValueError(f'Unsupported data type. Only "bytes" or "string" accepted')
+
+    blob_client.upload_blob(binary_data, overwrite=True, max_concurrency=_WRITE_MAX_CONCURRENCY)
+
+
+ADLSDataStore.write_file = _with_hard_timeout(_write_file_with_concurrency)
 
 
 def get_snowflake_auth_kwargs() -> dict:
@@ -62,6 +175,7 @@ def get_data_store():
     if data_pipeline_db == 'BLOB':
         app_config.validate_azure_config()
         return ADLSDataStore(
+            container=app_config.CONTAINER_NAME,
             account_url=app_config.ACCOUNT_URL,
             sas_token=app_config.SAS_TOKEN,
         )

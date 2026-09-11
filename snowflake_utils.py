@@ -16,7 +16,7 @@ Key Components:
   directly from TC-ECMWF-Forecast-Pipeline's own output instead of
   Snowflake, plus dispatch functions (get_envelopes()/get_gust_envelopes()/
   get_tracks()) that pick Snowflake vs LOCAL/BLOB based on
-  config.HAZARD_DATA_SOURCE -- callers outside this module should use the
+  config.HAZARD_DATA_SOURCE; callers outside this module should use the
   dispatch functions, not the raw *_from_snowflake()/get_snowflake_tracks()
   ones directly, so they work under any HAZARD_DATA_SOURCE setting.
 
@@ -28,6 +28,7 @@ Usage:
 
 import io
 import os
+import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
@@ -97,7 +98,7 @@ def _execute_query(query: str, params: Optional[List[Any]] = None) -> pd.DataFra
         failed attempt), whether this function returns normally or raises.
         Raises on a genuine query failure rather than swallowing it into an
         empty DataFrame (deliberate fail-loud design, matches
-        get_countries_in_range()'s own reasoning below) -- every CURRENT
+        get_countries_in_range()'s own reasoning below); every CURRENT
         caller already wraps its own call site in try/except (main_pipeline.py's
         update_storms()/run_precip_analysis()/run_river_flood_analysis(), and
         glofas_utils.py's/precip_utils.py's own Snowflake-reading functions,
@@ -358,14 +359,16 @@ def get_snowflake_tracks(date: str, storm: str) -> pd.DataFrame:
 def _read_hazard_file(hazard_type: str, filename: str, storm: Optional[str] = None) -> Optional[bytes]:
     """
     Read one file's bytes from the configured HAZARD_DATA_SOURCE (LOCAL or
-    BLOB) location for a given hazard type ('wind' or 'tracks' -- 'met' is
-    handled separately by precip_utils._list_local_met_files(), which lists
-    a whole directory rather than looking up one filename at a time).
+    BLOB) location for a given hazard type ('wind' or 'tracks'; 'met' has no
+    LOCAL/BLOB file-listing equivalent at all, precip_utils.
+    get_latest_met_forecast()/get_met_forecast_for_date() always query real
+    Snowflake for the pointer step, matching river's own pattern, see those
+    functions' own docstrings for why).
 
     Looks in the flat top-level directory, matching TC-ECMWF-Forecast-
     Pipeline's own glob/write convention for wind/gust envelopes and tracks.
 
-    Returns None if the file isn't found -- a genuinely missing cycle (e.g.
+    Returns None if the file isn't found, a genuinely missing cycle (e.g.
     this storm never had a gust forecast, or this forecast_time predates
     local retention), mirrors get_envelopes_from_snowflake()'s own "returns
     empty DataFrame" behavior for a missing row, not an error.
@@ -376,7 +379,14 @@ def _read_hazard_file(hazard_type: str, filename: str, storm: Optional[str] = No
         'wind': config.HAZARD_LOCAL_WIND_DIR,
         'tracks': config.HAZARD_LOCAL_TRACKS_DIR,
     }
-    blob_prefix_by_type = {'wind': 'wind', 'tracks': 'tracks'}
+    # This mapping intentionally differs from HAZARD_LOCAL_WIND_DIR's key naming: Blob's
+    # actual prefixes are glofas, tracks, met, envelopes, geodb - no 'wind/' prefix - so
+    # 'wind' maps to 'envelopes'. TC-ECMWF-Forecast-Pipeline's own upload_to_blob() calls
+    # (github_actions/main.py step7_load(), snowflake/spcs_pipeline.py phase4_snowflake_loading())
+    # write wind/gust envelope CSVs under the 'envelopes/' container prefix. The
+    # hazard_type key stays 'wind' to match HAZARD_LOCAL_WIND_DIR's own naming for the
+    # LOCAL case above, an unrelated, independently correct config value.
+    blob_prefix_by_type = {'wind': 'envelopes', 'tracks': 'tracks'}
 
     if config.HAZARD_DATA_SOURCE == 'LOCAL':
         data_store = get_hazard_data_store(base_path=local_dir_by_type[hazard_type])
@@ -460,7 +470,7 @@ def get_tracks_local(date: str, storm: str) -> pd.DataFrame:
     TC-ECMWF-Forecast-Pipeline's own transformed-tracks output instead of
     TC_TRACKS. Local files carry many more columns (radius/wind-field-polygon
     fields, matching get_hurricane_data_from_snowflake()'s wider shape, not
-    get_snowflake_tracks()'s) -- this projects down to the same 7 columns for
+    get_snowflake_tracks()'s); this projects down to the same 7 columns for
     exact shape parity with get_snowflake_tracks().
 
     Args:
@@ -487,6 +497,81 @@ def get_tracks_local(date: str, storm: str) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(raw))
     df.columns = df.columns.str.upper()
     return df[['ENSEMBLE_MEMBER', 'VALID_TIME', 'LEAD_TIME', 'LATITUDE', 'LONGITUDE', 'WIND_SPEED_KNOTS', 'PRESSURE_HPA']]
+
+
+# Matches TC-ECMWF-Forecast-Pipeline's real, already-in-production track filename
+# shape exactly (same shape get_tracks_local() above already constructs via its own
+# f-string: f"transformed_tc_tracks_{date_str}_r{run_str}_storm_{storm}_extracted_
+# transformed.csv"), anchored to the full known filename, not the more generic
+# date/storm regexes TC-ECMWF's own pipeline_core.py uses elsewhere for the same
+# purpose, to avoid any false-positive match against an unrelated file that happens
+# to contain a similar substring.
+_TRACKS_FILENAME_RE = re.compile(
+    r'^transformed_tc_tracks_(\d{4}-\d{2}-\d{2})_r(\d{2})_storm_([A-Z0-9-]+)_extracted_transformed\.csv$'
+)
+
+
+def get_storms_local() -> pd.DataFrame:
+    """
+    LOCAL/BLOB equivalent of get_snowflake_data(): discovers every distinct
+    (storm, forecast_time) combination that has ever been written by
+    TC-ECMWF-Forecast-Pipeline, without any Snowflake dependency, so
+    update_storms() (main_pipeline.py) can discover a new storm under
+    HAZARD_DATA_SOURCE=LOCAL/BLOB where nothing ever writes to TC_TRACKS.
+
+    Lists the tracks/ directory (Blob) or HAZARD_LOCAL_TRACKS_DIR (local) and
+    parses each filename with the exact real filename shape
+    get_tracks_local() above already writes/reads (_TRACKS_FILENAME_RE), pure
+    filename parsing, no file contents ever read. ENSEMBLE_COUNT,
+    get_snowflake_data()'s only other real column, would require reading
+    file contents to compute; it has no real consumers in this codebase, so
+    it is still included in the returned DataFrame for exact schema parity
+    with get_snowflake_data(), left as NaN rather than computed.
+
+    Returns:
+        pd.DataFrame: TRACK_ID, FORECAST_TIME (as a real datetime, matching
+            get_snowflake_data()'s own dtype so downstream
+            pd.to_datetime()/.dt accessor calls in update_storms() work
+            unchanged), ENSEMBLE_COUNT (always NaN, see above). Empty (but
+            correctly-shaped) DataFrame if the tracks directory doesn't
+            exist yet or contains no matching files, a genuine "nothing
+            to discover yet" result, not an error.
+    """
+    from data_store_utils import get_hazard_data_store
+
+    if config.HAZARD_DATA_SOURCE == 'LOCAL':
+        data_store = get_hazard_data_store(base_path=config.HAZARD_LOCAL_TRACKS_DIR)
+        search_dir = '.'
+    else:  # BLOB
+        data_store = get_hazard_data_store()
+        search_dir = 'tracks'
+
+    try:
+        files = data_store.list_files(search_dir)
+    except Exception as e:
+        logger.warning(f"Could not list '{search_dir}' for storm discovery: {e}")
+        return pd.DataFrame({'TRACK_ID': [], 'FORECAST_TIME': [], 'ENSEMBLE_COUNT': []})
+
+    rows = []
+    for f in files:
+        basename = f.rsplit('/', 1)[-1]
+        m = _TRACKS_FILENAME_RE.match(basename)
+        if not m:
+            continue
+        date_str, run_str, storm = m.groups()
+        rows.append({
+            'TRACK_ID': storm,
+            'FORECAST_TIME': f'{date_str} {run_str}:00:00',
+            'ENSEMBLE_COUNT': float('nan'),
+        })
+
+    if not rows:
+        return pd.DataFrame({'TRACK_ID': [], 'FORECAST_TIME': [], 'ENSEMBLE_COUNT': []})
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=['TRACK_ID', 'FORECAST_TIME'])
+    df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'])
+    return df.sort_values(['FORECAST_TIME', 'TRACK_ID']).reset_index(drop=True)
+
 
 def get_hurricane_data_from_snowflake(track_id: str, forecast_time: str) -> pd.DataFrame:
     """
@@ -683,7 +768,7 @@ def convert_envelopes_to_geodataframe(envelopes_df: pd.DataFrame) -> gpd.GeoData
 # HAZARD_DATA_SOURCE DISPATCH
 #
 # These three are what impact_analysis.py should call instead of the raw
-# *_from_snowflake()/get_snowflake_tracks() functions above -- same call
+# *_from_snowflake()/get_snowflake_tracks() functions above, same call
 # signature, but routed to the LOCAL/BLOB reader when config.HAZARD_DATA_SOURCE
 # says so.
 # =============================================================================
@@ -819,7 +904,7 @@ def get_envelope_data_snowflake(track_id: str, forecast_time: str) -> pd.DataFra
     
     return df
 
-def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 500_000) -> list:
+def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 100_000) -> list:
     """
     Returns ISO codes of countries whose boundary is within buffer_m metres of the
     combined storm envelope for the given track_id and forecast_time.
@@ -830,7 +915,7 @@ def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: 
     Raises on a genuine query failure (connection/permission/ST_DWITHIN error)
     instead of swallowing it: the caller (main_pipeline.py) distinguishes
     "confirmed empty result" from "query itself failed" specifically to decide
-    whether to fall back to the Python 500km-buffer check, silently returning
+    whether to fall back to the Python 100km-buffer check, silently returning
     [] here for BOTH cases would make that fallback dead code, since the
     caller's own except would never fire.
     """
@@ -864,7 +949,7 @@ def get_countries_with_null_boundary(cursor, countries: list) -> list:
     from "confirmed out of range", it never appears in that function's result
     either way. This lets the caller (main_pipeline.py) detect that ambiguity
     specifically for the countries it actually requested, and route only those
-    through the Python 500km-buffer fallback instead of trusting a NULL-boundary
+    through the Python 100km-buffer fallback instead of trusting a NULL-boundary
     country was correctly excluded.
 
     Args:
@@ -904,7 +989,7 @@ def get_snowflake_data() -> pd.DataFrame:
             - ENSEMBLE_COUNT: Number of ensemble members
         Returns an empty (but correctly-shaped) DataFrame when the query
         genuinely returns 0 rows. Raises on a genuine query failure (see
-        _execute_query()'s own docstring) -- callers must wrap their own
+        _execute_query()'s own docstring); callers must wrap their own
         call site in try/except.
     """
     query = '''

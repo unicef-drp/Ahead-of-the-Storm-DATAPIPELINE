@@ -22,11 +22,17 @@
 # MAGIC
 # MAGIC Wind/gust is different: each storm cycle is distinct and worth its own processing, matching
 # MAGIC `CHECK_AND_TRIGGER_DATAPIPELINE()`'s own logic, so `02_scheduler_logic`'s wind/gust discovery
-# MAGIC results directly drive which `(storm, forecast_time)` pairs get processed below.
+# MAGIC results directly drive which `(storm, forecast_time)` pairs get processed below. Note this is
+# MAGIC `02_scheduler_logic`'s simpler, unhardened query (trusts a logged `SUCCESS` status
+# MAGIC unconditionally), not `04_scheduler_windgust.py`'s real-output-existence-checked one, so a
+# MAGIC backfill run here can therefore reprocess (real writes) a cycle the live wind/gust job would
+# MAGIC skip, or vice versa. Cross-check against `04_scheduler_windgust.py`'s own query first if that
+# MAGIC distinction matters for the backfill you're doing.
 # MAGIC
-# MAGIC Real writes to the real Snowflake stage. No completion signal, no alert cascade risk. The
-# MAGIC live production scheduler notebook, `04_production_scheduler.py`, runs this same compute
-# MAGIC logic plus a real completion signal on a live schedule.
+# MAGIC Real writes to the real Snowflake stage. No completion signal, no alert cascade risk. The 3
+# MAGIC live production scheduler notebooks, `04_scheduler_windgust.py` / `05_scheduler_precip.py` /
+# MAGIC `06_scheduler_river.py`, run this same compute logic (each scoped to its own hazard) plus a
+# MAGIC real completion signal on their own live schedules.
 # MAGIC
 # MAGIC Self-contained: installs its own dependencies and patches directly, so it does not depend on
 # MAGIC any other notebook having run first on the same cluster.
@@ -227,11 +233,18 @@ active_countries = get_active_countries_from_snowflake()
 print(f"Active countries: {len(active_countries)}")
 
 wind_results = []
+# The fix that makes `_seed_facility_failure_cache()`/`_new_facility_failures()`
+# (main_pipeline.py; see their own docstrings for the full "why") restore
+# cross-country facility-fetch-failure caching despite per-country subprocess
+# isolation: one set for this whole scheduler run, mutated in place by every
+# storm's own run_complete_impact_analysis() call below, then carried forward
+# into precip's and river's own calls further down this notebook.
+known_failed_facilities = set()
 for track_id, forecast_time in wind_work:
     date_str = forecast_time.strftime("%Y%m%d%H%M%S")
     logger.info(f"Processing {track_id} at {date_str}...")
     try:
-        result = run_complete_impact_analysis(track_id, date_str, active_countries, logger, zoom=14)
+        result = run_complete_impact_analysis(track_id, date_str, active_countries, logger, zoom=14, known_failed_facilities=known_failed_facilities)
         wind_results.append((track_id, forecast_time, result))
         print(f"  {track_id} {date_str}: {result}")
     except Exception as e:
@@ -256,12 +269,12 @@ from main_pipeline import run_precip_analysis, run_river_flood_analysis
 precip_files_written = 0
 river_files_written = 0
 try:
-    precip_files_written = run_precip_analysis(active_countries, logger, zoom=14, target_date=None) or 0
+    precip_files_written = run_precip_analysis(active_countries, logger, zoom=14, target_date=None, known_failed_facilities=known_failed_facilities) or 0
 except Exception as e:
     logger.error(f"Precip analysis failed: {e}", exc_info=True)
 
 try:
-    river_files_written = run_river_flood_analysis(active_countries, logger, zoom=14, target_date=None) or 0
+    river_files_written = run_river_flood_analysis(active_countries, logger, zoom=14, target_date=None, known_failed_facilities=known_failed_facilities) or 0
 except Exception as e:
     logger.error(f"River-flood analysis failed: {e}", exc_info=True)
 

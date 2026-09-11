@@ -14,7 +14,7 @@ The pipeline uses environment variables to configure base directories:
 
 ## Files Produced During Initialize (`--type initialize`)
 
-**Note:** The pipeline no longer requires a separate bounding box file. Country boundaries are checked directly with a 500km buffer during processing.
+**Note:** Country boundaries are checked directly with a 100km buffer during processing; no separate bounding box file is used.
 
 ### 1. Base Mercator Views (per country)
 **Location:** `{ROOT_DATA_DIR}/{VIEWS_DIR}/mercator_views/{country}_{zoom_level}.parquet`
@@ -254,27 +254,9 @@ For each storm/forecast combination processed, the following files are created:
 - **Format:** Parquet (DataFrame)
 - **Content:** Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask: `tile_id`, `bits` (bit `m-1` set ⇔ member `m`'s envelope/exceedance covers that tile). One row per DISTINCT tile with ≥1 member's coverage; a tile with zero coverage from every member simply has no row (sparse, same convention as `TRACK_MAT`'s own severity columns).
 - **Created by (wind):** `calculate_tile_member_bitmask()` → `save_tracks_tile_bitmask_view()`
-- **Note:** Multiple files per storm/cycle (one per threshold/tier-window, same pattern as item 18). Loaded into **`TILE_WIND_BITMASK_MAT`**/**`TILE_GUST_BITMASK_MAT`**/**`TILE_RIVER_BITMASK_MAT`**/**`TILE_PRECIP_BITMASK_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. Persists the same envelope-vs-tile spatial join item 18's own `severity_*` columns are computed from (previously discarded immediately after collapsing to a country-wide scalar); this keeps the per-member, per-tile identity instead, enabling a real tile-level union across hazards in the dashboard's "Compare Worst Case By" feature (`pages/map_shell_concept.py`'s `_fetch_family_member_frames`, which unions this bitmask data across Wind/Gust/River/Rain into one real per-member total instead of approximating it from separate marginal totals).
+- **Note:** Multiple files per storm/cycle (one per threshold/tier-window, same pattern as item 18). Loaded into **`TILE_WIND_BITMASK_MAT`**/**`TILE_GUST_BITMASK_MAT`**/**`TILE_RIVER_BITMASK_MAT`**/**`TILE_PRECIP_BITMASK_MAT`** in Snowflake by `REFRESH_MATERIALIZED_VIEWS()`. Persists the same envelope-vs-tile spatial join item 18's own `severity_*` columns are computed from, at per-member, per-tile granularity rather than collapsed to a country-wide scalar, enabling a real tile-level union across hazards in the dashboard's "Compare Worst Case By" feature (`pages/map_shell_concept.py`'s `_fetch_family_member_frames`, which unions this bitmask data across Wind/Gust/River/Rain into one real per-member total instead of approximating it from separate marginal totals).
 
-### 20. JSON Impact Reports (per country, per storm, per forecast)
-**Location:** `{RESULTS_DIR}/jsons/{country}_{storm}_{date}.json`
-- **Example:** `results/jsons/DOM_LORENZO_20251015120000.json`
-- **Format:** JSON
-- **Content:** Comprehensive impact report data including:
-  - Expected impacts by wind threshold: `expected_pop_{wind}`, `expected_children_{wind}`, `expected_school_{wind}`, `expected_infant_{wind}`, `expected_adolescent_{wind}`, `expected_schools_{wind}`, `expected_hcs_{wind}`, `expected_shelters_{wind}`, `expected_wash_{wind}`
-  - Overall expected counts (across all thresholds): `expected_pop`, `expected_children`, `expected_school_age`, `expected_infants`, `expected_adolescent`, `expected_schools`, `expected_hcs`, `expected_shelters`, `expected_wash`
-  - People/children in need (CHIN vulnerability, `None` if country not patched): `E_people_in_need`, `E_children_in_need`, `E_infant_in_need`, `E_school_age_in_need`, `E_adolescent_in_need`
-  - CCI: `expected_cci_pop`, `expected_cci_school`, `expected_cci_infant`, `expected_cci_adolescent`
-  - Urban/rural breakdown: `expected_pop_urban`, `expected_pop_rural`, `expected_school_urban`, `expected_school_rural`, `expected_infant_urban`, `expected_infant_rural`, `expected_adolescent_urban`, `expected_adolescent_rural`
-  - RWI-based poverty breakdown: `expected_pop_poverty`, `expected_pop_severe`, `expected_school_poverty`, `expected_school_severe`, `expected_infant_poverty`, `expected_infant_severe`, `expected_adolescent_poverty`, `expected_adolescent_severe`
-  - Top 5 schools, health centers, shelters, WASH facilities at risk
-  - Administrative breakdowns: `rows_admins_pop_total`, `rows_admins_school`, `rows_admins_infant`, `rows_admins_adolescent`, `rows_schools_winds`, `rows_hcs_winds`, `rows_shelters_winds`, `rows_wash_winds`. Each admin row includes per-wind impact counts, a `"cci"` key (Child Cyclone Index for that admin), and a `"people_in_need"` key (`null` when country not patched with vulnerability data)
-  - Change indicators vs previous forecast: `children_change`, `children_change_perc`, `children_change_direction`
-  - Metadata: `storm`, `country`, `forecast_date`, `next_forecast_date`, `report_date`, `expected_landfall`, `storm_category`
-- **Created by:** `do_report()` → `save_json_report()`
-- **Note:** One file per country per storm per forecast. `E_*_in_need` fields are `None` (N/A) for countries not patched with vulnerability data; all other fields are unaffected.
-
-### 21. Processed Storms Tracking File
+### 20. Processed Storms Tracking File
 **Location:** `{RESULTS_DIR}/{STORMS_FILE}`
 - **Example:** `results/storms.json`
 - **Format:** JSON
@@ -689,7 +671,7 @@ No CCI, vulnerability, or JSON report for river flood, same as gust/precip.
 - RP tier: `{rp_tier}` (`rp2`, `rp5`, `rp10`, `rp20`, `rp50`, `rp100`, how rare a river discharge
   level is, e.g. `rp100` = a 1-in-100-year discharge level for that river reach); no numeric-value
   collision risk with wind/gust thresholds, so no letter-prefix disambiguation is needed
-- Lead-time step: `{step_h}h` (24, 72, 120, or 168 hours -- 4 of the 7 raw hours the upstream data has,
+- Lead-time step: `{step_h}h` (24, 72, 120, or 168 hours, 4 of the 7 raw hours the upstream data has,
   see `RIVER_LEADTIME_STEPS_H` above)
 
 ### Country Codes

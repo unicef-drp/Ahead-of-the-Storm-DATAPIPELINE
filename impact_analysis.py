@@ -20,41 +20,84 @@ Key Features:
   stage (controlled by DATA_PIPELINE_DB env var)
 
 Entry points called from main_pipeline.py:
-    create_mercator_country_layer()       -- --type initialize
-    create_admin_country_layer()          -- --type initialize
-    create_views_from_envelopes_in_country()  -- --type update
-    patch_country_layer()                 -- --type patch
+    create_mercator_country_layer():          --type initialize
+    create_admin_country_layer():             --type initialize
+    create_views_from_envelopes_in_country(): --type update
+    patch_country_layer():                    --type patch
 
-Module structure (sections in order):
-    CUSTOM DATA HELPERS             -- _custom_file_path, _load_custom_points_csv,
-                                       _load_custom_tiles_csv
-    DATA FETCHING AND CACHING       -- fetch_schools, fetch_health_centers,
-                                       fetch_shelters, fetch_wash
-    GEOGRAPHIC UTILITIES            -- get_country_boundaries, is_envelope_in_zone
-    BASE LAYER INITIALIZATION       -- create_mercator_country_layer, save_mercator_view,
-                                       admins_overlay, add_admin_ids,
-                                       write_country_boundary, patch_country_layer,
+This was originally one ~6600-line file; it has since been split into five
+sibling modules, each covering one concern, with this module (the "core")
+retaining wind/gust view creation and the main per-country orchestrator:
+    pipeline_shared.py      - state/helpers every module below needs, with no
+                              dependency of its own on any of them (data_store,
+                              path/column constants, admins_overlay(), the
+                              custom-data-override loaders) - see that
+                              module's own docstring for why it exists
+    facility_io.py          - HealthSites/GIGA/OSM facility fetch + the
+                              per-facility-type location-cache/impact-view
+                              save/load/exist persistence helpers
+    country_boundaries.py   - country/admin boundary bookkeeping (GeoRepo
+                              fetch, PIPELINE_COUNTRIES.COUNTRY_BOUNDARY and
+                              boundary pre-filter cache writes, admin-level
+                              parquet discovery)
+    precip_views.py         - all precip (tp/ro-tp-ratio exceedance
+                              probability) tile/admin/facility view creation
+                              and persistence
+    river_views.py          - all river-flood (GloFAS x JRC) tile/admin/
+                              facility view creation and persistence
+This module imports several names back from facility_io.py/country_boundaries.py/
+precip_views.py/river_views.py (real internal dependencies - e.g.
+create_views_from_envelopes_in_country() fetches/saves facilities and writes
+country boundaries as part of its own per-country orchestration), all as
+plain top-of-file imports; since every one of those four modules gets its own
+shared state from pipeline_shared.py rather than from this module, there is no
+circular import to work around.
+
+Module structure (sections in order, this file only):
+    CUSTOM DATA HELPERS: _load_custom_tiles_csv, _vulnerability_file_path,
+                                       _load_vulnerability_tiles_csv
+                                       (_custom_file_path/_load_custom_points_csv
+                                       moved to pipeline_shared.py)
+    GEOGRAPHIC UTILITIES: is_envelope_in_zone (get_country_boundaries moved
+                                       to country_boundaries.py)
+    BASE LAYER INITIALIZATION: create_mercator_country_layer, save_mercator_view,
+                                       patch_country_layer,
                                        save_mercator_and_admin_views
-    STORM METADATA                  -- save/load_json_storms, load_mercator_view
-    PER-STORM IMPACT VIEW GENERATION -- create_school/hc/shelter/wash/mercator/admin/
+                                       (admins_overlay moved to pipeline_shared.py;
+                                       add_admin_ids/write_country_boundary
+                                       moved to country_boundaries.py)
+    STORM METADATA: save/load_json_storms, load_mercator_view
+    PER-STORM IMPACT VIEW GENERATION: create_school/hc/shelter/wash/mercator/admin/
                                         tracks_view_from_envelopes
-    FACILITY VIEW PERSISTENCE       -- save/load/exist per facility type
-                                       (schools, HCs, shelters, WASH)
-    ADMIN COUNTRY LAYER             -- create_admin_country_layer
+    ADMIN COUNTRY LAYER: create_admin_country_layer
                                        (logically part of base layer init)
-    TILE & STORM VIEW PERSISTENCE   -- save/load for tile views, CCI views,
+    SHARED FACILITY-TO-TILE ASSIGNMENT: project_tiles_for_facility_assignment,
+                                       assign_facilities_to_tiles (used
+                                       directly by main_pipeline.py's own
+                                       precip/river loops, and by precip_views.py/
+                                       river_views.py's own facility views)
+    TILE & STORM VIEW PERSISTENCE: save/load for tile views, CCI views,
                                        admin views, track views
-    CCI CALCULATION                 -- calculate_ccis
-    MAIN IMPACT ANALYSIS            -- create_views_from_envelopes_in_country
-    SNOWFLAKE DATA LOADING          -- load_envelopes_from_snowflake
+    CCI CALCULATION: calculate_ccis
+    VULNERABILITY CALCULATION: calculate_vulnerability_view,
+                                       calculate_vulnerability_tracks
+    RASTERIZED ENVELOPE COVERAGE / BITMASK HELPERS: calculate_tile_member_bitmask
+                                       and its private helpers
+    MAIN IMPACT ANALYSIS: create_views_from_envelopes_in_country
+    SNOWFLAKE DATA LOADING: load_envelopes_from_snowflake,
+                                       load_gust_envelopes_from_snowflake
 """
 
 import io
 import json
 import os
+import re
 import tempfile
 import contextlib
 import sys
+import time
+import threading
+import queue
 import logging
 import warnings
 import geopandas as gpd
@@ -81,78 +124,84 @@ from gigaspatial.core.io.readers import read_dataset
 from gigaspatial.core.io.writers import write_dataset
 from gigaspatial.processing.tif_processor import TifProcessor
 from gigaspatial.core.io.local_data_store import LocalDataStore
-from shapely.geometry import shape
+import pyproj
+from shapely.geometry import shape, MultiPolygon, Polygon
 from shapely.ops import unary_union
+from shapely.ops import transform as shapely_transform
 
-# Import centralized data store utility
-from data_store_utils import get_data_store
 from country_utils import update_country_initialized
 
-# Import hazard source data retrieval functions. get_envelopes/get_gust_envelopes/
-# get_tracks dispatch to Snowflake or LOCAL/BLOB based on config.HAZARD_DATA_SOURCE
-# (see snowflake_utils.py's "HAZARD_DATA_SOURCE DISPATCH" section); get_snowflake_connection
+# Import hazard source data retrieval functions. get_envelopes/get_gust_envelopes
+# dispatch to Snowflake or LOCAL/BLOB based on config.HAZARD_DATA_SOURCE (see
+# snowflake_utils.py's "HAZARD_DATA_SOURCE DISPATCH" section); get_snowflake_connection
 # is unrelated (used only for the country pre-filter, always Snowflake).
 from snowflake_utils import (
     get_envelopes,
     get_gust_envelopes,
     convert_envelopes_to_geodataframe,
-    get_tracks,
     get_snowflake_connection
 )
 
-from reports import do_report, save_json_report
+# Shared state/generic helpers with no dependency of their own on this module
+# or its 4 siblings (facility_io/country_boundaries/precip_views/river_views) -
+# see pipeline_shared.py's own docstring for why this exists as its own module.
+from pipeline_shared import (
+    data_store,
+    ROOT_DATA_DIR,
+    VIEWS_DIR,
+    data_cols,
+    POPULATION_COLS,
+    sum_cols,
+    avg_cols,
+    _OPTIONAL_SUM_COLS,
+    _optional_sum,
+    FULL_ENSEMBLE_SIZE,
+    admins_overlay,
+    _custom_file_path,
+)
+
+# The four sibling modules impact_analysis.py was split from. Each imports its
+# own shared state from pipeline_shared.py (not from here), so there's no
+# cycle - these are plain, ordinary top-of-file imports.
+from facility_io import (
+    HC_FACILITY_TYPES,
+    WASH_LOCATION_TYPES,
+    fetch_health_centers,
+    fetch_schools,
+    fetch_shelters,
+    fetch_wash,
+    save_school_view,
+    load_school_locations,
+    school_exist,
+    save_hc_view,
+    load_hc_locations,
+    hc_exist,
+    save_shelter_view,
+    load_shelter_locations,
+    shelter_exist,
+    save_wash_view,
+    load_wash_locations,
+    wash_exist,
+)
+from country_boundaries import (
+    get_country_boundaries,
+    add_admin_ids,
+    get_initialized_admin_levels,
+    get_initialized_admin_levels_bulk,
+    write_country_boundary,
+)
+from precip_views import (
+    create_precip_tile_view,
+    create_precip_admin_view,
+)
+from river_views import (
+    create_river_tile_view,
+)
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-# Columns stored in every mercator and admin base parquet.
-# sum_cols / avg_cols define how each column is aggregated when computing E_ (expected) values during impact view generation (col * probability). 
-# Counts and populations are summed; continuous indices (RWI, SMOD) are averaged to preserve their meaning.
-
-data_cols = [
-    'population',           # Total population (WorldPop GR2, year=2025, 1km)
-    'school_age_population',# School-age population 5–14 years (WorldPop GR2/2025, 100m, age_structures)
-    'infant_population',    # Infant population 0–4 years (WorldPop GR2/2025, 100m, age_structures)
-    'adolescent_population', # Adolescent population 15–19 years (WorldPop GR2/2025, 100m, age_structures)
-    'built_surface_m2',     # Built surface area in m² (GHSL GHS-BUILT-S)
-    'smod_class',           # Settlement model L2 class 10–30 (GHSL GHS-SMOD)
-    'smod_class_l1',        # Derived L1 class: 1=rural, 2=suburban, 3=urban
-    'rwi',                  # Relative Wealth Index, ~-2.5 to +2.5 (Meta/HDX)
-    'num_schools',          # Number of schools in tile (GIGA API)
-    'num_hcs',              # Number of health centers in tile (HealthSites.io)
-    'num_shelters',         # Number of emergency shelters in tile (OSM social_facility=shelter)
-    'num_wash',             # Number of WASH facilities in tile (OSM amenity/man_made)
-]
-
-# WorldPop age-structure columns within data_cols that are a hard, always-required
-# init-time dependency. A country missing one of these needs `--type patch --columns <col>`, 
-# not a silent NaN/0 default.
-POPULATION_COLS = ['population', 'school_age_population', 'infant_population', 'adolescent_population']
-
-# Columns multiplied by probability to produce E_ (expected impact) values per tile.
-# Used in create_mercator_view_from_envelopes and create_admin_view_from_envelopes_new.
-sum_cols = [
-    'E_population',
-    'E_school_age_population',
-    'E_infant_population',
-    'E_adolescent_population',
-    'E_built_surface_m2',
-    'E_num_schools',
-    'E_num_hcs',
-    'E_num_shelters',
-    'E_num_wash',
-]
-
-# Continuous index columns: averaged (not summed) when aggregating across tiles.
-avg_cols = [
-    'E_smod_class',     # Expected SMOD L2 class (smod_class * probability)
-    'E_smod_class_l1',  # Expected SMOD L1 class
-    'E_rwi',            # Expected RWI (rwi * probability)
-    'probability',      # Mean ensemble probability across tiles
-]
-
-# Admin-level aggregation: same logic, but operating on already-aggregated tile values.
+# Admin-level aggregation: same logic as sum_cols, but operating on already-aggregated tile values.
 sum_cols_admin = [
     'population',
     'school_age_population',
@@ -165,16 +214,8 @@ sum_cols_admin = [
     'num_wash',
 ]
 
-# Columns where all-NaN means "no data" and should remain NaN (not sum to 0).
-_OPTIONAL_SUM_COLS = {
-    'num_shelters', 'num_wash', 'E_num_shelters', 'E_num_wash',
-    'num_schools',  'num_hcs',  'E_num_schools',  'E_num_hcs',
-    'built_surface_m2', 'E_built_surface_m2',
-}
-
-def _optional_sum(s):
-    """Sum that preserves NaN when all values are NaN (no-data semantics)."""
-    return s.sum() if s.notna().any() else float('nan')
+# _OPTIONAL_SUM_COLS/_optional_sum live in pipeline_shared.py (imported above);
+# not redefined here.
 
 avg_cols_admin = [
     'smod_class',   # Mean SMOD L2 class across tiles in admin unit
@@ -254,154 +295,7 @@ INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0–12mo) and _01_ (1–4y) band
 ADOLESCENT_AGE_MIN = 15  # GR2 min_age: picks _15_ (15–19y) band
 ADOLESCENT_AGE_MAX = 15  # GR2 max_age: picks _15_ (15–19y) band (1 file only)
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
-# Full ECMWF ensemble size: 50 perturbed members + 1 control (member 51 = GRIB number 0).
-# Hard-coded so probability denominators stay correct even when individual members fail
-# to produce wind polygons or are missing from GRIB files.
-FULL_ENSEMBLE_SIZE = 51
-
-# HealthSites.io's own `country` filter does not recognize every active country's
-# name, regardless of spelling/case/ISO-code form tried (confirmed via direct API
-# testing: 'Aruba'/'aruba'/'AW'/'ABW' and 'Curacao'/'Curaçao'/'Netherlands Antilles'
-# all return 400 "not found or not a country", this is a gap in HealthSites' own
-# country list, not a name-resolution bug on our side). The underlying facility data
-# does exist there; a bounding-box (`extent`) query reaches it where a country-name
-# query cannot. Bounds taken from each country's real PIPELINE_COUNTRIES.COUNTRY_BOUNDARY
-# (ST_XMIN/YMIN/XMAX/YMAX in Snowflake), padded 0.05 degrees to avoid clipping
-# coastal facilities. Keyed by ISO3; extend if another active country is found to
-# have the same gap (see 'PIPELINE_COUNTRIES active-country HealthSites sweep' in
-# project history for the sweep method).
-# Each value is a list of bboxes (usually one) so a disjoint territory like BES
-# can be covered by several tight boxes instead of one huge one spanning empty
-# ocean and other countries' territory in between.
-_HEALTHSITES_BBOX_OVERRIDES = {
-    "ABW": [(-70.1138, 12.3618, -69.8155, 12.6734)],  # Aruba
-    "CUW": [(-69.2127, 11.9283, -68.5899, 12.4427)],  # Curaçao
-    "BHS": [(-80.5259, 20.8631, -72.6624, 27.3229)],  # Bahamas (archipelago; also
-    # resolvable by name as "The Bahamas", but HealthSitesFetcher re-runs any
-    # country string through pycountry, which does not recognize that name
-    # either -- the bbox path avoids that second lookup entirely).
-    "BES": [  # Bonaire, Sint Eustatius and Saba: two disjoint clusters ~500km
-        # apart (see _BES_GEOREPO_UCODES below); bounds taken from the real
-        # per-island GeoRepo geometries, not PIPELINE_COUNTRIES.COUNTRY_BOUNDARY
-        # (whose own bbox spans the huge gap between the two clusters).
-        (-68.4709, 11.9747, -68.1455, 12.3622),   # Bonaire
-        (-63.3085, 17.4146, -62.8959, 17.7003),   # Sint Eustatius + Saba
-    ],
-}
-
-# GeoRepo's "Global Administrative Boundaries" dataset has no single level-0
-# entity for BES (Bonaire, Sint Eustatius and Saba): it models the three
-# islands as separate level-0 "Territory" entities, each independently
-# tagged ISO3=BES but with its own ucode (BES1/BES2/BES3), not one combined
-# "BES_..." entity. AdminBoundaries.create()'s ISO3 lookup expects a ucode
-# starting with "BES_" and finds nothing. Confirmed via a direct GeoRepo API
-# query against the "Global Administrative Boundaries (Latest)" view.
-_BES_GEOREPO_UCODES = {
-    "BES1_V2": "Saba",
-    "BES2_V2": "Sint Eustatius",
-    "BES3_V2": "Bonaire",
-}
-
-
-#==============================================================================
-# HEALTH FACILITY TYPES
-#==============================================================================
-# Health facility types to include in impact analysis, keyed by OSM/HealthSites column.
-#
-# Format mirrors SHELTER_LOCATION_TYPES and WASH_LOCATION_TYPES: a dict of
-# {column_name: [values]} so additional tag keys (e.g. 'healthcare', 'emergency')
-# can be added alongside 'amenity' without changing the filter logic.
-#
-# The HealthSites.io API (https://healthsites.io/api/v3/) returns an `amenity` column
-# whose documented values are: clinic, doctors, hospital, dentist, pharmacy.
-# Filtering uses the `amenity` column (not `healthcare`).
-#
-# Included:
-#   amenity=hospital  – Inpatient care, typically with emergency department.
-#                       Most critical for mass-casualty and evacuation response.
-#   amenity=clinic    – Outpatient clinics and clinics with beds.
-#                       Primary care backbone in most low/middle-income countries.
-#   amenity=doctors   – Individual practitioner offices (OSM amenity=doctors, plural).
-#                       Lower capacity than clinics but relevant for community-level care.
-#
-# Excluded intentionally:
-#   amenity=dentist   – Specialist care, not relevant to cyclone response.
-#   amenity=pharmacy  – Supply chain node, not direct emergency care delivery.
-#
-# To change the included types, update this dict. The raw (unfiltered) API response
-# is stored in the location cache so changes take effect on the next update run.
-
-HC_FACILITY_TYPES = {
-    'amenity': ['hospital', 'clinic', 'doctors'],
-}
-
-#==============================================================================
-# OSM LOCATION TYPES
-#==============================================================================
-# OSM location types for emergency shelters
-#
-# Queried via OSMLocationFetcher (Overpass API). Only social_facility=shelter is included
-# because it specifically denotes dedicated emergency/disaster shelter facilities in OSM.
-#
-# Included:
-#   social_facility=shelter – Dedicated emergency or disaster relief shelters
-#                             (refugee shelters, evacuation centres, disaster relief sites).
-#                             Tagged on amenity=social_facility nodes/ways in OSM.
-#
-# Excluded intentionally:
-#   amenity=shelter         – Too broad: includes bus stop shelters, hiking shelters,
-#                             picnic shelters, market covers. Not emergency-relevant.
-#   emergency=assembly_point / - Only evacuation_point, e.g. in case of a fire etc.
-#
-
-SHELTER_LOCATION_TYPES = {
-    'social_facility': ['shelter'],
-}
-
-#==============================================================================
-# WASH LOCATION TYPES
-#==============================================================================
-# OSM location types for humanitarian WASH infrastructure
-#
-# Queried via OSMLocationFetcher (Overpass API). Covers the full managed water and
-# sanitation infrastructure chain relevant to cyclone response.
-# Reference: https://wiki.openstreetmap.org/wiki/Humanitarian_OSM_Tags/WASH
-# (HOT wiki documents amenity=water_point and amenity=toilets as primary tags;
-# the man_made=* tags below extend coverage to upstream infrastructure.)
-#
-# Included:
-#   amenity=drinking_water         – Drinking water taps/fountains (public access points)
-#   amenity=water_point            – Water collection points (often in informal settlements)
-#   amenity=toilets                – Public toilets / latrines (core HOT WASH tag)
-#   amenity=shower                 – Public shower facilities (hygiene)
-#   man_made=water_well            – Water wells (managed, hand-pump or motorised)
-#   man_made=water_tap             – Piped water tap stands
-#   man_made=water_works           – Water treatment or pumping plants
-#   man_made=pumping_station       – Water supply pumping stations
-#   man_made=wastewater_treatment_plant – Sanitation infrastructure
-#
-# Excluded intentionally:
-#   natural=spring / natural=water – Natural sources, not managed infrastructure.
-#                                    Reliability after a cyclone is unpredictable.
-#   man_made=storage_tank          – Too broad: includes fuel, agricultural, industrial tanks.
-#
-
-WASH_LOCATION_TYPES = {
-    'amenity': ['drinking_water', 'water_point', 'toilets', 'shower'],
-    'man_made': ['water_well', 'water_tap', 'water_works', 'pumping_station', 'wastewater_treatment_plant'],
-}
-
-#==============================================================================
-# SCHOOL EDUCATION LEVELS
-#==============================================================================
-# School education levels available from the GIGA School Location API
-# (https://uni-ooi-giga-maps-service.azurewebsites.net)
-#
-#   'Pre-Primary'   – Pre-school / kindergarten
-#   'Primary'       – Primary school
-#   'Secondary'     – Secondary / high school
-#   'Unknown'       – Education level not recorded
-# Other values may exist in the API; all are retained regardless.
+# FULL_ENSEMBLE_SIZE lives in pipeline_shared.py (imported above); not redefined here.
 
 
 #==============================================================================
@@ -422,22 +316,10 @@ SMOD_L2_TO_L1 = {
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# VIEWS_DIR/ROOT_DATA_DIR/data_store now come from pipeline_shared.py (imported
+# above) - RESULTS_DIR/STORMS_FILE are only ever used in this file, so they stay.
 RESULTS_DIR = config.RESULTS_DIR
 STORMS_FILE = config.STORMS_FILE
-VIEWS_DIR = config.VIEWS_DIR
-ROOT_DATA_DIR = config.ROOT_DATA_DIR
-
-# =============================================================================
-# DATA STORE INITIALIZATION
-# =============================================================================
-# Initialize data store using centralized utility
-# Defaults to LOCAL if DATA_PIPELINE_DB is not set or is LOCAL
-# In production (SPCS), DATA_PIPELINE_DB will be SNOWFLAKE and credentials will be available
-data_store = get_data_store()
-
-# Path for custom data overrides (schools, health centers, pre-aggregated tile values).
-# Same relative path is used across all backends (LOCAL, BLOB, SNOWFLAKE stage).
-CUSTOM_DATA_DIR = os.path.join(ROOT_DATA_DIR, 'custom')
 
 # Path for vulnerability (people/children in need) probability data.
 # Files placed here by vulnerability/fetch_vulnerability_probs.py (or uploaded to stage).
@@ -461,117 +343,8 @@ else:
 # =============================================================================
 # CUSTOM DATA HELPERS
 # =============================================================================
-def _custom_file_path(country, kind, zoom=None):
-    """
-    Return the data store path for a custom data override file.
-
-    Args:
-        country: ISO3 country code
-        kind: File type identifier: 'schools', 'health_centers', 'shelters', 'wash',
-              'population', 'built_surface', 'smod', or 'rwi'
-        zoom: Zoom level (required for tile-level files; None for point files)
-
-    Returns:
-        str: Path relative to the data store root (e.g. 'geodb/custom/PNG_schools.csv')
-    """
-    if zoom is not None:
-        filename = f"{country}_{kind}_z{zoom}.csv"
-    else:
-        filename = f"{country}_{kind}.csv"
-    return os.path.join(CUSTOM_DATA_DIR, filename)
-
-
-def _load_custom_points_csv(country, kind):
-    """
-    Load a custom point data CSV (schools or health_centers) from the data store.
-
-    The file is read from the data store at geodb/custom/<COUNTRY>_<kind>.csv, and
-    must contain the required columns for `kind` (see the `required` mapping below;
-    at minimum 'latitude'/'longitude'). If the file is absent, None is returned and
-    the caller falls back to API fetching. If the file exists but is invalid (missing
-    required columns or unreadable), a ValueError is raised. The pipeline does not
-    silently fall back to the API when a custom file is present.
-
-    The ID column is optional. Accepted names: 'id', 'school_id_giga' (schools),
-    'osm_id' (health_centers, shelters, wash). If none are present, sequential IDs
-    are auto-generated (e.g. 'schools_0', 'schools_1', ...).
-
-    Args:
-        country: ISO3 country code
-        kind: 'schools', 'health_centers', 'shelters', or 'wash'
-
-    Returns:
-        gpd.GeoDataFrame or None: GeoDataFrame with Point geometry (EPSG:4326), or None
-                                   if the custom file does not exist.
-    """
-    # Internal ID column name expected by GeometryBasedZonalViewGenerator calls
-    id_col = 'school_id_giga' if kind == 'schools' else 'osm_id'
-
-    path = _custom_file_path(country, kind)
-    if not data_store.file_exists(path):
-        return None
-    try:
-        raw = data_store.read_file(path)
-        df = pd.read_csv(io.BytesIO(raw))
-        # Required columns (ID is handled separately below)
-        required = {
-            'schools':        ['latitude', 'longitude'],
-            'health_centers': ['latitude', 'longitude', 'amenity'],
-            'shelters':       ['latitude', 'longitude'],
-            'wash':           ['latitude', 'longitude', 'wash_type'],
-        }[kind]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(
-                f"{country}: Custom {kind} CSV at '{path}' is missing required columns: {missing}. "
-                f"Fix the file or remove it to fall back to API fetching."
-            )
-        # Normalize ID column: accept 'id' as alias for the internal name,
-        # or auto-generate sequential IDs if no ID column is present at all.
-        if id_col not in df.columns:
-            if 'id' in df.columns:
-                df = df.rename(columns={'id': id_col})
-            else:
-                df[id_col] = [f"{kind}_{i}" for i in range(len(df))]
-                logger.info(f"{country}: No ID column in custom {kind} CSV, auto-generated sequential IDs")
-        # Warn early about nulls/duplicates: _ensure_unique_zone_ids will fix
-        # them at view-generation time, but surfacing the issue here helps debug
-        # the source CSV.
-        null_count = df[id_col].isna().sum()
-        dup_count = df[id_col].duplicated(keep='first').sum()
-        if null_count:
-            logger.warning(f"{country}: Custom {kind} CSV has {null_count} null {id_col} values, fallback IDs will be assigned at impact time")
-        if dup_count:
-            logger.warning(f"{country}: Custom {kind} CSV has {dup_count} duplicate {id_col} values, fallback IDs will be assigned at impact time")
-        gdf = gpd.GeoDataFrame(
-            df,
-            geometry=gpd.points_from_xy(df['longitude'], df['latitude']),
-            crs='EPSG:4326'
-        )
-        # Canonical 'source' column so downstream MAT tables/the dashboard can
-        # show real per-country provenance instead of always assuming the
-        # standard API/OSM source. Some custom CSVs already carry their own
-        # source-like column under a different name (e.g. DOM/HND's SIASAR
-        # files use 'school_data_source' or 'source'), normalize whichever is
-        # present into 'source'; if neither exists, fall back to a generic
-        # marker rather than leaving it blank.
-        if 'source' not in gdf.columns:
-            alt_source_cols = [c for c in gdf.columns if c.endswith('_data_source')]
-            if alt_source_cols:
-                gdf['source'] = gdf[alt_source_cols[0]]
-            else:
-                gdf['source'] = f"Custom data ({country})"
-        logger.info(f"{country}: Loaded {len(gdf)} custom {kind} from '{path}' (custom data, API skipped, --rewrite has no effect)")
-        return gdf
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            f"{country}: Failed to read custom {kind} CSV at '{path}': {e}. "
-            f"Fix the file or remove it to fall back to API fetching."
-        ) from e
-
-
+# _custom_file_path/_load_custom_points_csv moved to pipeline_shared.py
+# (facility_io.py needs them too); imported above alongside data_store etc.
 def _load_custom_tiles_csv(country, kind, zoom):
     """
     Load a custom tile-level CSV from the data store and return it as a DataFrame.
@@ -665,321 +438,11 @@ def _load_vulnerability_tiles_csv(country, zoom):
 # =============================================================================
 # DATA FETCHING AND CACHING FUNCTIONS
 # =============================================================================
-def fetch_health_centers(country, rewrite=0):
-    """
-    Fetch health center locations for a country, using custom data or cache if available.
-
-    Priority order:
-        1. Custom file at geodb/custom/<COUNTRY>_health_centers.csv: always used if present;
-           --rewrite has no effect on custom data. Custom data is never overwritten.
-        2. Location cache (hc_views/<COUNTRY>_health_centers.parquet): if rewrite=0.
-        3. HealthSites.io API: fetched if no cache or rewrite=1.
-
-    The cache stores ALL facility types from HealthSites (full OSM healthcare taxonomy).
-    Filtering to HC_FACILITY_TYPES happens at analysis time in
-    create_health_center_view_from_envelopes(), not here. This ensures custom data is
-    filtered consistently and the cache can be reused if filtering changes.
-
-    Cache location:
-        LOCAL/BLOB: geodb/aos_views/hc_views/<COUNTRY>_health_centers.parquet
-        SNOWFLAKE:  AOTS_ANALYSIS stage (PUT during init, GET'd during update)
-
-    Args:
-        country: ISO3 country code
-        rewrite: If 1, re-fetch from API and overwrite cache (ignored if custom file exists);
-                 if 0, use cache if available
-
-    Returns:
-        gpd.GeoDataFrame: All health center locations with geometry (EPSG:4326).
-                         Empty GeoDataFrame if no data is available from any source.
-    """
-    # 1. Custom data takes priority: never overwritten
-    custom_gdf = _load_custom_points_csv(country, 'health_centers')
-    if custom_gdf is not None:
-        save_hc_locations(custom_gdf, country)
-        return custom_gdf
-
-    # 2. Use cache if available, valid, and rewrite not requested
-    if hc_exist(country) and rewrite == 0:
-        cached = load_hc_locations(country)
-        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
-            if 'source' not in cached.columns:
-                cached['source'] = 'HealthSites.io'
-            return cached
-        logger.warning(f"{country}: HC cache invalid or missing required columns, re-fetching from HealthSites.io")
-
-    # 3. Fetch from HealthSites.io API
-    try:
-        if country in _HEALTHSITES_BBOX_OVERRIDES:
-            # Query each bbox separately and concatenate: a disjoint territory
-            # (e.g. BES) needs more than one tight box, not one huge box spanning
-            # the gap between clusters.
-            parts = [
-                HealthSitesFetcher().fetch_facilities(extent=bbox, output_format='geojson')
-                for bbox in _HEALTHSITES_BBOX_OVERRIDES[country]
-            ]
-            parts = [p for p in parts if not p.empty]
-            gdf_hcs = pd.concat(parts, ignore_index=True) if parts else gpd.GeoDataFrame()
-        else:
-            gdf_hcs = HealthSitesFetcher(country=country).fetch_facilities(output_format='geojson')
-        if gdf_hcs.empty or 'geometry' not in gdf_hcs.columns:
-            logger.warning(f"{country}: HealthSites API returned no data")
-            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
-        gdf_hcs = gdf_hcs.set_crs(4326)
-        gdf_hcs['source'] = 'HealthSites.io'
-        logger.info(f"{country}: Fetched {len(gdf_hcs)} health facilities from HealthSites API "
-                    f"(all types cached; filtering to {HC_FACILITY_TYPES} happens at analysis time)")
-        save_hc_locations(gdf_hcs, country)
-        return gdf_hcs
-    except Exception as e:
-        if '403' in str(e):
-            logger.error(f"{country}: HealthSites API returned 403 Forbidden: likely daily rate limit "
-                         f"exceeded (50 requests/day). Run scripts/test_healthsites.py to confirm. "
-                         f"To skip the API, provide a custom file at "
-                         f"geodb/custom/{country}_health_centers.csv (see custom_data/README.md)")
-        else:
-            logger.error(f"{country}: Error fetching health centers from HealthSites API: {e}")
-        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
-
-
-def fetch_schools(country, rewrite=0):
-    """
-    Fetch school locations for a country using custom data, cache, or GIGA API.
-
-    Priority order:
-        1. Custom file at geodb/custom/<COUNTRY>_schools.csv: always used if present;
-           --rewrite has no effect on custom data. Custom data is never overwritten.
-        2. Location cache (school_views/<COUNTRY>_schools.parquet): if rewrite=0.
-        3. GIGA school location API: fetched if no cache or rewrite=1.
-
-    All education levels are kept in the cache. The count stored in
-    mercator/admin tiles is num_schools (total across all levels). Education level
-    is not preserved in tile impact files.
-
-    Cache location:
-        LOCAL/BLOB: geodb/aos_views/school_views/<COUNTRY>_schools.parquet
-        SNOWFLAKE:  AOTS_ANALYSIS stage (PUT during init, GET'd during update)
-
-    Args:
-        country: ISO3 country code
-        rewrite: If 1, re-fetch from GIGA API and overwrite cache (ignored if custom file exists);
-                 if 0, use cache if available
-
-    Returns:
-        gpd.GeoDataFrame: School locations with geometry (EPSG:4326).
-                         Empty GeoDataFrame if no data available from any source.
-    """
-    # 1. Custom data takes priority: never overwritten
-    custom_gdf = _load_custom_points_csv(country, 'schools')
-    if custom_gdf is not None:
-        save_school_locations(custom_gdf, country)
-        return custom_gdf
-
-    # 2. Use cache if available and rewrite not requested
-    if school_exist(country) and rewrite == 0:
-        gdf_schools = load_school_locations(country)
-        if not isinstance(gdf_schools, gpd.GeoDataFrame):
-            if isinstance(gdf_schools, pd.DataFrame) and not gdf_schools.empty and 'geometry' in gdf_schools.columns:
-                gdf_schools = gpd.GeoDataFrame(gdf_schools, geometry='geometry', crs='EPSG:4326')
-            else:
-                gdf_schools = None
-        # Same validation fetch_health_centers/fetch_shelters/fetch_wash apply to
-        # their own caches: an empty cache or one missing the required ID column
-        # ('school_id_giga', needed downstream by _ensure_unique_zone_ids()) must
-        # trigger a re-fetch, not be silently returned and crash/misbehave later.
-        if (gdf_schools is not None and not gdf_schools.empty
-                and 'school_id_giga' in gdf_schools.columns and 'geometry' in gdf_schools.columns
-                and not gdf_schools.geometry.isna().all()):
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
-            if 'source' not in gdf_schools.columns:
-                gdf_schools['source'] = 'UNICEF Giga school-location API'
-            return gdf_schools
-        logger.warning(f"{country}: School cache invalid or missing required columns, re-fetching from GIGA API")
-
-    # 3. Fetch from GIGA API
-    try:
-        result = GigaSchoolLocationFetcher(country).fetch_locations(process_geospatial=True)
-        if not isinstance(result, gpd.GeoDataFrame):
-            if isinstance(result, pd.DataFrame) and not result.empty and 'geometry' in result.columns:
-                result = gpd.GeoDataFrame(result, geometry='geometry', crs='EPSG:4326')
-            else:
-                logger.warning(f"{country}: GIGA API returned no usable school data")
-                return gpd.GeoDataFrame(columns=['geometry', 'school_id_giga'], crs='EPSG:4326')
-        gdf_schools = result
-        if 'giga_id_school' in gdf_schools.columns:
-            gdf_schools = gdf_schools.rename(columns={'giga_id_school': 'school_id_giga'})
-        if gdf_schools.crs is None:
-            gdf_schools.set_crs('EPSG:4326', inplace=True)
-        gdf_schools['source'] = 'UNICEF Giga school-location API'
-        if gdf_schools.empty:
-            # Never overwrite a good cache with an empty result (e.g. a transient
-            # rate-limit or API hiccup returning a valid-but-empty GeoDataFrame
-            # rather than raising): matches fetch_health_centers/fetch_shelters/
-            # fetch_wash, which all return early on empty BEFORE ever calling
-            # their own save_*_locations(), leaving their cache untouched on
-            # failure. This preserves patch_country_layer()'s fallback-to-cache
-            # safety net for an empty result: the cache it falls back to must
-            # not itself have just been overwritten with that same empty result.
-            logger.warning(f"{country}: GIGA API returned no schools; cache left untouched")
-            return gdf_schools
-        save_school_locations(gdf_schools, country)
-        return gdf_schools
-    except Exception as e:
-        logger.error(f"{country}: Error fetching schools from GIGA API: {e}")
-        return gpd.GeoDataFrame(columns=['geometry', 'school_id_giga'], crs='EPSG:4326')
-
-
-def fetch_shelters(country, rewrite=0):
-    """
-    Fetch emergency shelter locations for a country using custom data, cache, or OSM.
-
-    Priority order:
-        1. Custom file at geodb/custom/<COUNTRY>_shelters.csv: always used if present.
-        2. Location cache (shelter_views/<COUNTRY>_shelters.parquet): if rewrite=0.
-        3. OSM via Overpass API using SHELTER_LOCATION_TYPES (social_facility=shelter).
-
-    Args:
-        country: ISO3 country code
-        rewrite: If 1, re-fetch from OSM and overwrite cache (ignored if custom file exists)
-
-    Returns:
-        gpd.GeoDataFrame: Shelter locations with geometry (EPSG:4326) and 'osm_id' column.
-    """
-    # 1. Custom data takes priority: never overwritten
-    custom_gdf = _load_custom_points_csv(country, 'shelters')
-    if custom_gdf is not None:
-        save_shelter_locations(custom_gdf, country)
-        return custom_gdf
-
-    # 2. Use cache if available, valid, and rewrite not requested
-    if shelter_exist(country) and rewrite == 0:
-        cached = load_shelter_locations(country)
-        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
-            if 'source' not in cached.columns:
-                cached['source'] = 'OpenStreetMap (social_facility=shelter tag)'
-            return cached
-        logger.warning(f"{country}: Shelter cache invalid or missing required columns, re-fetching from OSM")
-
-    # 3. Fetch from OSM via Overpass API
-    try:
-        from gigaspatial.handlers.osm import OSMLocationFetcher
-        df = OSMLocationFetcher(country=country, location_types=SHELTER_LOCATION_TYPES).fetch_locations()
-        if df.empty:
-            logger.warning(f"{country}: No shelter data found in OSM (social_facility=shelter)")
-            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
-        gdf = gpd.GeoDataFrame(
-            df, geometry=gpd.points_from_xy(df['longitude'], df['latitude']), crs='EPSG:4326'
-        )
-        gdf = gdf.rename(columns={'source_id': 'osm_id', 'category_value': 'shelter_type'})
-        gdf['source'] = 'OpenStreetMap (social_facility=shelter tag)'
-        logger.info(f"{country}: Fetched {len(gdf)} shelters from OSM")
-        save_shelter_locations(gdf, country)
-        return gdf
-    except Exception as e:
-        logger.error(f"{country}: Error fetching shelters from OSM: {e}")
-        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
-
-
-def fetch_wash(country, rewrite=0):
-    """
-    Fetch WASH infrastructure locations for a country using custom data, cache, or OSM.
-
-    Priority order:
-        1. Custom file at geodb/custom/<COUNTRY>_wash.csv: always used if present.
-        2. Location cache (wash_views/<COUNTRY>_wash.parquet): if rewrite=0.
-        3. OSM via Overpass API using WASH_LOCATION_TYPES.
-
-    Fetches: drinking_water, water_point, toilets, shower (amenity) and
-    water_well, water_tap, water_works, pumping_station, wastewater_treatment_plant (man_made).
-    Natural sources (springs) are excluded: only managed infrastructure.
-
-    Args:
-        country: ISO3 country code
-        rewrite: If 1, re-fetch from OSM and overwrite cache (ignored if custom file exists)
-
-    Returns:
-        gpd.GeoDataFrame: WASH facility locations with geometry (EPSG:4326) and 'osm_id' column.
-    """
-    # 1. Custom data takes priority: never overwritten
-    custom_gdf = _load_custom_points_csv(country, 'wash')
-    if custom_gdf is not None:
-        save_wash_locations(custom_gdf, country)
-        return custom_gdf
-
-    # 2. Use cache if available, valid, and rewrite not requested
-    if wash_exist(country) and rewrite == 0:
-        cached = load_wash_locations(country)
-        if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
-            if 'source' not in cached.columns:
-                cached['source'] = 'OpenStreetMap (humanitarian WASH tags)'
-            return cached
-        logger.warning(f"{country}: WASH cache invalid or missing required columns, re-fetching from OSM")
-
-    # 3. Fetch from OSM via Overpass API
-    try:
-        from gigaspatial.handlers.osm import OSMLocationFetcher
-        df = OSMLocationFetcher(country=country, location_types=WASH_LOCATION_TYPES).fetch_locations()
-        if df.empty:
-            logger.warning(f"{country}: No WASH data found in OSM")
-            return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
-        gdf = gpd.GeoDataFrame(
-            df, geometry=gpd.points_from_xy(df['longitude'], df['latitude']), crs='EPSG:4326'
-        )
-        gdf = gdf.rename(columns={'source_id': 'osm_id', 'category_value': 'wash_type'})
-        gdf['source'] = 'OpenStreetMap (humanitarian WASH tags)'
-        logger.info(f"{country}: Fetched {len(gdf)} WASH facilities from OSM "
-                    f"({df['category_value'].value_counts().to_dict()})")
-        save_wash_locations(gdf, country)
-        return gdf
-    except Exception as e:
-        logger.error(f"{country}: Error fetching WASH facilities from OSM: {e}")
-        return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
 
 
 # =============================================================================
 # GEOGRAPHIC UTILITIES
 # =============================================================================
-def get_country_boundaries(countries):
-    """
-    Retrieve country boundary geometries for a list of countries.
-
-    A single country's fetch failure is isolated and does not abort the others
-    this is the Python fallback path (used only when the SQL pre-filter itself
-    fails), and one country's transient GeoRepo hiccup must not take down storm
-    processing for every other unrelated, healthy country in the same request,
-    matching the per-country isolation pattern used everywhere else in this file
-    (e.g. the per-country create_views_from_envelopes_in_country loop).
-
-    Args:
-        countries: List of ISO3 country codes (e.g., ['TWN', 'DOM'])
-
-    Returns:
-        list: One entry per input country, same order, a Shapely geometry
-              (admin level 0 boundary) on success, or None if that country's
-              boundary could not be retrieved. Callers must handle None entries
-              (skip that country, log a warning) rather than assume every
-              entry is a real geometry.
-    """
-    country_boundaries = []
-    for country in countries:
-        try:
-            admin_boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
-            country_boundaries.append(admin_boundaries.to_geodataframe().geometry.iat[0])
-        except Exception as e:
-            logger.error(f"Error retrieving boundaries for {country}: {e}, skipping this country, others continue")
-            country_boundaries.append(None)
-    return country_boundaries
 
 
 def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
@@ -988,7 +451,7 @@ def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
 
     Used in the Python fallback path of run_complete_impact_analysis when the SQL
     pre-filter (ST_DWITHIN on COUNTRY_BOUNDARY) is unavailable. The zone geometry
-    is typically a 500 km buffer around a country boundary.
+    is typically a 100 km buffer around a country boundary.
 
     Args:
         zone_geom: Shapely geometry representing the zone to check against
@@ -1018,12 +481,18 @@ def is_envelope_in_zone(zone_geom, df_envelopes, geometry_column='geometry'):
 # for a country (--type initialize / --type patch). These are written once and
 # reused across all storm update runs.
 # =============================================================================
-def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
+def create_mercator_country_layer(country, zoom_level=14, rewrite=0, fast_fail=False):
     """
     Create mercator tile layer with demographic and infrastructure data for a country.
 
     Called during `--type initialize` (and as fallback during `--type update` if the base
     mercator parquet is missing). Produces one row per tile with all data columns.
+
+    fast_fail: forwarded to fetch_shelters()/fetch_wash() (see their own docstrings). The
+        `--type initialize` caller leaves this at the patient default; the `--type update`
+        fallback caller passes True, since it runs on every forecast cycle and a slow OSM
+        retry there would stall the whole cycle exactly like the main per-storm fetch this
+        fallback sits alongside.
 
     Data requirements: **hard failures** (init aborts if unavailable):
         - Total population (WorldPop 1km)
@@ -1051,10 +520,10 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
                          columns. 'zone_id' renamed to 'tile_id'.
     """
     # Fetch facility locations using helper functions with caching
-    gdf_schools = fetch_schools(country, rewrite)
-    gdf_hcs = fetch_health_centers(country, rewrite)
-    gdf_shelters = fetch_shelters(country, rewrite)
-    gdf_wash = fetch_wash(country, rewrite)
+    gdf_schools = fetch_schools(country, rewrite, fast_fail=fast_fail)
+    gdf_hcs = fetch_health_centers(country, rewrite, fast_fail=fast_fail)
+    gdf_shelters = fetch_shelters(country, rewrite, fast_fail=fast_fail)
+    gdf_wash = fetch_wash(country, rewrite, fast_fail=fast_fail)
 
     tiles_viewer = MercatorViewGenerator(source=country, zoom_level=zoom_level, data_store=data_store)
 
@@ -1160,8 +629,11 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0):
             )
 
     # Derive smod_class_l1 from smod_class (always derived, never loaded from custom)
+    # tiles_viewer.view's own DataFrame index is a positional RangeIndex, not zone_id
+    # (zone_id is a regular column); must re-key by zone_id before .map()/.to_dict(),
+    # since add_variable_to_view() joins the resulting dict by zone_id.
     try:
-        smod_l2 = tiles_viewer.view['smod_class']
+        smod_l2 = tiles_viewer.view.set_index('zone_id')['smod_class']
         smod_l1 = smod_l2.map(SMOD_L2_TO_L1)
         tiles_viewer.add_variable_to_view(smod_l1.to_dict(), 'smod_class_l1')
     except Exception as e:
@@ -1258,243 +730,7 @@ def save_mercator_view(gdf, country, zoom_level):
     write_dataset(gdf, data_store, path)
 
 
-def admins_overlay(gdf_admins1, gdf_mercator):
-    """
-    Assign admin boundary IDs to mercator tiles.
-
-    Works for any admin level (1, 2, …). Three-step assignment, applied in order:
-
-    1. Centroid-within: each tile is assigned to the admin region that contains its
-       centroid (projected to equal-area CRS for accuracy). Handles most tiles.
-
-    2. Area-overlap fallback: for tiles whose centroid falls outside every admin
-       boundary (straddles a border), assign to the admin with the largest
-       intersection area (equal-area CRS).
-
-    3. Nearest-neighbour fallback: for tiles still unassigned after steps 1–2
-       (ocean/far-offshore tiles), assign to the nearest admin boundary by
-       centroid distance. Ensures every tile gets an admin ID.
-
-    Note: step 3 only applies to tiles that do not intersect any admin region at all.
-    Tiles that straddle admin boundaries are handled by steps 1–2.
-
-    Callers are responsible for normalising the admin ID column to 'id' before
-    passing gdf_admins1 (see add_admin_ids).
-
-    Args:
-        gdf_admins1: GeoDataFrame with admin boundaries (any level). Must have 'id' column.
-        gdf_mercator: GeoDataFrame with mercator tiles. Must have 'tile_id' column.
-
-    Returns:
-        gpd.GeoDataFrame: Mercator tiles with an added 'id' column (admin boundary ID).
-    """
-    # Step 1: centroid-based assignment (primary)
-    # Project to equal-area CRS for accurate centroid computation
-    centroids = gdf_mercator[["tile_id", "geometry"]].copy()
-    centroids["geometry"] = centroids.geometry.to_crs("ESRI:54009").centroid.to_crs(gdf_mercator.crs)
-    centroid_join = gpd.sjoin(
-        centroids,
-        gdf_admins1[["id", "geometry"]],
-        how="left",
-        predicate="within",
-    ).drop(columns=["index_right"], errors="ignore")
-    # Keep first match per tile (handles rare centroid-on-boundary duplicates)
-    centroid_join = centroid_join.drop_duplicates(subset="tile_id", keep="first")
-    assigned = centroid_join[["tile_id", "id"]].copy()
-
-    # Step 2: area-based fallback for tiles whose centroid is outside all admin regions
-    still_unassigned = assigned[assigned["id"].isna()]["tile_id"]
-    if len(still_unassigned) > 0:
-        tiles_fallback = gdf_mercator[gdf_mercator["tile_id"].isin(still_unassigned)]
-        intersections = gpd.overlay(tiles_fallback, gdf_admins1, how="intersection")
-        if len(intersections) > 0:
-            intersections["intersection_area"] = (
-                intersections.geometry.to_crs("ESRI:54009").area
-            )
-            max_idx = intersections.groupby("tile_id")["intersection_area"].idxmax()
-            fallback = intersections.loc[max_idx, ["tile_id", "id"]]
-            assigned = assigned.set_index("tile_id")
-            assigned.update(fallback.set_index("tile_id"))
-            assigned = assigned.reset_index()
-
-    # Step 3: nearest-neighbour fallback for tiles still unassigned (no intersection
-    # with any admin, typically ocean or far-offshore tiles)
-    still_unassigned = assigned[assigned["id"].isna()]["tile_id"]
-    if len(still_unassigned) > 0:
-        logger.debug(
-            f"admins_overlay: {len(still_unassigned)} tiles unassigned after centroid "
-            "and area steps, applying nearest-neighbour fallback"
-        )
-        # Both sides kept in ESRI:54009 (equal-area, metres) for the sjoin_nearest call
-        # itself, degrees don't reflect true distance for "nearest" (same reasoning
-        # assign_facilities_to_tiles() already applies for its own nearest-tile
-        # fallback). Harmless to leave projected here since only tile_id/id survive
-        # into `assigned` below, geometry never leaks out of this local computation.
-        tiles_nn = gdf_mercator[gdf_mercator["tile_id"].isin(still_unassigned)].copy()
-        tiles_nn["geometry"] = tiles_nn.geometry.to_crs("ESRI:54009").centroid
-        admins_proj = gdf_admins1[["id", "geometry"]].to_crs("ESRI:54009")
-        nearest = gpd.sjoin_nearest(tiles_nn[["tile_id", "geometry"]], admins_proj, how="left")
-        nearest = nearest.drop_duplicates(subset="tile_id", keep="first")[["tile_id", "id"]]
-        assigned = assigned.set_index("tile_id")
-        assigned.update(nearest.set_index("tile_id"))
-        assigned = assigned.reset_index()
-
-    # Left-join back to preserve all original tiles
-    result = gdf_mercator.merge(assigned, on="tile_id", how="left")
-    return gpd.GeoDataFrame(result, geometry="geometry", crs=gdf_mercator.crs)
-
-
-def add_admin_ids(view, country, admin_level=1, strict=False):
-    """
-    Add admin-level IDs to a mercator tile view.
-
-    Fetches admin boundaries at the requested level from GeoRepo and assigns each
-    tile to the admin boundary with the largest intersection area (via admins_overlay).
-    Unless strict=True, falls back to admin level 0 (whole country) if the requested
-    level is unavailable.
-
-    Args:
-        view: GeoDataFrame containing mercator tiles (must have 'tile_id' column)
-        country: ISO3 country code
-        admin_level: Admin level to use for boundary assignment (default: 1)
-        strict: If True, raise ValueError instead of falling back to admin 0 when
-                the requested level is unavailable (default: False)
-
-    Returns:
-        tuple: (combined_view, gdf_admins) where:
-            - combined_view: GeoDataFrame with tiles and 'id' column (admin boundary ID)
-            - gdf_admins: GeoDataFrame with admin boundaries at the requested level
-
-    Raises:
-        ValueError: If strict=True and the requested admin level is unavailable
-    """
-    try:
-        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=admin_level).to_geodataframe()
-        # giga-spatial 0.9.x AdminBoundaries.to_geodataframe() returns 'boundary_id';
-        # older versions returned 'id'. Normalise to 'id' so downstream code is consistent.
-        if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
-            gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
-        if gdf_admins1.empty or "id" not in gdf_admins1.columns:
-            raise ValueError(f"Admin level {admin_level} boundaries empty or missing 'id' column")
-    except Exception as e:
-        if strict:
-            raise ValueError(
-                f"{country}: Admin level {admin_level} not available in GeoRepo ({e})"
-            ) from e
-        logger.warning(
-            f"{country}: Admin level {admin_level} boundaries unavailable ({e}), "
-            "falling back to admin level 0 (whole country as single region)"
-        )
-        gdf_admins1 = AdminBoundaries.create(country_code=country, admin_level=0).to_geodataframe()
-        if "boundary_id" in gdf_admins1.columns and "id" not in gdf_admins1.columns:
-            gdf_admins1 = gdf_admins1.rename(columns={"boundary_id": "id"})
-        if "name" not in gdf_admins1.columns:
-            gdf_admins1["name"] = country
-        if "id" not in gdf_admins1.columns:
-            gdf_admins1["id"] = country
-    combined_view = admins_overlay(gdf_admins1, view)
-    return combined_view, gdf_admins1
-
-
-def get_initialized_admin_levels(country):
-    """
-    Return the list of admin levels that have base parquets initialized for a country.
-
-    Lists admin_views/ and matches every "{country}_admin<N>.parquet" file found,
-    with no upper bound on N; --type initialize --admin has no upper bound either
-    (see main_pipeline.py's argparse), so a fixed probe range here would silently
-    make any level beyond it invisible to --type update forever. This determines
-    which admin-level storm views are produced during --type update.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        list[int]: Admin levels with existing base parquets (e.g. [1, 2])
-    """
-    admin_dir = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views')
-    try:
-        files = data_store.list_files(admin_dir)
-    except Exception as e:
-        logger.warning(f"Could not list {admin_dir} to detect initialized admin levels for {country}: {e}")
-        return []
-
-    prefix, suffix = f"{country}_admin", ".parquet"
-    found = []
-    for f in files:
-        fname = os.path.basename(f)
-        if fname.startswith(prefix) and fname.endswith(suffix):
-            level_str = fname[len(prefix):-len(suffix)]
-            if level_str.isdigit():
-                found.append(int(level_str))
-    return sorted(found)
-
-
-def write_country_boundary(country: str):
-    """
-    Fetch admin level 0 boundary from GeoRepo and write it to
-    PIPELINE_COUNTRIES.COUNTRY_BOUNDARY in Snowflake.
-    Called automatically during --type initialize for each new country.
-
-    BES is a special case: see _BES_GEOREPO_UCODES above. Its three real
-    sub-territory geometries are fetched directly by ucode and unioned,
-    bypassing AdminBoundaries.create()'s single-ISO3 lookup entirely.
-    """
-    conn = None
-    try:
-        if country == "BES":
-            client = GeoRepoClient()
-            geoms = []
-            for ucode, name in _BES_GEOREPO_UCODES.items():
-                feature = client.get_entity_by_ucode(ucode, geom="full_geom", format="geojson")
-                if feature and feature.get("geometry"):
-                    geoms.append(shape(feature["geometry"]))
-                else:
-                    logger.warning(f"{country}: GeoRepo returned no geometry for {name} ({ucode})")
-            if not geoms:
-                logger.warning(f"{country}: GeoRepo returned no boundary for any BES sub-territory, COUNTRY_BOUNDARY not updated")
-                return
-            geom = unary_union(geoms)
-        else:
-            boundaries = AdminBoundaries.create(country_code=country, admin_level=0)
-            gdf = boundaries.to_geodataframe()
-            if gdf.empty or gdf.geometry.isna().all():
-                logger.warning(f"{country}: GeoRepo returned no boundary, COUNTRY_BOUNDARY not updated")
-                return
-            # Union all rows in case GeoRepo returns multiple polygons for admin_level=0
-            geom = gdf.geometry.union_all()
-        wkt = geom.wkt
-        center_lat = geom.centroid.y
-        center_lon = geom.centroid.x
-        span = max(
-            geom.bounds[3] - geom.bounds[1],  # lat span
-            geom.bounds[2] - geom.bounds[0],  # lon span
-        )
-        view_zoom = (11 if span < 0.5 else 10 if span < 1 else
-                     9 if span < 2 else 8 if span < 4 else 7)
-        conn = get_snowflake_connection()
-        cur = conn.cursor()
-        # Use TO_GEOGRAPHY (not TRY_TO_GEOGRAPHY) so invalid WKT raises immediately
-        # rather than silently writing NULL to COUNTRY_BOUNDARY. This is a foreseen,
-        # intentionally-triggered exception path for bad GeoRepo WKT, conn must still
-        # be closed when it happens, hence the finally below.
-        # COALESCE preserves any manually-set center/zoom values.
-        cur.execute("""
-            UPDATE AOTS.TC_ECMWF.PIPELINE_COUNTRIES
-            SET COUNTRY_BOUNDARY = TO_GEOGRAPHY(%(wkt)s),
-                CENTER_LAT = COALESCE(CENTER_LAT, %(lat)s),
-                CENTER_LON = COALESCE(CENTER_LON, %(lon)s),
-                VIEW_ZOOM  = COALESCE(VIEW_ZOOM,  %(zoom)s)
-            WHERE COUNTRY_CODE = %(iso)s
-        """, {"wkt": wkt, "iso": country, "lat": center_lat, "lon": center_lon, "zoom": view_zoom})
-        conn.commit()
-        cur.close()
-        logger.info(f"{country}: COUNTRY_BOUNDARY, CENTER_LAT/LON, VIEW_ZOOM written to Snowflake")
-    except Exception as e:
-        logger.warning(f"{country}: Could not write COUNTRY_BOUNDARY to Snowflake: {e}")
-    finally:
-        if conn is not None:
-            conn.close()
+# admins_overlay lives in pipeline_shared.py (imported above); not redefined here.
 
 
 def patch_country_layer(country, zoom_level, columns):
@@ -1780,12 +1016,11 @@ def patch_country_layer(country, zoom_level, columns):
                 agg = agg.rename(columns={group_col: 'tile_id'})
                 # Ensure every admin region already in the persisted parquet still
                 # appears, even one with zero assigned tiles this time (e.g. a tiny
-                # offshore island admin unit), matching the same all_ids-merge
-                # protection _build_admin_view_from_mercator() applies at init time.
-                # Without this, groupby only emits ids with >=1 assigned tile, and
-                # since save_admin_view() below fully overwrites the parquet (not an
-                # append/merge), any zero-tile region already on file would be
-                # permanently dropped here, not just reordered.
+                # offshore island unit), matching the all_ids-merge protection
+                # _build_admin_view_from_mercator() applies at init time: groupby
+                # alone only emits ids with >=1 assigned tile, and save_admin_view()
+                # fully overwrites (not merges) the parquet, so a zero-tile region
+                # would otherwise be permanently dropped.
                 all_tile_ids = gdf_admin[['tile_id']].copy()
                 agg = all_tile_ids.merge(agg, on='tile_id', how='left')
                 for col in sum_cols_admin:
@@ -1804,16 +1039,13 @@ def patch_country_layer(country, zoom_level, columns):
         for admin_level in admin_patch_levels:
             try:
                 # gdf always already carries an 'id' column (written by the
-                # admin_level=1 add_admin_ids() call at --type initialize time),
-                # regardless of which admin_level is being created here.
-                # _build_admin_view_from_mercator() always recomputes 'id' itself
-                # via its own add_admin_ids() call, so the stale 'id' must be
-                # dropped for EVERY admin_level (not just admin_level != 1), or
-                # the merge inside admins_overlay() collides two 'id' columns
-                # into id_x/id_y, and the subsequent groupby("id") raises an
-                # uncaught KeyError that isn't caught by the except ValueError
-                # below (matches the same 'id' handling in the sibling
-                # save_mercator_and_admin_views() branch above).
+                # admin_level=1 add_admin_ids() call at --type initialize time).
+                # _build_admin_view_from_mercator() recomputes 'id' itself via its
+                # own add_admin_ids() call, so the stale 'id' must be dropped for
+                # every admin_level, or the merge inside admins_overlay() collides
+                # two 'id' columns into id_x/id_y and the subsequent groupby("id")
+                # raises an uncaught KeyError (matches the 'id' handling in the
+                # sibling save_mercator_and_admin_views() branch).
                 src = gdf.drop(columns=['id'], errors='ignore')
                 admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
                 save_admin_view(admin_view, country, admin_level=admin_level)
@@ -1922,16 +1154,10 @@ def save_mercator_and_admin_views(countries, zoom_level, rewrite, admin_levels=N
                                           f"{country}_admin{admin_level}.parquet")
                 if not data_store.file_exists(admin_path):
                     try:
-                        # The persisted mercator parquet always already carries an 'id'
-                        # column (written by the admin_level=1 add_admin_ids() call that
-                        # ran when it was first saved), regardless of which admin_level
-                        # is being built here. _build_admin_view_from_mercator() always
-                        # recomputes 'id' itself via its own add_admin_ids() call, so the
-                        # stale 'id' column must be dropped for EVERY admin_level (not
-                        # just admin_level != 1), or the merge inside admins_overlay()
-                        # collides two 'id' columns into id_x/id_y, and the subsequent
-                        # groupby("id") raises an uncaught KeyError that isn't caught by
-                        # the except ValueError below, aborting the whole country loop.
+                        # The persisted mercator parquet already carries an 'id' column
+                        # (written by the admin_level=1 add_admin_ids() call at save
+                        # time); drop it before rebuilding, same stale-'id' issue as
+                        # the admin_patch_levels branch above.
                         src = view.drop(columns=['id'], errors='ignore')
                         admin_view = _build_admin_view_from_mercator(src, country, admin_level=admin_level)
                         save_admin_view(admin_view, country, admin_level=admin_level)
@@ -2040,7 +1266,50 @@ def _ensure_unique_zone_ids(gdf, id_col, facility_label):
     return gdf
 
 
-def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_column='wind_threshold'):
+def _precompute_facility_buffer(gdf, id_col, facility_label, filter_fn=None,
+                                 buffer_distance_meters=BUFFER_DISTANCE_METERS):
+    """
+    Runs the same validate -> filter -> deduplicate -> buffer sequence each of
+    create_school_view_from_envelopes()/create_health_center_view_from_
+    envelopes()/create_shelter_view_from_envelopes()/create_wash_view_from_
+    envelopes() and create_tracks_view_from_envelopes() already run
+    internally for one facility type, ONCE, so create_views_from_envelopes_
+    in_country() can compute a single buffered GeoDataFrame per facility type
+    and reuse it across its own wind-view, wind-tracks, gust-view, and
+    gust-tracks calls for that same facility type, instead of each of those
+    four independently re-running buffer_geodataframe() (a real UTM-
+    reprojection-and-buffer geometry operation, not a cheap one) on the exact
+    same input. Deduplication never changes row count, order, or geometry
+    (see _ensure_unique_zone_ids()'s own docstring: only id_col values on
+    null/duplicate rows are rewritten), so the buffered GEOMETRY this
+    produces is identical whether or not deduplication happened to run first,
+    which is why create_tracks_view_from_envelopes()'s own point-in-polygon
+    counting (unaffected by facility ID identity) can safely reuse a buffer
+    built via this same dedup-then-buffer path as the per-facility-probability
+    views that DO depend on unique IDs.
+
+    Returns None on any invalid/missing/empty input (mirroring each
+    downstream function's own early-return guard) so the caller can pass None
+    straight through as that function's own precomputed_buff argument: a None
+    there makes the function fall back to computing everything internally,
+    exactly as if this precompute had never run, including that function's
+    own facility-specific validation logging for the failure. Only a
+    genuinely valid, real precomputed buffer is ever returned here.
+    """
+    if not isinstance(gdf, gpd.GeoDataFrame) or gdf.empty:
+        return None
+    if 'geometry' not in gdf.columns or gdf.geometry.isna().all():
+        return None
+    if filter_fn is not None:
+        gdf = filter_fn(gdf)
+        if gdf is None or gdf.empty:
+            return None
+    gdf = _ensure_unique_zone_ids(gdf, id_col, facility_label)
+    return buffer_geodataframe(gdf, buffer_distance_meters=buffer_distance_meters)
+
+
+def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_column='wind_threshold',
+                                       precomputed_buff=None):
     """
     Create per-facility school impact views from hurricane envelopes.
 
@@ -2065,6 +1334,15 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_colu
                      Must have 'school_id_giga' column and valid geometry.
         gdf_envelopes: GeoDataFrame of hurricane envelope geometries with
                        'wind_threshold' and 'ensemble_member' columns.
+        threshold_column: 'wind_threshold' or 'gust_threshold'.
+        precomputed_buff: Optional, an already-deduplicated-and-buffered
+            version of gdf_schools (see _precompute_facility_buffer()'s own
+            docstring), reused instead of deduplicating/buffering gdf_schools
+            again here. Passed by create_views_from_envelopes_in_country()
+            when it has already computed this same buffer for its own
+            create_tracks_view_from_envelopes() call (and, for gust, this
+            same call again); None (the default) computes it here exactly as
+            before, for any caller that doesn't have one handy.
 
     Returns:
         dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per school,
@@ -2086,33 +1364,46 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_colu
         logger.error("School GeoDataFrame has no valid geometry column. Returning empty views.")
         return {}
     
-    gdf_schools = _ensure_unique_zone_ids(gdf_schools, 'school_id_giga', 'school')
-
-    gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+    if precomputed_buff is not None:
+        gdf_schools_buff = precomputed_buff
+    else:
+        gdf_schools = _ensure_unique_zone_ids(gdf_schools, 'school_id_giga', 'school')
+        gdf_schools_buff = buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
     num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes[threshold_column].unique())
+
+    # Built ONCE and reused across every wind_th below, not reconstructed per
+    # threshold (typically 6x for wind, more for gust): __init__ renames+copies
+    # every column of gdf_schools_buff and rebuilds its zone_id->geometry dict
+    # from scratch, overhead avoided since gdf_schools_buff never changes across
+    # this loop. `_view` is reset to None before each threshold's own
+    # add_variable_to_view() call, matching a freshly constructed instance's
+    # lazy `if self._view is None` init path, so only setup cost is removed, not
+    # per-threshold behavior. Same pattern applied to the sibling
+    # create_health_center/shelter/wash/mercator/admin_view_from_envelopes*
+    # functions below, but NOT create_tracks_view_from_envelopes(), whose
+    # zone_data (gdf_envelopes_wth) genuinely differs every iteration.
+    schools_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_schools_buff, zone_id_column='school_id_giga')
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            schools_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_schools_buff, zone_id_column='school_id_giga')
+            schools_viewer._view = None
             try:
                 new_col = schools_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
             except KeyError as e:
-                # gigaspatial's map_polygons(value_columns=None) internally adds a
+                # gigaspatial's map_polygons(value_columns=None) adds a
                 # '_temp_polygon_count_dummy' column and reads it back via
-                # result.set_index('zone_id')[col], when zero envelope polygons
-                # intersect any zone at this threshold (a normal, expected outcome,
-                # e.g. no member reaches a high wind_threshold), its own internal
-                # aggregate_polygons_to_zones() early-returns before ever adding
-                # that column, so the read-back raises a bare KeyError. Narrowed
-                # from a broad except so a genuinely different bug here doesn't
-                # get silently misattributed to this benign case,  matches the
-                # same real root cause already handled this way in
+                # result.set_index('zone_id')[col]; when zero envelope polygons
+                # intersect any zone at this threshold (normal, e.g. no member
+                # reaches a high wind_threshold), aggregate_polygons_to_zones()
+                # early-returns before adding that column, so the read-back raises
+                # a bare KeyError. Narrowed from a broad except so an unrelated bug
+                # isn't silently misattributed here, matching
                 # create_tracks_view_from_envelopes()'s tile aggregation below.
-                logger.info(f"No envelope/school intersections at {wind_th} ({threshold_column}) -- defaulting probability to 0.0: {e}")
+                logger.info(f"No envelope/school intersections at {wind_th} ({threshold_column}), defaulting probability to 0.0: {e}")
                 probs = {k: 0.0 for k in schools_viewer.view['zone_id'].unique()}
             schools_viewer.add_variable_to_view(probs, 'probability')
 
@@ -2148,7 +1439,8 @@ def _filter_hcs_to_relevant_types(gdf_hcs):
     return filtered
 
 
-def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_column='wind_threshold'):
+def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_column='wind_threshold',
+                                              precomputed_buff=None):
     """
     Create per-facility health center impact views from hurricane envelopes.
 
@@ -2174,6 +1466,12 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_c
                  location cache). Must have 'osm_id' column and valid geometry.
         gdf_envelopes: GeoDataFrame of hurricane envelope geometries with
                        'wind_threshold' and 'ensemble_member' columns.
+        threshold_column: 'wind_threshold' or 'gust_threshold'.
+        precomputed_buff: Optional, an already-filtered-deduplicated-and-
+            buffered version of gdf_hcs (see _precompute_facility_buffer()'s
+            own docstring), reused instead of filtering/deduplicating/
+            buffering gdf_hcs again here. None (the default) computes it
+            here exactly as before.
 
     Returns:
         dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per facility,
@@ -2193,22 +1491,30 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_c
         logger.error("Health center GeoDataFrame has no valid geometry column. Returning empty views.")
         return {}
 
-    gdf_hcs = _filter_hcs_to_relevant_types(gdf_hcs)
+    if precomputed_buff is not None:
+        gdf_hcs_buff = precomputed_buff
+    else:
+        gdf_hcs = _filter_hcs_to_relevant_types(gdf_hcs)
 
-    if gdf_hcs.empty:
-        logger.warning(f"No health facilities matching {HC_FACILITY_TYPES}, returning empty impact views")
-        return {}
+        if gdf_hcs.empty:
+            logger.warning(f"No health facilities matching {HC_FACILITY_TYPES}, returning empty impact views")
+            return {}
 
-    gdf_hcs = _ensure_unique_zone_ids(gdf_hcs, 'osm_id', 'health center')
-    gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+        gdf_hcs = _ensure_unique_zone_ids(gdf_hcs, 'osm_id', 'health center')
+        gdf_hcs_buff = buffer_geodataframe(gdf_hcs, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
 
     num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes[threshold_column].unique())
+
+    # Built ONCE and reused across every wind_th, `_view` reset before each
+    # reuse: see create_school_view_from_envelopes()'s own comment above for
+    # the full "why" (identical redundancy, same optimization).
+    hcs_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_hcs_buff, zone_id_column='osm_id')
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            hcs_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_hcs_buff, zone_id_column='osm_id')
+            hcs_viewer._view = None
             try:
                 new_col = hcs_viewer.map_polygons(gdf_envelopes_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
@@ -2217,7 +1523,7 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_c
                 # explanation: a bare KeyError here means zero envelope/HC
                 # intersections at this threshold, a normal expected outcome,
                 # not a real failure.
-                logger.info(f"No envelope/health-center intersections at {wind_th} ({threshold_column}) -- defaulting probability to 0.0: {e}")
+                logger.info(f"No envelope/health-center intersections at {wind_th} ({threshold_column}), defaulting probability to 0.0: {e}")
                 probs = {k: 0.0 for k in hcs_viewer.view['zone_id'].unique()}
             hcs_viewer.add_variable_to_view(probs, 'probability')
 
@@ -2227,7 +1533,8 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_c
     return wind_views
 
 
-def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_column='wind_threshold'):
+def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_column='wind_threshold',
+                                        precomputed_buff=None):
     """
     Create per-facility shelter impact views from hurricane envelopes.
 
@@ -2240,6 +1547,11 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_co
     Args:
         gdf_shelters: GeoDataFrame of shelter locations. Must have 'osm_id' column.
         gdf_envelopes: GeoDataFrame of hurricane envelopes.
+        threshold_column: 'wind_threshold' or 'gust_threshold'.
+        precomputed_buff: Optional, an already-deduplicated-and-buffered
+            version of gdf_shelters (see _precompute_facility_buffer()'s own
+            docstring), reused instead of deduplicating/buffering gdf_shelters
+            again here. None (the default) computes it here exactly as before.
 
     Returns:
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
@@ -2254,14 +1566,21 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_co
         logger.error("Shelter GeoDataFrame has no valid geometry. Returning empty views.")
         return {}
 
-    gdf_shelters = _ensure_unique_zone_ids(gdf_shelters, 'osm_id', 'shelter')
-    gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+    if precomputed_buff is not None:
+        gdf_shelters_buff = precomputed_buff
+    else:
+        gdf_shelters = _ensure_unique_zone_ids(gdf_shelters, 'osm_id', 'shelter')
+        gdf_shelters_buff = buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
+    # Built ONCE and reused across every wind_th, `_view` reset before each
+    # reuse: see create_school_view_from_envelopes()'s own comment above for
+    # the full "why" (identical redundancy, same optimization).
+    viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_shelters_buff, zone_id_column='osm_id')
     for wind_th in gdf_envelopes[threshold_column].unique():
         gdf_env_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_env_wth.empty:
-            viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_shelters_buff, zone_id_column='osm_id')
+            viewer._view = None
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
@@ -2270,14 +1589,15 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_co
                 # explanation: a bare KeyError here means zero envelope/shelter
                 # intersections at this threshold, a normal expected outcome,
                 # not a real failure.
-                logger.info(f"No envelope/shelter intersections at {wind_th} ({threshold_column}) -- defaulting probability to 0.0: {e}")
+                logger.info(f"No envelope/shelter intersections at {wind_th} ({threshold_column}), defaulting probability to 0.0: {e}")
                 probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
             viewer.add_variable_to_view(probs, 'probability')
             wind_views[wind_th] = viewer.to_geodataframe()
     return wind_views
 
 
-def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='wind_threshold'):
+def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='wind_threshold',
+                                     precomputed_buff=None):
     """
     Create per-facility WASH impact views from hurricane envelopes.
 
@@ -2291,6 +1611,11 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='w
     Args:
         gdf_wash: GeoDataFrame of WASH facility locations. Must have 'osm_id' column.
         gdf_envelopes: GeoDataFrame of hurricane envelopes.
+        threshold_column: 'wind_threshold' or 'gust_threshold'.
+        precomputed_buff: Optional, an already-deduplicated-and-buffered
+            version of gdf_wash (see _precompute_facility_buffer()'s own
+            docstring), reused instead of deduplicating/buffering gdf_wash
+            again here. None (the default) computes it here exactly as before.
 
     Returns:
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
@@ -2306,14 +1631,21 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='w
         logger.error("WASH GeoDataFrame has no valid geometry. Returning empty views.")
         return {}
 
-    gdf_wash = _ensure_unique_zone_ids(gdf_wash, 'osm_id', 'WASH facility')
-    gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+    if precomputed_buff is not None:
+        gdf_wash_buff = precomputed_buff
+    else:
+        gdf_wash = _ensure_unique_zone_ids(gdf_wash, 'osm_id', 'WASH facility')
+        gdf_wash_buff = buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
+    # Built ONCE and reused across every wind_th, `_view` reset before each
+    # reuse: see create_school_view_from_envelopes()'s own comment above for
+    # the full "why" (identical redundancy, same optimization).
+    viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_wash_buff, zone_id_column='osm_id')
     for wind_th in gdf_envelopes[threshold_column].unique():
         gdf_env_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_env_wth.empty:
-            viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_wash_buff, zone_id_column='osm_id')
+            viewer._view = None
             try:
                 new_col = viewer.map_polygons(gdf_env_wth)
                 probs = {k: v / float(num_ensembles) for k, v in new_col.items()}
@@ -2322,14 +1654,52 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='w
                 # explanation: a bare KeyError here means zero envelope/WASH
                 # intersections at this threshold, a normal expected outcome,
                 # not a real failure.
-                logger.info(f"No envelope/WASH intersections at {wind_th} ({threshold_column}) -- defaulting probability to 0.0: {e}")
+                logger.info(f"No envelope/WASH intersections at {wind_th} ({threshold_column}), defaulting probability to 0.0: {e}")
                 probs = {k: 0.0 for k in viewer.view['zone_id'].unique()}
             viewer.add_variable_to_view(probs, 'probability')
             wind_views[wind_th] = viewer.to_geodataframe()
     return wind_views
 
 
-def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_column='wind_threshold'):
+def build_tiles_viewer(gdf_tiles, zone_id_column='tile_id'):
+    """
+    Construct a GeometryBasedZonalViewGenerator for gdf_tiles, exposed so
+    callers OUTSIDE this module (main_pipeline.py's own per-country precip/
+    river loops) can build one ONCE per country and pass it into every
+    create_precip_tile_view()/create_precip_admin_view()/
+    create_river_tile_view() call for that country via their own
+    `tiles_viewer` param, instead of each of those ~20-24 calls (one per
+    window x threshold for precip, one per rp_tier x leadtime step for
+    river) independently reconstructing the same GeometryBasedZonalView
+    Generator for the same unchanging gdf_tiles. See create_precip_tile_
+    view()'s own `tiles_viewer` docstring for the full "why" of what this
+    construction costs and why repeating it is real, measurable overhead.
+
+    Safe to reuse across calls for different admin levels too, as long as
+    each admin level's own gdf_tiles_for_admin object gets its own viewer
+    (built from that object, not the whole-country one): the cost being
+    avoided is per-object, not per-country.
+
+    Args:
+        gdf_tiles: GeoDataFrame of mercator tiles (or an admin-level tile
+            GeoDataFrame from admins_overlay()), used verbatim as `zone_data`.
+        zone_id_column: column in gdf_tiles identifying each zone. Always
+            'tile_id' for every real caller today (mercator/admin tile grids
+            all use this column name), kept as a parameter rather than
+            hardcoded only so this function's contract doesn't silently
+            assume it.
+
+    Returns:
+        GeometryBasedZonalViewGenerator: freshly constructed, `_view` unset
+            (i.e. in the exact same state passing it straight into
+            create_precip_tile_view()/create_river_tile_view() as their own
+            internal `tiles_viewer = GeometryBasedZonalViewGenerator(...)`
+            line would produce).
+    """
+    return GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column=zone_id_column)
+
+
+def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_column='wind_threshold', bitmask_views=None):
     """
     Create mercator tile impact views from hurricane envelopes.
 
@@ -2339,24 +1709,26 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_colu
     Args:
         gdf_tiles: GeoDataFrame containing mercator tiles with demographic/infrastructure data
         gdf_envelopes: GeoDataFrame containing hurricane envelope geometries with wind_threshold column
+        threshold_column: 'wind_threshold' or 'gust_threshold'.
+        bitmask_views: Optional, an already-computed {threshold: DataFrame}
+            result of calculate_tile_member_bitmask(), reused instead of
+            recomputing it here. None (the default) computes it here exactly
+            as before.
 
     Returns:
         dict: Dictionary mapping wind threshold (int) to DataFrame with tile impact data.
               Each DataFrame contains probability and E_* columns for expected impacts.
     """
-    # Population columns are a hard init-time requirement, not optional data:
-    # a country missing one means that country's base layer needs
-    # `--type patch --columns <col>`, an operational data-completeness
-    # problem, not something this function should silently route around by
-    # defaulting E_<col> to NaN for every tile. Fail loudly and immediately,
-    # matching create_tracks_view_from_envelopes()'s existing precedent for
-    # adolescent_population: for wind this propagates to the per-country
-    # try/except in run_complete_impact_analysis() (correctly failing that
-    # one country while the rest of the batch continues); for gust it's
-    # caught by that call's own dedicated try/except and logged at warning
-    # level, isolated from wind as already designed. The other data_cols
-    # entries (built_surface_m2, schools/hcs/shelters/wash, smod, rwi) stay
-    # NaN-tolerant below.
+    # Population columns are a hard init-time requirement, not optional data: a
+    # country missing one needs `--type patch --columns <col>`, an operational
+    # data-completeness problem, not something to silently route around by
+    # defaulting E_<col> to NaN. Fail loudly and immediately, matching
+    # create_tracks_view_from_envelopes()'s precedent for adolescent_population:
+    # for wind this propagates to the per-country try/except in
+    # run_complete_impact_analysis() (failing only that country); for gust it's
+    # caught by that call's own dedicated try/except and logged as a warning.
+    # The other data_cols entries (built_surface_m2, schools/hcs/shelters/wash,
+    # smod, rwi) stay NaN-tolerant below.
     _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
     if _missing_pop_cols:
         raise ValueError(
@@ -2368,29 +1740,41 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_colu
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes[threshold_column].unique())
+
+    # Canonical per-tile-per-member coverage bitmask, computed ONCE for every
+    # threshold in gdf_envelopes (shared tile reprojection + centroid extraction
+    # cost, see calculate_tile_member_bitmask()'s own docstring), instead of each
+    # threshold running its own gpd.sjoin(). Reused, not recomputed, when the
+    # caller already has one: this function, create_admin_view_from_envelopes_new(),
+    # and create_tracks_view_from_envelopes() all need the identical bitmask for
+    # the same (gdf_envelopes, gdf_tiles, threshold_column);
+    # create_views_from_envelopes_in_country() computes it once per hazard and
+    # passes it to all three instead of each recomputing this expensive
+    # per-member rasterize pass independently (a real OOM contributor at
+    # MEX/PHL scale, found live in production).
+    if bitmask_views is None:
+        bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
+                                                       threshold_column=threshold_column,
+                                                       label='mercator tile')
+
+    # Built ONCE and reused across every wind_th below, `_view` reset before
+    # each reuse: see create_school_view_from_envelopes()'s comment for the
+    # full "why" (identical optimization). gdf_tiles never changes across this
+    # loop, only bm_df/probs does, so the expensive rename+copy+zone_dict setup
+    # runs once here instead of once per threshold (and again, independently,
+    # in create_admin_view_from_envelopes_new() below for admin_level 1, on the
+    # same gdf_tiles object).
+    tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
-            try:
-                # Use tiles-left, envelopes-right sjoin (same direction as
-                # create_tracks_view_from_envelopes) so boundary tiles are
-                # treated identically in the probability raster and per-member
-                # track view. Reversing the join direction (envelopes-left,
-                # tiles-right) reprojects the CRS the opposite way, which can
-                # cause borderline tiles to be included in one view but
-                # excluded from the other.
-                tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
-                envs_geom = gdf_envelopes_wth[['geometry']].copy()
-                if tiles_geom.crs != envs_geom.crs:
-                    tiles_geom = tiles_geom.to_crs(envs_geom.crs)
-                joined = gpd.sjoin(tiles_geom, envs_geom, how='inner', predicate='intersects')
-                tile_counts = joined.groupby('tile_id').size()
-                all_tile_ids = gdf_tiles['tile_id']
-                probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
-            except Exception as e:
-                logger.warning(f"map_polygons failed for {threshold_column}, defaulting probabilities to 0: {e}")
+            tiles_viewer._view = None
+            bm_df = bitmask_views.get(int(wind_th))
+            if bm_df is None:
+                logger.warning(f"tile_member_bitmask FAILED for {threshold_column}={wind_th}, defaulting probabilities to 0")
                 probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
+            else:
+                probs = _tile_probability_from_bitmask(bm_df, gdf_tiles['tile_id'], float(num_ensembles))
             tiles_viewer.add_variable_to_view(probs, 'probability')
 
             df_view = tiles_viewer.to_dataframe()
@@ -2433,19 +1817,37 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_colu
     return wind_views
 
 
-def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, threshold_column='wind_threshold'):
+def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, threshold_column='wind_threshold', bitmask_views=None,
+                                          precomputed_tile_views=None):
+    """
+    precomputed_tile_views: Optional {threshold: DataFrame} dict, the exact
+        return shape of create_mercator_view_from_envelopes(), to reuse for
+        admin level 1 instead of rebuilding the same per-tile probability/E_*
+        DataFrame from scratch. Admin level 1's own gdf_tiles is always the
+        exact same object as the caller's whole-country mercator gdf_tiles
+        (see create_views_from_envelopes_in_country()'s own
+        gdf_tiles_for_admin_by_level construction: `gdf_tiles_for_admin =
+        gdf_tiles` for admin_level == 1), and this function is always called
+        with the same bitmask_views the sibling mercator call already used,
+        so for that level every per-tile quantity below is byte-identical to
+        what create_mercator_view_from_envelopes() already computed moments
+        earlier in the same per-country pass. Unlike precip's own analogous
+        create_precip_admin_view() reuse (which still needs its own
+        gdf_tiles-derived id_mapping even when reusing, because precip's tile
+        view is a raw grid sample keyed only by zone_id), this one needs no
+        remapping step: the mercator view's own tiles_viewer.view already
+        carries every original gdf_tiles column straight through, 'id' (this
+        admin level's own admin id per tile) included. A copy is taken per
+        threshold, never the caller's own object, since the caller
+        (create_views_from_envelopes_in_country()) still saves that same
+        DataFrame as the mercator tile view afterward. None (the default) or
+        a threshold missing from this dict falls back to computing that
+        threshold's tile view directly here.
+    """
     # Population columns are a hard init-time requirement, not optional data:
-    # a country missing one means that country's base layer needs
-    # `--type patch --columns <col>`, an operational data-completeness
-    # problem, not something this function should silently route around by
-    # defaulting E_<col> to NaN for every tile (and then to 0 once aggregated
-    # to admin level). Fail loudly and immediately, matching
-    # create_tracks_view_from_envelopes()'s existing precedent for
-    # adolescent_population: for wind this propagates to the per-country
-    # try/except in run_complete_impact_analysis() (correctly failing that
-    # one country while the rest of the batch continues); for gust it's
-    # caught by that call's own dedicated try/except and logged at warning
-    # level, isolated from wind as already designed.
+    # a country missing one needs `--type patch --columns <col>`, not a silent
+    # E_<col> NaN default (0 once aggregated to admin level). Fail loudly, same
+    # handling as create_mercator_view_from_envelopes()'s identical check above.
     _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
     if _missing_pop_cols:
         raise ValueError(
@@ -2462,49 +1864,69 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, th
     wind_views = {}
     num_ensembles = FULL_ENSEMBLE_SIZE
     wind_ths = list(gdf_envelopes[threshold_column].unique())
+
+    # Canonical per-tile-per-member coverage bitmask, computed ONCE per threshold
+    # in gdf_envelopes; see create_mercator_view_from_envelopes()'s identical
+    # comment for the full "why" (shared reprojection cost, OOM risk if
+    # recomputed independently by each caller). Tile-level probability only;
+    # aggregation up to admin regions (area-mean) happens further down,
+    # unchanged (see the NOTE after calculate_tile_member_bitmask()'s own
+    # module-level comment for why an admin-region-level bitmask is wrong here).
+    if bitmask_views is None:
+        bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
+                                                       threshold_column=threshold_column,
+                                                       label='admin tile')
+
+    # Admin IDs must be present in gdf_tiles (added during initialization or on
+    # load). Checked once, and the tile_id -> admin id mapping built once here,
+    # since gdf_tiles is never reassigned inside the loop below: rebuilding the
+    # same dict once per wind_th would repeat identical work, the same
+    # redundancy the bitmask_views hoist above already avoids.
+    if 'id' not in gdf_tiles.columns:
+        raise ValueError(
+            "Mercator view missing admin IDs."
+            "Admin IDs are added during initialization. "
+            "Re-initialize the country or check the mercator view file."
+        )
+    id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
+
+    # Built ONCE and reused across every wind_th below, `_view` reset before
+    # each reuse: same rationale as the id_mapping hoist above (gdf_tiles never
+    # reassigned inside the loop); see create_school_view_from_envelopes()'s
+    # comment for the GeometryBasedZonalViewGenerator construction cost itself.
+    tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
         if not gdf_envelopes_wth.empty:
-            tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
-            try:
-                # Use tiles-left, envelopes-right sjoin (same direction as
-                # create_tracks_view_from_envelopes) so boundary tiles are
-                # treated identically in the probability raster and per-member
-                # track view. Reversing the join direction (envelopes-left,
-                # tiles-right) reprojects the CRS the opposite way, which can
-                # cause borderline tiles to be included in one view but
-                # excluded from the other.
-                tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
-                envs_geom = gdf_envelopes_wth[['geometry']].copy()
-                if tiles_geom.crs != envs_geom.crs:
-                    tiles_geom = tiles_geom.to_crs(envs_geom.crs)
-                joined = gpd.sjoin(tiles_geom, envs_geom, how='inner', predicate='intersects')
-                tile_counts = joined.groupby('tile_id').size()
-                all_tile_ids = gdf_tiles['tile_id']
-                probs = {tid: int(tile_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
-            except Exception as e:
-                logger.warning(f"map_polygons failed for {threshold_column}, defaulting probabilities to 0: {e}")
-                probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
-            tiles_viewer.add_variable_to_view(probs, 'probability')
-
-            df_view = tiles_viewer.to_dataframe()
-            for col in data_cols:
-                if col in df_view.columns:
-                    df_view[f"E_{col}"] = df_view[col] * df_view['probability']
+            # Admin level 1 reuse: precomputed_tile_views holds the sibling
+            # mercator call's already-computed per-tile probability/E_* DataFrame
+            # for this exact threshold. When present, skip the bitmask-to-
+            # probability derivation and tiles_viewer rebuild below (see this
+            # function's own docstring). Copied, not used directly, since the
+            # caller still saves this same DataFrame as the mercator tile view.
+            tile_view_th = precomputed_tile_views.get(int(wind_th)) if precomputed_tile_views is not None else None
+            if tile_view_th is not None:
+                df_view = tile_view_th.copy()
+            else:
+                tiles_viewer._view = None
+                bm_df = bitmask_views.get(int(wind_th))
+                if bm_df is None:
+                    logger.warning(f"tile_member_bitmask FAILED for {threshold_column}={wind_th}, defaulting probabilities to 0")
+                    probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
                 else:
-                    df_view[f"E_{col}"] = np.nan
-                    logger.debug(f"Column '{col}' missing from tile data, E_{col} set to NaN (re-initialize country to populate)")
+                    probs = _tile_probability_from_bitmask(bm_df, gdf_tiles['tile_id'], float(num_ensembles))
+                tiles_viewer.add_variable_to_view(probs, 'probability')
 
-            df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
-            
-            # Admin IDs must be present in gdf_tiles (added during initialization or on load)
-            if 'id' not in gdf_tiles.columns:
-                raise ValueError(
-                    "Mercator view missing admin IDs."
-                    "Admin IDs are added during initialization. "
-                    "Re-initialize the country or check the mercator view file."
-                )
-            
+                df_view = tiles_viewer.to_dataframe()
+                for col in data_cols:
+                    if col in df_view.columns:
+                        df_view[f"E_{col}"] = df_view[col] * df_view['probability']
+                    else:
+                        df_view[f"E_{col}"] = np.nan
+                        logger.debug(f"Column '{col}' missing from tile data, E_{col} set to NaN (re-initialize country to populate)")
+
+                df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
+
             # Check if 'id' column is already present in df_view (from to_dataframe())
             # If not, we need to reset index and map from zone_id to id
             if 'id' not in df_view.columns:
@@ -2522,8 +1944,7 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, th
                     else:
                         df_view = df_view.reset_index(names=['zone_id'])
                 
-                # Map zone_id (tile_id) to admin id
-                id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
+                # Map zone_id (tile_id) to admin id (id_mapping built once above the loop)
                 df_view['id'] = df_view['zone_id'].map(lambda x: id_mapping.get(x, x))
                 # Drop zone_id column since we don't need it after mapping to admin IDs
                 df_view = df_view.drop(columns=['zone_id'], errors='ignore')
@@ -2562,8 +1983,24 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, th
     return wind_views
 
 
-def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=None, gdf_wash=None, threshold_column='wind_threshold'):
-    """Create tracks impact views from envelopes"""
+def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member',
+                                       gdf_shelters=None, gdf_wash=None, threshold_column='wind_threshold', bitmask_views=None,
+                                       schools_buff=None, hcs_buff=None, shelters_buff=None, wash_buff=None):
+    """
+    Create tracks impact views from envelopes.
+
+    schools_buff/hcs_buff/shelters_buff/wash_buff are each an optional
+    already-buffered version of the correspondingly-named gdf_* argument (see
+    _precompute_facility_buffer()'s own docstring): create_views_from_
+    envelopes_in_country() computes each of these once per facility type and
+    passes the same buffer into both this function and its own sibling
+    create_school_view_from_envelopes()/create_health_center_view_from_
+    envelopes()/create_shelter_view_from_envelopes()/create_wash_view_from_
+    envelopes() calls (for both wind and, when present, gust), instead of
+    every one of those calls independently re-running buffer_geodataframe()
+    on the exact same input. None (the default for each) computes it here
+    exactly as before, for any caller that doesn't have one handy.
+    """
     wind_views = {}
 
     # Buffer facility points and use predicate='intersects', matching every
@@ -2573,19 +2010,52 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
     # default the siblings rely on, so without this a facility near an envelope
     # boundary could be counted impacted in school_views/hc_views but not here,
     # producing internally-inconsistent severity numbers for the same run.
-    gdf_schools_buff = (buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
-                        if gdf_schools is not None and not gdf_schools.empty else gdf_schools)
-    # Filtered the same way create_health_center_view_from_envelopes filters gdf_hcs,
-    # so severity_hcs agrees with hc_views' own num_hcs for the same run.
-    gdf_hcs_filtered = _filter_hcs_to_relevant_types(gdf_hcs)
-    gdf_hcs_buff = (buffer_geodataframe(gdf_hcs_filtered, buffer_distance_meters=BUFFER_DISTANCE_METERS)
-                    if gdf_hcs_filtered is not None and not gdf_hcs_filtered.empty else gdf_hcs_filtered)
-    gdf_shelters_buff = (buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
-                        if gdf_shelters is not None and not gdf_shelters.empty else gdf_shelters)
-    gdf_wash_buff = (buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
-                     if gdf_wash is not None and not gdf_wash.empty else gdf_wash)
+    if schools_buff is not None:
+        gdf_schools_buff = schools_buff
+    else:
+        gdf_schools_buff = (buffer_geodataframe(gdf_schools, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+                            if gdf_schools is not None and not gdf_schools.empty else gdf_schools)
+    if hcs_buff is not None:
+        gdf_hcs_buff = hcs_buff
+    else:
+        # Filtered the same way create_health_center_view_from_envelopes filters gdf_hcs,
+        # so severity_hcs agrees with hc_views' own num_hcs for the same run.
+        gdf_hcs_filtered = _filter_hcs_to_relevant_types(gdf_hcs)
+        gdf_hcs_buff = (buffer_geodataframe(gdf_hcs_filtered, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+                        if gdf_hcs_filtered is not None and not gdf_hcs_filtered.empty else gdf_hcs_filtered)
+    if shelters_buff is not None:
+        gdf_shelters_buff = shelters_buff
+    else:
+        gdf_shelters_buff = (buffer_geodataframe(gdf_shelters, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+                            if gdf_shelters is not None and not gdf_shelters.empty else gdf_shelters)
+    if wash_buff is not None:
+        gdf_wash_buff = wash_buff
+    else:
+        gdf_wash_buff = (buffer_geodataframe(gdf_wash, buffer_distance_meters=BUFFER_DISTANCE_METERS)
+                         if gdf_wash is not None and not gdf_wash.empty else gdf_wash)
+
+    if "adolescent_population" not in gdf_tiles.columns:
+        raise ValueError(
+            "gdf_tiles is missing 'adolescent_population', run "
+            "'--type patch --columns adolescent_population' for this country "
+            "before track severity views can be computed."
+        )
+    tile_value_columns = ["population", "school_age_population", "infant_population",
+                           "built_surface_m2", "adolescent_population"]
+    tile_values = gdf_tiles[['tile_id'] + tile_value_columns]
 
     wind_ths = list(gdf_envelopes[threshold_column].unique())
+
+    # Canonical per-tile-per-member coverage bitmask, computed ONCE per threshold;
+    # see create_mercator_view_from_envelopes()'s identical comment on this
+    # bitmask_views parameter for the full "why". Each member's own rasterize
+    # call is naturally bounded to its own envelope extent, so no separate
+    # tile-narrowing step is needed here.
+    if bitmask_views is None:
+        bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
+                                                       threshold_column=threshold_column,
+                                                       label='tracks tile')
+
     for wind_th in wind_ths:
         gdf_envelopes_wth = gdf_envelopes[gdf_envelopes[threshold_column] == int(wind_th)]
 
@@ -2612,33 +2082,34 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         else:
             tracks_viewer.add_variable_to_view(tracks_viewer.map_points(points=gdf_wash_buff, predicate='intersects'), "severity_num_wash")
 
-        if "adolescent_population" not in gdf_tiles.columns:
-            raise ValueError(
-                "gdf_tiles is missing 'adolescent_population', run "
-                "'--type patch --columns adolescent_population' for this country "
-                "before track severity views can be computed."
-            )
-        tile_value_columns = ["population", "school_age_population", "infant_population",
-                               "built_surface_m2", "adolescent_population"]
-        _zero_members = {m: 0.0 for m in gdf_envelopes_wth[index_column].unique()}
-        try:
-            # gigaspatial's aggregate_polygons_to_zones() raises a bare
-            # KeyError from inside map_polygons() itself (not something a
-            # try/except around the CALL's return value can catch, since it
-            # crashes before returning) when the spatial join finds zero
-            # tile/envelope intersections at all: no tile falls within ANY
-            # ensemble member's envelope ring for this wind threshold, a
-            # real, reproducible case for high thresholds (e.g. 137kt) on a
-            # storm/date where few or no members reach that speed over land.
-            # That's a genuine "zero severity for every member" case (not
-            # missing data), so catch it here and default to 0.0 for every
-            # value column/member, matching the same try/except + 0.0
-            # fallback pattern create_mercator_view_from_envelopes() already
-            # uses for its own analogous zero-intersection risk.
-            overlays = tracks_viewer.map_polygons(polygons=gdf_tiles, value_columns=tile_value_columns, aggregation="sum")
-        except KeyError as e:
-            logger.warning(f"map_polygons found no tile/envelope intersections for {threshold_column}={wind_th}, defaulting severity to 0: {e}")
+        members_present = gdf_envelopes_wth[index_column].unique()
+        _zero_members = {m: 0.0 for m in members_present}
+
+        # Per-member SUM over tiles covered by that member's own envelope,
+        # derived from the same canonical bitmask create_mercator_view_
+        # from_envelopes()/create_admin_view_from_envelopes_new() also use. A
+        # member with zero tile coverage gets NaN, not 0.0 (matching the old
+        # gpd.sjoin-based aggregate_polygons_to_zones()'s "no matching rows" ->
+        # NaN fill for "sum"); only a threshold with ZERO tiles covered by every
+        # member falls back to 0.0 for all (bm_df.empty or a rasterize failure).
+        bm_df = bitmask_views.get(int(wind_th))
+        if bm_df is None:
+            logger.warning(f"tile_member_bitmask FAILED for {threshold_column}={wind_th}, defaulting severity to 0")
             overlays = {col: dict(_zero_members) for col in tile_value_columns}
+        elif bm_df.empty:
+            overlays = {col: dict(_zero_members) for col in tile_value_columns}
+        else:
+            merged = tile_values.merge(bm_df, on='tile_id', how='inner')
+            bits = merged['bits'].to_numpy()
+            overlays = {}
+            for col in tile_value_columns:
+                vals = merged[col].to_numpy(dtype=float)
+                col_sums = {}
+                for m in members_present:
+                    bitpos = np.uint64(1) << np.uint64(int(m) - 1)
+                    covered = (bits & bitpos) != 0
+                    col_sums[m] = float(np.nansum(vals[covered])) if covered.any() else float('nan')
+                overlays[col] = col_sums
         tracks_viewer.add_variable_to_view(overlays.get('population', _zero_members), "severity_population")
         tracks_viewer.add_variable_to_view(overlays.get('adolescent_population', _zero_members), "severity_adolescent_population")
         tracks_viewer.add_variable_to_view(overlays.get('school_age_population', _zero_members), "severity_school_age_population")
@@ -2651,291 +2122,23 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
     return wind_views
 
 
-# =============================================================================
-# FACILITY VIEW PERSISTENCE
-# Save / load / existence-check functions for per-facility location caches
-# (written once at --type initialize) and per-storm impact views (written on
-# every --type update). Grouped by facility type: schools, HCs, shelters, WASH.
-# =============================================================================
-def save_school_view(gdf, country, storm, date, wind_th, dataset='wind'):
-    """
-    Save per-facility school impact view for a specific storm, date, and wind threshold.
-
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
-    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own school_views_gust/ dir).
-    The separate directory + 'g' prefix keep gust files structurally distinct
-    from wind (avoids collision with wind thresholds of the same numeric value,
-    and with any path-pattern-based downstream classification of school_views/).
-
-    Note: This is distinct from the location cache (<COUNTRY>_schools.parquet).
-    The impact view has one row per school with a 'probability' column; the
-    location cache has full school metadata (education_level, etc.). Join on
-    school_id_giga to combine them.
-
-    Args:
-        gdf: GeoDataFrame with per-school impact data (zone_id + probability)
-        country: ISO3 country code
-        storm: Storm name
-        date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Threshold value (knots for wind, m/s for gust)
-        dataset: 'wind' (default) or 'gust'
-    """
-    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
-        gdf = gdf.copy()
-        gdf['zone_id'] = gdf['zone_id'].astype(str)
-    dir_name = 'school_views_gust' if dataset == 'gust' else 'school_views'
-    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
-    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
-
-def save_school_locations(gdf, country):
-    """
-    Save school locations to cache.
-    
-    Args:
-        gdf: GeoDataFrame containing school locations
-        country: ISO3 country code
-    """
-    file_name = f"{country}_schools.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
-
-def load_school_locations(country):
-    """
-    Load cached school locations.
-    
-    Args:
-        country: ISO3 country code
-    
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing cached school locations
-    """
-    file_name = f"{country}_schools.parquet"
-    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name), data_store)
-
-def school_exist(country):
-    """
-    Check if cached school locations exist for a country.
-    
-    Args:
-        country: ISO3 country code
-    
-    Returns:
-        bool: True if cached school data exists, False otherwise
-    """
-    file_name = f"{country}_schools.parquet"
-    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views', file_name))
-
-
-def save_hc_view(gdf, country, storm, date, wind_th, dataset='wind'):
-    """
-    Save per-facility health center impact view for a specific storm, date, and wind threshold.
-
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
-    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own hc_views_gust/ dir).
-
-    Note: This is distinct from the location cache (<COUNTRY>_health_centers.parquet).
-    The impact view has one row per facility with a 'probability' column; the
-    location cache has full facility metadata including the 'amenity' column.
-    Join on osm_id to combine them, or filter the impact view directly by
-    'amenity', only HC_FACILITY_TYPES values will be present since filtering
-    happens before the impact views are written.
-
-    Args:
-        gdf: GeoDataFrame with per-facility impact data (zone_id + probability)
-        country: ISO3 country code
-        storm: Storm name
-        date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Threshold value (knots for wind, m/s for gust)
-        dataset: 'wind' (default) or 'gust'
-    """
-    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
-        gdf = gdf.copy()
-        gdf['zone_id'] = gdf['zone_id'].astype(str)
-    dir_name = 'hc_views_gust' if dataset == 'gust' else 'hc_views'
-    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
-    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
-
-def save_hc_locations(gdf, country):
-    """
-    Save health center locations to cache.
-    
-    Args:
-        gdf: GeoDataFrame containing health center locations
-        country: ISO3 country code
-    """
-    file_name = f"{country}_health_centers.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
-
-def load_hc_locations(country):
-    """
-    Load cached health center locations.
-    
-    Args:
-        country: ISO3 country code
-    
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing cached health center locations
-    """
-    file_name = f"{country}_health_centers.parquet"
-    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name), data_store)
-
-def hc_exist(country):
-    """
-    Check if cached health center locations exist for a country.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        bool: True if cached health center data exists, False otherwise
-    """
-    file_name = f"{country}_health_centers.parquet"
-    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views', file_name))
-
-
-def save_shelter_view(gdf, country, storm, date, wind_th, dataset='wind'):
-    """
-    Save per-facility shelter impact view for a specific storm, date, and wind threshold.
-
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
-    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own shelter_views_gust/ dir).
-
-    Note: This is distinct from the location cache (<COUNTRY>_shelters.parquet).
-    The impact view has one row per shelter with a 'probability' column; the
-    location cache has full shelter metadata (shelter_type, capacity, etc.).
-
-    Args:
-        gdf: GeoDataFrame with per-shelter impact data (zone_id + probability)
-        country: ISO3 country code
-        storm: Storm name
-        date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Threshold value (knots for wind, m/s for gust)
-        dataset: 'wind' (default) or 'gust'
-    """
-    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
-        gdf = gdf.copy()
-        gdf['zone_id'] = gdf['zone_id'].astype(str)
-    dir_name = 'shelter_views_gust' if dataset == 'gust' else 'shelter_views'
-    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
-    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
-
-def save_shelter_locations(gdf, country):
-    """
-    Save shelter locations to cache.
-
-    Args:
-        gdf: GeoDataFrame containing shelter locations
-        country: ISO3 country code
-    """
-    file_name = f"{country}_shelters.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
-
-def load_shelter_locations(country):
-    """
-    Load cached shelter locations.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing cached shelter locations
-    """
-    file_name = f"{country}_shelters.parquet"
-    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name), data_store)
-
-def shelter_exist(country):
-    """
-    Check if cached shelter locations exist for a country.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        bool: True if cached shelter data exists, False otherwise
-    """
-    file_name = f"{country}_shelters.parquet"
-    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views', file_name))
-
-
-def save_wash_view(gdf, country, storm, date, wind_th, dataset='wind'):
-    """
-    Save per-facility WASH impact view for a specific storm, date, and wind threshold.
-
-    File name pattern: <COUNTRY>_<STORM>_<DATE>_<WINDTH>.parquet (wind) or
-    <COUNTRY>_<STORM>_<DATE>_g<GUSTTH>.parquet (gust, own wash_views_gust/ dir).
-
-    Note: This is distinct from the location cache (<COUNTRY>_wash.parquet).
-    The impact view has one row per WASH facility with a 'probability' column; the
-    location cache has full facility metadata (wash_type, name, etc.).
-
-    Args:
-        gdf: GeoDataFrame with per-facility impact data (zone_id + probability)
-        country: ISO3 country code
-        storm: Storm name
-        date: Forecast date in YYYYMMDDHHMMSS format
-        wind_th: Threshold value (knots for wind, m/s for gust)
-        dataset: 'wind' (default) or 'gust'
-    """
-    if 'zone_id' in gdf.columns and gdf['zone_id'].dtype != object:
-        gdf = gdf.copy()
-        gdf['zone_id'] = gdf['zone_id'].astype(str)
-    dir_name = 'wash_views_gust' if dataset == 'gust' else 'wash_views'
-    th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
-    file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
-
-def save_wash_locations(gdf, country):
-    """
-    Save WASH facility locations to cache.
-
-    Args:
-        gdf: GeoDataFrame containing WASH facility locations
-        country: ISO3 country code
-    """
-    file_name = f"{country}_wash.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
-
-def load_wash_locations(country):
-    """
-    Load cached WASH facility locations.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        gpd.GeoDataFrame: GeoDataFrame containing cached WASH facility locations
-    """
-    file_name = f"{country}_wash.parquet"
-    return read_dataset(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name), data_store)
-
-def wash_exist(country):
-    """
-    Check if cached WASH facility locations exist for a country.
-
-    Args:
-        country: ISO3 country code
-
-    Returns:
-        bool: True if cached WASH data exists, False otherwise
-    """
-    file_name = f"{country}_wash.parquet"
-    return data_store.file_exists(os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views', file_name))
-
 
 # =============================================================================
 # ADMIN COUNTRY LAYER
-# Logically part of Base Layer Initialization but placed here for historical
-# reasons. Mirrors create_mercator_country_layer but aggregates at admin level N.
+# Logically part of Base Layer Initialization. Mirrors create_mercator_country_layer
+# but aggregates at admin level N.
 # =============================================================================
-def create_admin_country_layer(country, rewrite=0, admin_level=1):
+def create_admin_country_layer(country, rewrite=0, admin_level=1, fast_fail=False):
     """
     Create an admin-level layer with demographic and infrastructure data for a country.
 
     Fallback used during `--type update` when the base admin parquet is missing. Produces
     one row per admin boundary with all data columns aggregated to that level.
     Applies the same data requirements as create_mercator_country_layer():
+
+    fast_fail: forwarded to fetch_shelters()/fetch_wash() (see their own docstrings and
+        create_mercator_country_layer()'s own fast_fail note). Defaults to the patient
+        behavior; the `--type update` fallback caller passes True.
 
     Data requirements: **hard failures** (aborts if unavailable):
         - Total population (WorldPop 1km)
@@ -2963,10 +2166,10 @@ def create_admin_country_layer(country, rewrite=0, admin_level=1):
                          infrastructure columns. 'zone_id' renamed to 'tile_id'.
     """
     # Fetch facility locations: custom data priority handled inside fetch_*
-    gdf_schools = fetch_schools(country, rewrite)
-    gdf_hcs = fetch_health_centers(country, rewrite)
-    gdf_shelters = fetch_shelters(country, rewrite)
-    gdf_wash = fetch_wash(country, rewrite)
+    gdf_schools = fetch_schools(country, rewrite, fast_fail=fast_fail)
+    gdf_hcs = fetch_health_centers(country, rewrite, fast_fail=fast_fail)
+    gdf_shelters = fetch_shelters(country, rewrite, fast_fail=fast_fail)
+    gdf_wash = fetch_wash(country, rewrite, fast_fail=fast_fail)
 
     # Note: AdminBoundariesViewGenerator uses admin boundary IDs (not quadkeys), so
     # custom tile-level CSVs (population_z<N>, built_surface_z<N>, etc.) do not apply here.
@@ -3035,8 +2238,11 @@ def create_admin_country_layer(country, rewrite=0, admin_level=1):
         )
 
     # Derive smod_class_l1
+    # tiles_viewer.view's own DataFrame index is a positional RangeIndex, not zone_id
+    # (zone_id is a regular column); must re-key by zone_id before .map()/.to_dict(),
+    # since add_variable_to_view() joins the resulting dict by zone_id.
     try:
-        smod_l2 = tiles_viewer.view['smod_class']
+        smod_l2 = tiles_viewer.view.set_index('zone_id')['smod_class']
         smod_l1 = smod_l2.map(SMOD_L2_TO_L1)
         tiles_viewer.add_variable_to_view(smod_l1.to_dict(), 'smod_class_l1')
     except Exception as e:
@@ -3121,303 +2327,35 @@ def save_admin_views(countries, rewrite=0, admin_level=1):
         view = create_admin_country_layer(country, rewrite, admin_level=admin_level)
         save_admin_view(view, country, admin_level=admin_level)
 
-# =============================================================================
-# PRECIPITATION/RUNOFF VIEWS
-# Storm-independent: tp exceedance-probability tiers and the ro/tp ratio's own
-# exceedance-probability tiers, both raster-sampled per tile via centroid-
-# based point sampling (TifProcessor.sample_by_coordinates()) rather than the
-# polygon sjoin wind/gust use or map_rasters()'s polygon-based zonal stats
-# Called from run_precip_analysis() once per --type update run, not once per storm.
-# =============================================================================
 
-@contextlib.contextmanager
-def grid_to_geotiff_to_tifprocessor(grid_2d, lat_min, lat_max, lon_min, lon_max):
+
+def project_tiles_for_facility_assignment(gdf_tiles):
     """
-    Materialize a probability grid as a temp GeoTIFF and wrap it in a
-    TifProcessor, ready for centroid-based sampling via
-    create_precip_tile_view(). Written to a local temp file regardless of
-    DATA_PIPELINE_DB (ephemeral intermediate, never needs to persist). A
-    context manager, not a plain function: TifProcessor reads the underlying
-    file lazily on each call (rasterio.open() inside
-    sample_by_coordinates()), not eagerly at construction, so the temp file
-    must stay alive for the `with` block's duration and is only deleted on
-    exit, not immediately after construction.
-
-    Usage:
-        with grid_to_geotiff_to_tifprocessor(grid, *bounds) as tif:
-            view = create_precip_tile_view(gdf_tiles, tif)
-    """
-    from precip_utils import grid_to_geotiff  # local import: avoids a module-load-order
-                                               # dependency between precip_utils and impact_analysis
-    tmp_path = tempfile.NamedTemporaryFile(suffix='.tif', delete=False).name
-    try:
-        grid_to_geotiff(grid_2d, lat_min, lat_max, lon_min, lon_max, tmp_path)
-        yield TifProcessor(dataset_path=tmp_path, data_store=LocalDataStore())
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
-def create_precip_tile_view(gdf_tiles, tif_processor):
-    """
-    Sample a precip/ratio probability raster onto mercator tiles.
-
-    Uses each tile's centroid, not map_rasters()'s polygon-based zonal mean:
-    the precip grid's own cells (~0.25 degrees) are far coarser than a
-    zoom-14 mercator tile, so a tile's tiny polygon usually doesn't contain
-    the enclosing raster cell's pixel-center point, which is what
-    TifProcessor.sample_by_polygons() (rasterio.mask.mask with the default
-    all_touched=False, and no all_touched override exposed) requires to
-    count any pixel as "inside" the polygon.
+    Reproject gdf_tiles (tile_id + geometry only) to ESRI:54009 once, exposed
+    so callers OUTSIDE this module (main_pipeline.py's own per-country river
+    loop) can build it ONCE per country and pass it into every
+    assign_facilities_to_tiles() call for that country via that function's
+    own `tiles_proj` param, instead of each call (up to 4 per country - one
+    per facility type: schools/health centers/shelters/WASH) independently
+    reprojecting the identical, unchanging whole-country tile grid whenever
+    that call happens to have any unmatched (border/coastal) facility. Same
+    "build once, reuse many" convention as build_tiles_viewer() above (see
+    that function's own docstring for the full "why" of avoiding this kind
+    of repeated per-call reconstruction).
 
     Args:
-        gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()).
-        tif_processor: TifProcessor wrapping a GeoTIFF probability grid
-            (from precip_utils.grid_to_geotiff()).
+        gdf_tiles: GeoDataFrame of mercator tiles (tile_id + geometry).
 
     Returns:
-        DataFrame with one row per tile: 'zone_id' (tile_id), 'probability',
-        the full 'E_<col>' breakdown for every data_cols entry (E_population,
-        E_school_age_population, E_infant_population, E_adolescent_population,
-        E_built_surface_m2, E_smod_class, E_smod_class_l1, E_rwi, E_num_schools,
-        E_num_hcs, E_num_shelters, E_num_wash: probability * <col>, the exact
-        same loop-then-drop pattern wind/gust/river-flood's own tile views
-        use, see create_mercator_view_from_envelopes()), 'native_cell_row'/
-        'native_cell_col' (which precip grid cell this tile's centroid falls
-        in; makes the tile-to-native-cell relationship explicit and
-        queryable, e.g. "which other tiles share my native cell", rather than
-        only true by coincidence of deterministic point-sampling, which
-        already guarantees two tiles in the same cell get an identical
-        probability today, this just makes that fact visible without needing
-        to recompute the point-in-raster math from scratch). No raw
-        moderate_poverty_prob/severe_poverty_prob: always hazard-independent,
-        sourced from the base mercator parquet only, never carried per-hazard
-        here (matches create_precip_admin_view()'s own already-clean shape).
+        GeoDataFrame: gdf_tiles[['tile_id', 'geometry']] reprojected to
+            ESRI:54009 - byte-identical to what assign_facilities_to_tiles()
+            would build internally for the same gdf_tiles when no
+            `tiles_proj` is passed in.
     """
-    tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
-    try:
-        # Centroid-on-geographic-CRS distortion is negligible at zoom-14 tile
-        # scale (well under the ~0.25 degree precip grid resolution), so the
-        # geopandas warning here is expected and safe to suppress, not a sign
-        # of an actual precision problem worth reprojecting for.
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', message='Geometry is in a geographic CRS')
-            centroids = gdf_tiles.geometry.centroid
-        coords = list(zip(centroids.x, centroids.y))
-        values = tif_processor.sample_by_coordinates(coords)
-        probs = dict(zip(gdf_tiles['tile_id'], values))
-
-        # Native grid cell each tile's centroid falls in
-        # against the GeoTIFF's own already-correct (half-cell-expanded)
-        # bounds, not a second raster read.
-        bounds = tif_processor.bounds
-        dlon = (bounds.right - bounds.left) / tif_processor.width
-        dlat = (bounds.top - bounds.bottom) / tif_processor.height
-        # Clamped to the valid pixel range: a tile centroid sitting exactly on
-        # (or within floating-point epsilon of) the raster's outer edge would
-        # otherwise produce an out-of-range index (e.g. col == width at the
-        # right edge, valid columns are 0..width-1).
-        native_rows = {tid: min(int((bounds.top - y) / dlat), tif_processor.height - 1)
-                       for tid, y in zip(gdf_tiles['tile_id'], centroids.y)}
-        native_cols = {tid: min(int((x - bounds.left) / dlon), tif_processor.width - 1)
-                       for tid, x in zip(gdf_tiles['tile_id'], centroids.x)}
-    except Exception as e:
-        logger.warning(f"sample_by_coordinates failed for precip tile view, defaulting probabilities to 0: {e}")
-        probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
-        native_rows = native_cols = {k: None for k in tiles_viewer.view['zone_id'].unique()}
-    tiles_viewer.add_variable_to_view(probs, 'probability')
-    tiles_viewer.add_variable_to_view(native_rows, 'native_cell_row')
-    tiles_viewer.add_variable_to_view(native_cols, 'native_cell_col')
-
-    df_view = tiles_viewer.to_dataframe()
-    # Weight every data_cols column (school_age_population, infant_population,
-    # adolescent_population, built_surface_m2, smod_class, smod_class_l1, rwi,
-    # num_schools, num_hcs, num_shelters, num_wash, population, ...) by
-    # 'probability' to produce its E_* equivalent, using the same loop-then-drop
-    # pattern as wind's own create_mercator_view_from_envelopes() (this file,
-    # ~line 2325), so precip's E_* breakdown is complete and consistent with
-    # every other hazard rather than leaving raw/unweighted columns that merely
-    # duplicate the base mercator parquet.
-    for col in data_cols:
-        if col in df_view.columns:
-            df_view[f"E_{col}"] = df_view[col] * df_view['probability']
-        else:
-            df_view[f"E_{col}"] = np.nan
-            logger.debug(f"Column '{col}' missing from tile data, E_{col} set to NaN")
-    df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
-
-    # moderate_poverty_prob/severe_poverty_prob are dropped entirely rather than
-    # E_-weighted or passed through: these are always hazard-independent, sourced
-    # raw from the base table only (matches _EXPOSURE_E_PROP_MAP's own exclusion
-    # principle in the dashboard). They are not part of data_cols, so the loop
-    # above never touches them, and create_precip_admin_view() never carries
-    # them either, so dropping them here keeps precip consistent with the other
-    # hazard views.
-    df_view = df_view.drop(columns=[c for c in ('moderate_poverty_prob', 'severe_poverty_prob')
-                                     if c in df_view.columns])
-
-    if 'zone_id' not in df_view.columns:
-        if df_view.index.name:
-            df_view = df_view.reset_index()
-            first_col = df_view.columns[0]
-            if first_col != 'zone_id':
-                df_view = df_view.rename(columns={first_col: 'zone_id'})
-        else:
-            df_view = df_view.reset_index(names=['zone_id'])
-
-    return df_view
+    return gdf_tiles[['tile_id', 'geometry']].to_crs("ESRI:54009")
 
 
-def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_max, lon_min, lon_max):
-    """
-    Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask for one
-    (threshold_mm, window_h) combination of rainfall exceedance (bit `m-1`
-    set <=> member `m`'s accumulated rainfall exceeds threshold_mm at that
-    tile's own native precip-grid cell). Same shape/purpose as Wind's own
-    calculate_tile_member_bitmask() and River's own
-    calculate_river_tile_member_bitmask() (see those functions' own
-    docstrings) -- exists to move a live, per-request dashboard decode into
-    a real pipeline output, not because that live decode was wrong.
-
-    Unlike River (a genuine point-in-polygon sjoin against real flooded
-    pixels) rain's own precip grid (~0.25 degrees) is far coarser than a
-    z14 tile, so this reuses the exact same centroid-to-native-cell mapping
-    create_precip_tile_view() already computes for its own probability
-    sampling (bounds/dlon/dlat/native_row/native_col, see that function's
-    own comment for the "why" of centroid sampling over polygon zonal
-    stats) -- NOT a new sjoin. Every tile whose centroid falls in the same
-    native cell shares the exact same bitmask value, by construction, same
-    as they already share the same probability value today.
-
-    Args:
-        gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()).
-        bitmask_grid: (n_lat, n_lon) uint64 array from precip_utils.
-            exceedance_bitmask(), same shape/orientation as the raw
-            period_grid it was derived from (row 0 = lat_max, matching
-            read_precip_window()'s own north-at-row-0 convention).
-        lat_min, lat_max, lon_min, lon_max: bitmask_grid's own real geo
-            bounds, the same 4 values read_precip_window() returns
-            alongside period_grid itself.
-
-    Returns:
-        DataFrame with columns ['tile_id' (string), 'bits' (uint64)], sparse
-        (only tiles whose native cell has >=1 member exceeding threshold_mm
-        get a row) -- same convention Wind/River's own bitmask functions
-        use, and the same "real, common outcome" contract for an
-        all-zero/empty result (no flooding-equivalent case here, this
-        mirrors an all-below-threshold cycle, not an error).
-    """
-    n_lat, n_lon = bitmask_grid.shape
-    # EXACT same dlat/dlon + half-cell bounds expansion grid_to_geotiff()
-    # (this file's own module, precip_utils.py) uses to build the GeoTIFF
-    # create_precip_tile_view() actually samples from. lat_min/lat_max/
-    # lon_min/lon_max are OUTERMOST GRID POINT (pixel-center) coordinates,
-    # NOT already the raster's own edge bounds: grid_to_geotiff() divides
-    # by (n-1) intervals between points (not n), then expands the sampled
-    # bounds by half a cell on every side before calling rasterio.transform.
-    # from_bounds(), so tif_processor.bounds (what create_precip_tile_view()
-    # actually reads) is systematically half a cell wider than the raw
-    # min/max on each side. An earlier version of this function divided by
-    # n (not n-1) and skipped the half-cell expansion entirely -- a real bug
-    # that silently mis-assigned a real fraction of tiles to the wrong
-    # native cell, since it re-derived a parallel formula instead of
-    # replicating grid_to_geotiff()'s own real math.
-    # This must stay byte-for-byte consistent with that function, not an
-    # independently-plausible-looking approximation.
-    dlat = (lat_max - lat_min) / (n_lat - 1) if n_lat > 1 else 0.0
-    dlon = (lon_max - lon_min) / (n_lon - 1) if n_lon > 1 else 0.0
-    top = lat_max + dlat / 2
-    left = lon_min - dlon / 2
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='Geometry is in a geographic CRS')
-        centroids = gdf_tiles.geometry.centroid
-    cy, cx = centroids.y.to_numpy(), centroids.x.to_numpy()
-    # Same clamped-to-valid-range row/col math create_precip_tile_view()
-    # already uses (a tile centroid sitting exactly on the grid's outer
-    # edge would otherwise produce an out-of-range index). dlat/dlon == 0
-    # only in the degenerate n_lat==1/n_lon==1 case (grid_to_geotiff()'s
-    # own same guard), every tile centroid maps to the single row/col.
-    rows = (np.clip(((top - cy) / dlat).astype(np.int64), 0, n_lat - 1)
-            if dlat else np.zeros(len(cy), dtype=np.int64))
-    cols = (np.clip(((cx - left) / dlon).astype(np.int64), 0, n_lon - 1)
-            if dlon else np.zeros(len(cx), dtype=np.int64))
-    tile_bits = bitmask_grid[rows, cols]
-    tile_ids = gdf_tiles['tile_id'].to_numpy()
-
-    nonzero = tile_bits != 0
-    if not nonzero.any():
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-    return pd.DataFrame({
-        'tile_id': pd.array(tile_ids[nonzero].astype(str), dtype='string'),
-        'bits': tile_bits[nonzero],
-    })
-
-
-def create_precip_admin_view(gdf_admin, gdf_tiles, tif_processor):
-    """
-    Admin-level equivalent of create_precip_tile_view(): tile-level probability
-    and the full E_* breakdown, then aggregated via groupby('id'), the exact
-    same sum(E_*)/mean(avg_cols) pattern wind/gust's own admin views use (see
-    create_admin_view_from_envelopes_new()), since this is a genuine per-member
-    exceedance probability, the same "expected impact" shape, not a
-    physical-property average needing different treatment.
-
-    Uses the same sum_cols/avg_cols-driven agg_dict wind's own admin view
-    builds, so every E_* column create_precip_tile_view() produces rolls up
-    here too, not just population.
-
-    Args:
-        gdf_admin: GeoDataFrame of admin regions with 'tile_id'/'name' columns.
-        gdf_tiles: GeoDataFrame of mercator tiles, must carry an admin 'id' column.
-        tif_processor: TifProcessor wrapping a GeoTIFF probability grid.
-
-    Returns:
-        DataFrame with one row per admin region: 'tile_id' (admin id), 'name',
-        the full E_* breakdown (summed, NaN-preserving for _OPTIONAL_SUM_COLS
-        plus E_population, see below), 'probability' (mean, via avg_cols).
-    """
-    if 'name' in gdf_admin.columns:
-        name_by_id = gdf_admin.set_index('tile_id')['name'].to_dict()
-    else:
-        logger.warning("Admin GeoDataFrame missing 'name' column, admin region names will be NaN")
-        name_by_id = {}
-
-    df_view = create_precip_tile_view(gdf_tiles, tif_processor)
-
-    if 'id' not in gdf_tiles.columns:
-        raise ValueError(
-            "Mercator view missing admin IDs. Admin IDs are added during "
-            "initialization. Re-initialize the country or check the mercator view file."
-        )
-    id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
-    df_view['id'] = df_view['zone_id'].map(lambda x: id_mapping.get(x, x))
-    df_view = df_view.drop(columns=['zone_id'], errors='ignore')
-
-    # E_population is additionally treated as NaN-preserving here (via
-    # _optional_sum, even though it's not in the global _OPTIONAL_SUM_COLS
-    # set wind's own admin view uses) because unlike wind, which hard-
-    # requires population at generation time (POPULATION_COLS, see
-    # create_mercator_view_from_envelopes()'s own check), precip's
-    # create_precip_tile_view() can genuinely produce a NaN E_population
-    # (missing 'population' column case), so an admin region rolling up
-    # all-NaN tiles must stay NaN, not silently become a confirmed zero
-    # ("no precip-affected population here" vs. "data unavailable").
-    agg_dict = {col: (_optional_sum if (col in _OPTIONAL_SUM_COLS or col == 'E_population') else "sum")
-                for col in sum_cols}
-    agg_dict.update({col: "mean" for col in avg_cols})
-    agg = df_view.groupby('id').agg(agg_dict).reset_index()
-    agg = agg.rename(columns={'id': 'tile_id'})
-    agg['name'] = agg['tile_id'].map(name_by_id)
-    missing_names = agg['name'].isna().sum()
-    if missing_names > 0:
-        logger.warning(f"  {missing_names} admin region(s) have no name mapping in precip admin view")
-
-    return agg
-
-
-def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column):
+def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column, tiles_proj=None):
     """
     Map each facility to the single mercator tile containing it.
 
@@ -3438,6 +2376,17 @@ def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column):
             via _ensure_unique_zone_ids and any type-filtered).
         gdf_tiles: GeoDataFrame of mercator tiles (tile_id + geometry).
         id_column: facility unique ID column ('school_id_giga' or 'osm_id').
+        tiles_proj: Optional, an already-computed
+            project_tiles_for_facility_assignment(gdf_tiles) result, reused
+            instead of reprojecting gdf_tiles to ESRI:54009 here. None (the
+            default, and what every caller other than main_pipeline.py's
+            river worker passes) reprojects internally exactly as before -
+            required only when `unmatched` below is non-empty, so a caller
+            that never passes this still pays that cost at most once, same
+            as pre-existing behaviour. When passed, it must have been built
+            from this same gdf_tiles (not a different country/admin-level
+            tile grid) - see project_tiles_for_facility_assignment()'s own
+            docstring.
 
     Returns:
         DataFrame with id_column and 'tile_id'. A facility can genuinely
@@ -3468,8 +2417,8 @@ def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column):
         # geographic-CRS degrees don't reflect true distance for "nearest".
         unmatched_facilities = gdf_facilities[gdf_facilities[id_column].isin(unmatched[id_column])][[id_column, 'geometry']].copy()
         unmatched_facilities['geometry'] = unmatched_facilities.geometry.to_crs("ESRI:54009")
-        tiles_proj = gdf_tiles[['tile_id', 'geometry']].to_crs("ESRI:54009")
-        nearest = gpd.sjoin_nearest(unmatched_facilities, tiles_proj, how='left').drop_duplicates(subset=id_column, keep='first')
+        tiles_proj_local = tiles_proj if tiles_proj is not None else project_tiles_for_facility_assignment(gdf_tiles)
+        nearest = gpd.sjoin_nearest(unmatched_facilities, tiles_proj_local, how='left').drop_duplicates(subset=id_column, keep='first')
         # Only tile_id, not geometry: nearest's own geometry is the equal-area
         # reprojection above (metres, ESRI:54009), carrying it into `joined`
         # would silently mislabel that facility's coordinates while `joined`
@@ -3481,540 +2430,6 @@ def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column):
     return joined[[id_column, 'tile_id']]
 
 
-def create_precip_facility_view(gdf_facilities, facility_tile_map, tile_view_df, id_column):
-    """
-    A facility's precip/ratio exposure is its containing tile's already-
-    computed probability, not an independent raster sample. Precip's native
-    grid (~0.25 degrees, ~27km/cell) is far coarser than a mercator tile
-    (~100-150m at zoom 14), so a tile's own probability is already just
-    "whichever native cell my centroid lands in"; routing facility exposure
-    through the tile guarantees a facility always agrees with the tile it
-    physically sits inside (no possible discrepancy near a native-grid-cell
-    boundary), and needs no raster access here at all, just a merge.
-
-    Unlike wind/gust's per-facility-type create functions (which compute
-    each facility's probability independently via their own buffered-
-    polygon-vs-envelope intersection test, with zero reference to mercator
-    tiles, confirmed directly: real wind facility files have no tile_id
-    column at all), this deliberately ties precip's facility exposure to the
-    tile grid, since precip's native grid is intrinsically coarser than a
-    tile, wind's per-facility independence remains correct for wind because
-    its envelope polygons carry real fine-grained shape.
-
-    Args:
-        gdf_facilities: GeoDataFrame of facility locations, already deduped
-            via _ensure_unique_zone_ids() and any type-filtered.
-        facility_tile_map: DataFrame from assign_facilities_to_tiles(),
-            id_column + 'tile_id'.
-        tile_view_df: create_precip_tile_view()'s own output for this
-            threshold/window (zone_id==tile_id, probability).
-        id_column: unique ID column ('school_id_giga' for schools, 'osm_id'
-            for health centers/shelters/WASH, same as wind/gust).
-
-    Returns:
-        GeoDataFrame carrying every original attribute column from
-        gdf_facilities (unlike wind/gust's own facility views, which only
-        keep zone_id+geometry, confirmed directly against real output, not
-        assumed) plus 'probability' (from the containing tile) and the
-        facility's own true geometry (point, or polygon for HC building
-        footprints, never a buffered approximation).
-    """
-    tile_probs = tile_view_df.set_index('zone_id')['probability'].to_dict()
-    merged = gdf_facilities.merge(facility_tile_map, on=id_column, how='left')
-    merged['probability'] = merged['tile_id'].map(tile_probs).fillna(0.0)
-    return merged.drop(columns=['tile_id'])
-
-
-def save_precip_tile_view(df, country, forecast_time, threshold_mm, window_h):
-    """Save a tp exceedance-probability tile view: mercator_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precip', file_name))
-
-
-def save_precip_tile_bitmask_view(df, country, forecast_time, threshold_mm, window_h):
-    """track_tile_bitmask_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet
-
-    Same 'precip' naming this repo already uses throughout (mercator_views_precip,
-    save_precip_tile_view, etc, this repo's own consistent term regardless of
-    the dashboard repo's own 'rain' shorthand for the same hazard) and the same
-    p{threshold_mm}_{window_h}h token convention save_precip_tile_view already
-    uses, separate top-level directory mirroring Wind's own
-    save_tracks_tile_bitmask_view (track_tile_bitmask_views/) convention. See
-    calculate_precip_tile_member_bitmask's own docstring for what this data is."""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_tile_bitmask_views_precip', file_name))
-
-
-def save_precip_admin_view(df, country, forecast_time, threshold_mm, window_h, admin_level=1):
-    """Save a tp exceedance-probability admin view: admin_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h_admin{admin_level}.csv"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h_admin{admin_level}.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views_precip', file_name))
-
-
-def save_precip_ratio_view(df, country, forecast_time, ratio_threshold, window_h):
-    """
-    Save a ro/tp ratio exceedance-probability tile view. 'g' token (ratio
-    cut point x100) distinguishes this from tp's 'p'-prefixed mm thresholds
-    and avoids a decimal point in the filename:
-    mercator_views_precipratio/{country}_{forecast_time}_g{ratio_threshold*100}_{window_h}h.csv
-    """
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precipratio', file_name))
-
-
-def save_precip_ratio_admin_view(df, country, forecast_time, ratio_threshold, window_h, admin_level=1):
-    """Admin-level equivalent of save_precip_ratio_view(), see its docstring for the g-token convention."""
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h_admin{admin_level}.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views_precipratio', file_name))
-
-
-# =============================================================================
-# PRECIP FACILITY-LEVEL VIEWS (schools/health centers/shelters/WASH)
-# Parquet, not CSV: these carry a real geometry column (the facility's true
-# point location), matching wind/gust's own facility-view file format
-# exactly, unlike precip's tile/admin views above (CSV, no geometry).
-# =============================================================================
-
-def save_precip_school_view(gdf, country, forecast_time, threshold_mm, window_h):
-    """school_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precip', file_name))
-
-
-def save_precip_ratio_school_view(gdf, country, forecast_time, ratio_threshold, window_h):
-    """school_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precipratio', file_name))
-
-
-def save_precip_hc_view(gdf, country, forecast_time, threshold_mm, window_h):
-    """hc_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precip', file_name))
-
-
-def save_precip_ratio_hc_view(gdf, country, forecast_time, ratio_threshold, window_h):
-    """hc_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precipratio', file_name))
-
-
-def save_precip_shelter_view(gdf, country, forecast_time, threshold_mm, window_h):
-    """shelter_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precip', file_name))
-
-
-def save_precip_ratio_shelter_view(gdf, country, forecast_time, ratio_threshold, window_h):
-    """shelter_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precipratio', file_name))
-
-
-def save_precip_wash_view(gdf, country, forecast_time, threshold_mm, window_h):
-    """wash_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precip', file_name))
-
-
-def save_precip_ratio_wash_view(gdf, country, forecast_time, ratio_threshold, window_h):
-    """wash_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
-    g_token = int(round(ratio_threshold * 100))
-    file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precipratio', file_name))
-
-
-# =============================================================================
-# RIVER FLOOD (GloFAS x JRC) VIEWS
-# =============================================================================
-# GloFAS/JRC pixels are ~150m resolution, comparable to a zoom-14 mercator
-# tile or a buffered facility footprint, NOT much coarser the way precip's
-# ~0.25 degree grid is. So unlike create_precip_tile_view() (which must
-# centroid-sample a continuous raster because a tile's tiny polygon usually
-# doesn't contain the enclosing coarse cell's pixel-center), river-flood
-# views reuse the wind/gust "count(members)/FULL_ENSEMBLE_SIZE" convention:
-# a member "hits" a zone if at least one of its flooded pixels falls within
-# that zone, same idiom create_mercator_view_from_envelopes() already uses
-# (manual gpd.sjoin + groupby, not a generic library helper), just points-
-# in-polygon (predicate='within') instead of polygon-in-polygon
-# (predicate='intersects'), and .nunique('member') instead of .size(): a
-# single member can contribute several flooded pixels to the same zone at
-# this resolution, so counting distinct members (not rows) avoids inflating
-# exposure.
-#
-# below_min_basin is a per-pixel QC flag (this cell's own upstream drainage
-# area is below GloFAS's own 500km^2 minimum-catchment cutoff for
-# JRC-extent-map generation), a matching-availability flag, NOT a
-# confidence statement about the discharge forecast. Per the upstream
-# TC-ECMWF-Forecast-Pipeline repo's own explicit design principle ("gate on
-# RP tier for relevance, attach channel scale as a secondary attribute, not
-# a pre-filter"), it is NEVER used to exclude a pixel/zone here, only
-# surfaced as a per-zone .any() boolean alongside the real probability.
-def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
-                            num_ensembles=FULL_ENSEMBLE_SIZE):
-    """
-    Per-tile flood-extent probability for one RP tier + lead-time WINDOW:
-    fraction of ensemble members with >=1 flooded JRC pixel inside the tile
-    at ANY real day within that window (real union across days, not a
-    single-day snapshot -- see RIVER_LEADTIME_STEPS_H's own "ACCUMULATION"
-    comment in main_pipeline.py for the full rationale).
-
-    Args:
-        gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()).
-        gdf_pixels_step: GeoDataFrame of this country's flooded pixels for
-            every real day up through the caller's selected window already
-            (caller filters by `step_h <= window` before calling -- this
-            function itself does no day-level filtering, it just counts
-            distinct members across whatever rows it's given, which is what
-            makes multi-day rows here a real union rather than requiring
-            any extra union logic in this function), columns: member,
-            below_min_basin, geometry (Point, EPSG:4326). May be empty (a
-            normal, common outcome -- no flooding within this window).
-        rp_tier: label for logging only (e.g. 'rp10').
-        is_standin: bool, from the real RIVER_FORECASTS.IS_STANDIN column --
-            True for rp2/rp5 (JRC has no native map, they reuse rp10's own
-            extent as a labelled upper-bound approximation), False for
-            rp10/rp20/rp50/rp100 (native JRC tier match). Passed through
-            unchanged as a per-tier constant column, never re-derived here.
-
-    Returns:
-        DataFrame with one row per tile: 'zone_id' (tile_id), 'probability',
-        the full E_* breakdown (E_population, E_school_age_population,
-        E_infant_population, E_adolescent_population, E_built_surface_m2,
-        E_smod_class, E_smod_class_l1, E_rwi, E_num_schools, E_num_hcs,
-        E_num_shelters, E_num_wash) -- the same `data_cols` loop
-        create_mercator_view_from_envelopes() (wind) and gust use, so this
-        file's shape matches a wind/gust mercator_views CSV exactly except
-        for the missing CCI/vulnerability columns (out of scope for river
-        flood, same as gust/precip), plus 'below_min_basin' (any
-        contributing pixel flagged) and 'is_standin'.
-
-    Raises:
-        ValueError: if gdf_tiles is missing any POPULATION_COLS column, same
-            hard-fail guard create_mercator_view_from_envelopes() (wind) and
-            create_admin_view_from_envelopes_new() use -- these are a hard,
-            always-required init-time dependency, not optional data. Without
-            this guard, a country missing e.g. school_age_population would
-            silently get NaN at tile level, and create_river_admin_view()'s
-            plain-'sum' aggregation for these columns (deliberately excluded
-            from _OPTIONAL_SUM_COLS, since they're never expected to be
-            all-NaN) would then turn that into a fabricated 0.0 at admin
-            level -- indistinguishable from a genuine zero-exposure result.
-    """
-    _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
-    if _missing_pop_cols:
-        raise ValueError(
-            f"gdf_tiles is missing {_missing_pop_cols}, run "
-            f"'--type patch --columns {' '.join(_missing_pop_cols)}' for this country "
-            f"before river-flood tile impact views can be computed."
-        )
-
-    tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
-    all_tile_ids = gdf_tiles['tile_id']
-    try:
-        if gdf_pixels_step.empty:
-            raise ValueError("no flooded pixels for this country/step")
-        tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
-        pix_geom = gdf_pixels_step[['member', 'below_min_basin', 'geometry']].copy()
-        if pix_geom.crs != tiles_geom.crs:
-            pix_geom = pix_geom.to_crs(tiles_geom.crs)
-        # Pixels (points) left, tiles (polygons) right: predicate='within'
-        # requires left.within(right), so the point must be the left side
-        # unlike create_mercator_view_from_envelopes()'s symmetric
-        # 'intersects' (a free direction choice there, made for CRS-
-        # reprojection-precision reasons), this direction is required by
-        # 'within' semantics, not a style choice.
-        joined = gpd.sjoin(pix_geom, tiles_geom, how='inner', predicate='within')
-        member_counts = joined.groupby('tile_id')['member'].nunique()
-        basin_flags = joined.groupby('tile_id')['below_min_basin'].any()
-        probs = {tid: int(member_counts.get(tid, 0)) / float(num_ensembles) for tid in all_tile_ids}
-        basin = {tid: bool(basin_flags.get(tid, False)) for tid in all_tile_ids}
-    except ValueError:
-        # Expected, common outcome: no flooded pixels this country/step.
-        probs = {tid: 0.0 for tid in all_tile_ids}
-        basin = {tid: False for tid in all_tile_ids}
-    except Exception as e:
-        # Anything else (e.g. a CRS mismatch, an upstream schema change
-        # dropping/renaming 'below_min_basin') is a real bug, not a normal
-        # "no flooding" outcome -- must be visible at warning level, same as
-        # create_mercator_view_from_envelopes()'s own catch-all does for the
-        # structurally identical case, not silently absorbed at debug level.
-        logger.warning(f"River-flood tile intersection failed for {rp_tier}, defaulting probabilities to 0: {e}")
-        probs = {tid: 0.0 for tid in all_tile_ids}
-        basin = {tid: False for tid in all_tile_ids}
-
-    tiles_viewer.add_variable_to_view(probs, 'probability')
-    tiles_viewer.add_variable_to_view(basin, 'below_min_basin')
-    df_view = tiles_viewer.to_dataframe()
-
-    # Same generic data_cols -> E_{col} loop as create_mercator_view_from_envelopes()
-    # (wind) / gust, not precip's E_population-only shape: river-flood's
-    # architecture is modeled on wind/gust throughout (see module docstring),
-    # so its tile view should carry the same E_* breakdown, not a reduced one.
-    for col in data_cols:
-        if col in df_view.columns:
-            df_view[f"E_{col}"] = df_view[col] * df_view['probability']
-        else:
-            df_view[f"E_{col}"] = np.nan
-    df_view = df_view.drop(columns=[c for c in data_cols if c in df_view.columns])
-    df_view['is_standin'] = bool(is_standin)
-
-    if 'zone_id' not in df_view.columns:
-        if df_view.index.name:
-            df_view = df_view.reset_index()
-            first_col = df_view.columns[0]
-            if first_col != 'zone_id':
-                df_view = df_view.rename(columns={first_col: 'zone_id'})
-        else:
-            df_view = df_view.reset_index(names=['zone_id'])
-
-    # Keep poverty columns last, same convention as create_mercator_view_from_envelopes().
-    _pov_cols = [c for c in ['moderate_poverty_prob', 'severe_poverty_prob'] if c in df_view.columns]
-    if _pov_cols:
-        df_view = df_view[[c for c in df_view.columns if c not in _pov_cols] + _pov_cols]
-
-    return df_view
-
-
-def calculate_river_tile_member_bitmask(gdf_tiles, gdf_pixels_step):
-    """
-    Real per-z14-tile, per-ensemble-member 64-bit coverage bitmask for one
-    (rp_tier, step_h window) of river flood extent (bit `m-1` set <=> member
-    `m` has >=1 flooded JRC pixel inside that tile), same convention/shape
-    as Wind/Gust's own calculate_tile_member_bitmask() (mirrors it directly,
-    see that function's own docstring for the full rationale), applied to
-    River instead: this repo's dashboard sibling already does an identical
-    live decode of this same raw per-member GloFAS parquet
-    (`_RiverExtentCache` in services/tile_server.py, `bits = uint64(1) <<
-    (member - 1)`), this function exists to move that decode from a live,
-    multi-minute, cold-cache dashboard operation to a real pipeline output,
-    not because the live decode was wrong.
-
-    Genuinely near-zero new I/O: reuses the same per-member pixel data
-    create_river_tile_view() already reads (gdf_pixels_step, already
-    country-scoped and step_h-filtered by the caller), running an
-    independent gpd.sjoin() with the identical inputs/predicate/direction
-    that function's own `joined` already uses (pixels left, tiles right,
-    predicate='within' -- required by 'within' semantics, not a style
-    choice, see create_river_tile_view's own comment). The sjoin itself is
-    cheap; the real cost (downloading/DuckDB-filtering the raw global
-    parquet) already happened upstream, once, before either function runs.
-
-    Args:
-        gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()),
-            needs only 'tile_id' and 'geometry'.
-        gdf_pixels_step: same shape create_river_tile_view() takes -- this
-            country's flooded pixels for every real day up through the
-            caller's selected window already (member, below_min_basin,
-            geometry columns), may be empty (a normal, common outcome).
-
-    Returns:
-        DataFrame with columns ['tile_id' (string), 'bits' (uint64)], one
-        row per distinct tile with >=1 member's flooded pixel falling
-        inside it -- sparse, same convention Wind's own bitmask uses (a
-        tile with zero coverage from every member simply doesn't appear).
-        An empty gdf_pixels_step or a real zero-intersection result both
-        return an empty DataFrame (not an error -- a common, expected
-        outcome, same as create_river_tile_view's own no-flooding case).
-        A genuine sjoin failure (e.g. a CRS mismatch) logs a warning and
-        also returns an empty DataFrame -- unlike Wind's per-threshold
-        None-vs-empty distinction, there is only ever ONE call per (rp_tier,
-        step_h) here (not one per multiple real thresholds in one call), so
-        the caller's own `files_written` bookkeeping simply skips writing a
-        file when this returns empty, no separate None sentinel needed.
-    """
-    if gdf_pixels_step.empty:
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
-    pix_geom = gdf_pixels_step[['member', 'geometry']].copy()
-    try:
-        if pix_geom.crs != tiles_geom.crs:
-            pix_geom = pix_geom.to_crs(tiles_geom.crs)
-        joined = gpd.sjoin(pix_geom, tiles_geom, how='inner', predicate='within')
-    except Exception as e:
-        logger.warning(f"River tile_member_bitmask sjoin FAILED, no bitmask file will be written: {e}")
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    if joined.empty:
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    # Same vectorized OR-reduction as Wind's own calculate_tile_member_bitmask
-    # (np.unique(..., return_inverse=True) + np.bitwise_or.at), and the same
-    # 1-indexed member convention the dashboard's own _RiverExtentCache
-    # already assumes for this exact raw data (`bits = 1 << (member - 1)`).
-    member_arr = joined['member'].to_numpy().astype(np.uint64)
-    bits = np.uint64(1) << (member_arr - np.uint64(1))
-    tile_ids = joined['tile_id'].to_numpy()
-    uniq_tiles, inverse = np.unique(tile_ids, return_inverse=True)
-    tile_bits = np.zeros(len(uniq_tiles), dtype=np.uint64)
-    np.bitwise_or.at(tile_bits, inverse, bits)
-
-    return pd.DataFrame({
-        'tile_id': pd.array(uniq_tiles.astype(str), dtype='string'),
-        'bits': tile_bits,
-    })
-
-
-def create_river_admin_view(gdf_admin, gdf_tiles, gdf_pixels_step, rp_tier, is_standin):
-    """
-    Admin-level rollup of create_river_tile_view(), same sum_cols/avg_cols
-    groupby-aggregation pattern create_admin_view_from_envelopes_new() (wind)
-    and gust use -- not precip's E_population-only shape. below_min_basin
-    OR'd (.any() -- a QC flag rolls up as "does ANY contributing tile carry
-    it", never averaged/summed), is_standin passed through as the same
-    per-tier constant.
-    """
-    if 'name' in gdf_admin.columns:
-        name_by_id = gdf_admin.set_index('tile_id')['name'].to_dict()
-    else:
-        logger.warning("Admin GeoDataFrame missing 'name' column, admin region names will be NaN")
-        name_by_id = {}
-
-    df_view = create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin)
-
-    if 'id' not in gdf_tiles.columns:
-        raise ValueError(
-            "Mercator view missing admin IDs. Admin IDs are added during "
-            "initialization. Re-initialize the country or check the mercator view file."
-        )
-    id_mapping = gdf_tiles.set_index('tile_id')['id'].to_dict()
-    df_view['id'] = df_view['zone_id'].map(lambda x: id_mapping.get(x, x))
-    df_view = df_view.drop(columns=['zone_id'], errors='ignore')
-
-    agg_dict = {col: (_optional_sum if col in _OPTIONAL_SUM_COLS else "sum")
-                for col in sum_cols if col in df_view.columns}
-    agg_dict.update({col: "mean" for col in avg_cols if col in df_view.columns})
-    agg_dict['below_min_basin'] = 'any'
-
-    agg = df_view.groupby('id').agg(agg_dict).reset_index()
-    agg = agg.rename(columns={'id': 'tile_id'})
-    agg['is_standin'] = bool(is_standin)
-    agg['name'] = agg['tile_id'].map(name_by_id)
-    missing_names = agg['name'].isna().sum()
-    if missing_names > 0:
-        logger.warning(f"  {missing_names} admin region(s) have no name mapping in river admin view")
-
-    return agg
-
-
-def create_river_facility_view(gdf_facilities, facility_tile_map, tile_view_df, id_column, is_standin):
-    """
-    A facility's river-flood exposure is its containing mercator tile's
-    already-computed probability (and below_min_basin QC flag), not an
-    independent per-facility buffer-and-pixel-intersect test.
-
-    GloFAS/JRC flood-extent pixels are patchy/localized (river channels,
-    low-lying pockets), unlike wind/gust's smooth, contiguous envelope
-    polygons. A facility's own point-buffer can sit in a part of a tile the
-    flood-extent pixels never touch, even though another part of that SAME
-    tile genuinely floods, so an independent per-facility buffer-and-intersect
-    test against the raw flooded pixels can report 0.0 for a facility inside
-    a tile whose own probability is nonzero -- a confusing, inconsistent
-    result. Deriving facility exposure from the containing tile's own
-    probability instead keeps the two views (tile and facility) consistent
-    by construction. Wind/gust's envelope polygons don't have this failure
-    mode (their independent per-facility buffer-intersect is left untouched),
-    but precip's grid faces the identical patchy-vs-point problem and is
-    solved the same way (create_precip_facility_view, this function's own
-    direct template).
-
-    Args:
-        gdf_facilities: GeoDataFrame of facility locations (already deduped
-            via _ensure_unique_zone_ids, type-filtered where relevant) --
-            UNBUFFERED. No buffer_geodataframe() call is needed by the caller:
-            the tile lookup below needs each facility's true point/footprint
-            for assign_facilities_to_tiles' own within-predicate join, not an
-            inflated one; the output below also carries this true geometry
-            (point, or polygon for HC building footprints), matching precip's
-            own established convention.
-        facility_tile_map: DataFrame from assign_facilities_to_tiles(),
-            id_column + 'tile_id' -- computed ONCE per country (tile
-            assignment doesn't depend on rp_tier/step_h), not once per call.
-        tile_view_df: create_river_tile_view()'s own real output for this
-            exact (rp_tier, step_h) -- 'zone_id' (==tile_id), 'probability',
-            'below_min_basin'.
-        id_column: 'school_id_giga' or 'osm_id'.
-        is_standin: bool, same per-tier constant create_river_tile_view()
-            already receives -- passed straight through, not re-derived.
-
-    Returns:
-        DataFrame carrying every original attribute column from
-        gdf_facilities (name/type/lat/lon/geometry/etc, matching
-        create_precip_facility_view's own real-output shape, matching
-        SCHOOL_RIVER_MAT's ORCHESTRATION ingestion SQL, which parses fields
-        by name via VARIANT, not positionally, so exact column ORDER here
-        doesn't matter, only names) plus 'probability'/'below_min_basin'
-        (both from the containing tile) and 'is_standin'. `id_column` is
-        renamed to 'zone_id' in the output (unlike precip's own function,
-        which leaves this rename to its SQL ingestion layer instead) to
-        match SCHOOL_RIVER_MAT's ingestion SQL verbatim (`parquet_variant:zone_id`,
-        not aliased from the facility's own id column the way precip's is).
-        A facility whose tile assignment is missing (should not happen given
-        assign_facilities_to_tiles' own nearest-tile fallback) defaults to
-        0.0/False, matching create_precip_facility_view's own convention.
-    """
-    tile_probs = tile_view_df.set_index('zone_id')['probability'].to_dict()
-    tile_basin = tile_view_df.set_index('zone_id')['below_min_basin'].to_dict()
-    merged = gdf_facilities.merge(facility_tile_map, on=id_column, how='left')
-    merged['probability'] = merged['tile_id'].map(tile_probs).fillna(0.0)
-    merged['below_min_basin'] = merged['tile_id'].map(tile_basin).fillna(False)
-    merged['is_standin'] = bool(is_standin)
-    return merged.drop(columns=['tile_id']).rename(columns={id_column: 'zone_id'})
-
-
-def save_river_tile_view(df, country, forecast_time, rp_tier, step_h):
-    """mercator_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.csv"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_river', file_name))
-
-
-def save_river_tile_bitmask_view(df, country, forecast_time, rp_tier, step_h):
-    """track_tile_bitmask_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet
-
-    Same filename token order as save_river_tile_view's own mercator_views_river/
-    convention (real key: country, forecast_time, rp_tier, step_h -- river is
-    date/cycle-keyed, not storm-keyed, see calculate_river_tile_member_bitmask's
-    own docstring), separate top-level directory mirroring Wind's own
-    save_tracks_tile_bitmask_view (track_tile_bitmask_views/) convention."""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_tile_bitmask_views_river', file_name))
-
-
-def save_river_admin_view(df, country, forecast_time, rp_tier, step_h, admin_level=1):
-    """admin_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h_admin{level}.csv"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h_admin{admin_level}.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views_river', file_name))
-
-
-def save_river_school_view(gdf, country, forecast_time, rp_tier, step_h):
-    """school_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_river', file_name))
-
-
-def save_river_hc_view(gdf, country, forecast_time, rp_tier, step_h):
-    """hc_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_river', file_name))
-
-
-def save_river_shelter_view(gdf, country, forecast_time, rp_tier, step_h):
-    """shelter_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_river', file_name))
-
-
-def save_river_wash_view(gdf, country, forecast_time, rp_tier, step_h):
-    """wash_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
-    file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_river', file_name))
-
 
 def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level, dataset='wind'):
     """
@@ -4025,7 +2440,9 @@ def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level, dataset='win
     dir_name = 'mercator_views_gust' if dataset == 'gust' else 'mercator_views'
     th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
     file_name = f"{country}_{storm}_{date}_{th_token}_{zoom_level}.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def save_cci_tiles(gdf, country, storm, date, zoom_level):
@@ -4040,7 +2457,9 @@ def save_cci_tiles(gdf, country, storm, date, zoom_level):
         zoom_level: Zoom level for tiles
     """
     file_name = f"{country}_{storm}_{date}_{zoom_level}_cci.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 def save_admin_tiles_view(gdf, country, storm, date, wind_th, admin_level=1, dataset='wind'):
     """
@@ -4052,7 +2471,9 @@ def save_admin_tiles_view(gdf, country, storm, date, wind_th, admin_level=1, dat
     dir_name = 'admin_views_gust' if dataset == 'gust' else 'admin_views'
     th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
     file_name = f"{country}_{storm}_{date}_{th_token}_admin{admin_level}.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def save_cci_admin(gdf, country, storm, date, admin_level=1):
@@ -4067,7 +2488,9 @@ def save_cci_admin(gdf, country, storm, date, admin_level=1):
         admin_level: Admin level these views correspond to (default: 1)
     """
     file_name = f"{country}_{storm}_{date}_admin{admin_level}_cci.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def save_vulnerability_tiles(gdf, country, storm, date, zoom_level):
@@ -4085,7 +2508,9 @@ def save_vulnerability_tiles(gdf, country, storm, date, zoom_level):
         zoom_level: Zoom level for tiles
     """
     file_name = f"{country}_{storm}_{date}_{zoom_level}_vulnerability.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views', file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def save_vulnerability_admin(gdf, country, storm, date, admin_level=1):
@@ -4103,7 +2528,9 @@ def save_vulnerability_admin(gdf, country, storm, date, admin_level=1):
         admin_level: Admin level (default: 1)
     """
     file_name = f"{country}_{storm}_{date}_admin{admin_level}_vulnerability.csv"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def load_admin_view(country, admin_level=1):
@@ -4121,7 +2548,9 @@ def save_tracks_view(gdf, country, storm, date, wind_th, dataset='wind'):
     dir_name = 'track_views_gust' if dataset == 'gust' else 'track_views'
     th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
     file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name)
+    write_dataset(gdf, data_store, out_path)
+    return out_path
 
 
 def save_tracks_tile_bitmask_view(df, country, storm, date, wind_th, dataset='wind'):
@@ -4129,14 +2558,15 @@ def save_tracks_tile_bitmask_view(df, country, storm, date, wind_th, dataset='wi
     Saves per-tile, per-member coverage bitmask views (see
     calculate_tile_member_bitmask's own docstring for what these are and
     why). Mirrors save_tracks_view's own dataset='gust' convention exactly
-    (g-prefixed threshold token, separate _gust directory); real per-tile
-    per-member data that was previously computed transiently for wind/gust
-    severity and discarded; this is the first time it's persisted.
+    (g-prefixed threshold token, separate _gust directory); persists this
+    per-tile, per-member data as a real pipeline output.
     """
     dir_name = 'track_tile_bitmask_views_gust' if dataset == 'gust' else 'track_tile_bitmask_views'
     th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
     file_name = f"{country}_{storm}_{date}_{th_token}.parquet"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name)
+    write_dataset(df, data_store, out_path)
+    return out_path
 
 
 def save_vulnerability_tracks(df, country, storm, date, zoom_level):
@@ -4158,7 +2588,9 @@ def save_vulnerability_tracks(df, country, storm, date, zoom_level):
         zoom_level: Zoom level for tiles
     """
     file_name = f"{country}_{storm}_{date}_{zoom_level}_vulnerability_tracks.parquet"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name))
+    out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_views', file_name)
+    write_dataset(df, data_store, out_path)
+    return out_path
 
 
 # =============================================================================
@@ -4188,9 +2620,12 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
             - E_CCI_school_age: Expected CCI for school-age population
             - CCI_infants: CCI for infant population
             - E_CCI_infants: Expected CCI for infants
+            - CCI_adolescents: CCI for adolescent population
+            - E_CCI_adolescents: Expected CCI for adolescents
             - CCI_pop: CCI for total population
             - E_CCI_pop: Expected CCI for total population
-    
+        Also includes 'zone_id' (tile_id) and 'id' (admin boundary ID).
+
     Raises:
         ValueError: If admin IDs are missing from gdf_tiles (required for aggregation)
     
@@ -4595,7 +3030,10 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
                 use_rate = 'full'
 
             # Always overwrite: winds iterated ascending → last assignment = highest band = correct rate.
-            covered_list = list(covered)
+            # sorted(), not list(): tile_id set iteration order is hash-seed-dependent
+            # (PYTHONHASHSEED unset), and float64 summation isn't associative, so an
+            # unsorted order made the final severity sums drift by ~1e-11 across processes.
+            covered_list = sorted(covered)
             # Tiles this member's envelope covers but that aren't in tile_index at all
             # (absent from the base layer entirely) are a genuinely different, narrower
             # case than a tile with merely-missing RWI data, only these get filled to
@@ -4644,7 +3082,7 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
         # min_count=1 (not plain .sum()'s default skipna=True/min_count=0):
         # a NaN rate (genuinely missing RWI for that tile, kept as NaN above,
         # not silently zero-filled) must propagate to a NaN total rather than
-        # being silently dropped from the sum -- the same "don't let a missing
+        # being silently dropped from the sum: the same "don't let a missing
         # rate look like a confirmed 0" reasoning the admin-level aggregation's
         # own sum(min_count=1) elsewhere in this file applies.
         pin        = df_member['population'].sum(min_count=1)
@@ -4666,6 +3104,166 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
     return result[['zone_id'] + out_cols]
 
 
+# =============================================================================
+# RASTERIZED ENVELOPE COVERAGE. Rasterizes each ensemble member's threshold-
+# contour polygon (still produced by TC-ECMWF-Forecast-Pipeline's
+# matplotlib.contour() interpolation, unchanged) onto a grid aligned to the
+# Web Mercator zoom-14 XYZ tile lattice, so the canonical per-member,
+# per-tile coverage computation (calculate_tile_member_bitmask, below) can be
+# computed once and reused by create_tracks_view_from_envelopes/
+# create_mercator_view_from_envelopes/create_admin_view_from_envelopes_new
+# instead of each running its own GEOS gpd.sjoin() for the same "does tile T
+# fall under member M's envelope" question. With all_touched=True and the
+# grid snapped to the lattice (not the polygon's bbox), this reproduces the
+# same gpd.sjoin ground truth exactly, while running 5-10x faster per member.
+# =============================================================================
+
+# Fixed Web Mercator constants (EPSG:3857): world half-circumference (anchors
+# the tile lattice's origin so every rasterize grid aligns to the same tile
+# boundaries regardless of member/threshold/storm) and the zoom-14 tile size
+# in meters, matching the same XYZ tile pyramid the tile server/mercator
+# views are built on.
+_WEB_MERCATOR_WORLD_ORIGIN_X = -20037508.342789244
+_WEB_MERCATOR_WORLD_ORIGIN_Y = 20037508.342789244
+_WEB_MERCATOR_CIRCUMFERENCE_M = 40075016.6855785
+
+
+def _z14_tile_size_m(zoom_level: int = 14) -> float:
+    """Real Web Mercator tile size in meters at the given zoom level (a tile
+    is a fixed-size square everywhere in EPSG:3857, unlike in EPSG:4326 where
+    tile height in degrees varies by latitude, a real, measured difference,
+    not a theoretical concern)."""
+    return _WEB_MERCATOR_CIRCUMFERENCE_M / (2 ** zoom_level)
+
+
+def _rasterize_member_envelope_mask(geom_3857, tile_size_m: float):
+    """
+    Rasterize one real member's envelope polygon (already in EPSG:3857) onto
+    a grid exactly aligned to the real Web Mercator XYZ tile lattice,
+    bounded to the polygon's OWN extent (not the whole country). This is
+    what makes each call cheap regardless of country size: a "don't process
+    area far from the storm" benefit a gpd.sjoin() needs an explicit
+    tile-narrowing step to get, but the grid here shrinks on its own as a
+    higher threshold's real envelope shrinks.
+
+    Two correctness requirements this function depends on:
+    1. A naive plain-lon/lat-degree grid is WRONG: real inspection of zoom-14
+       tile geometries shows tile width in degrees is constant, but tile
+       HEIGHT in degrees varies by latitude band (an inherent Web Mercator
+       property), so a single global dy misaligns rows far from where it was
+       measured. Fixed by working entirely in EPSG:3857, where tiles are
+       exact fixed-size squares everywhere.
+    2. A rasterize grid anchored to the polygon's own bounding box (not the
+       real, fixed-origin XYZ tile lattice) silently offsets every result by
+       a tile: pixel centers don't land on real tile centers. Fixed by
+       snapping the grid's origin onto the real lattice via floor-division
+       against the true Web Mercator world origin.
+
+    Args:
+        geom_3857: one real member's envelope geometry, already reprojected
+            to EPSG:3857 (Polygon or MultiPolygon).
+        tile_size_m: real zoom-14 tile size in meters (_z14_tile_size_m()).
+
+    Returns:
+        (mask_arr, transform): mask_arr is a uint8 array, 1 where the real
+        polygon covers that cell. all_touched=True is required here: the
+        rasterize default, all_touched=False, undercounts at boundaries
+        (misses real tiles the true contour genuinely reaches). transform
+        maps array row/col indices to real EPSG:3857 coordinates, for
+        sampling tile centroids against this mask afterward.
+    """
+    from rasterio.features import rasterize as _rio_rasterize
+    from rasterio.transform import from_origin
+
+    dx = dy = tile_size_m
+    minx, miny, maxx, maxy = geom_3857.bounds
+    minx = _WEB_MERCATOR_WORLD_ORIGIN_X + np.floor((minx - _WEB_MERCATOR_WORLD_ORIGIN_X) / dx) * dx
+    maxy = _WEB_MERCATOR_WORLD_ORIGIN_Y - np.floor((_WEB_MERCATOR_WORLD_ORIGIN_Y - maxy) / dy) * dy
+    width = max(1, int(np.ceil((maxx - minx) / dx)) + 2)
+    height = max(1, int(np.ceil((maxy - miny) / dy)) + 2)
+    transform = from_origin(minx - dx, maxy + dy, dx, dy)
+
+    mask_arr = _rio_rasterize(
+        [(geom_3857, 1)],
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype='uint8',
+    )
+    return mask_arr, transform
+
+
+def _sample_tile_centroids_against_mask(cx: np.ndarray, cy: np.ndarray, mask_arr, transform) -> np.ndarray:
+    """
+    Sample already-extracted real tile centroid coordinate arrays (EPSG:3857
+    x/y, same CRS as the mask) against one member's rasterize mask.
+
+    A tile centroid whose row/col falls outside this specific mask's own
+    (deliberately small, polygon-bounded) extent is correctly treated as
+    "not covered" via the `valid` bounds check below. This is what lets
+    the SAME full cx/cy arrays (extracted once, outside any per-member loop)
+    be safely reused across every member's own differently-sized small mask,
+    without needing to pre-filter tiles by bbox first.
+
+    Returns:
+        Boolean array, same length/order as cx/cy, True where that tile
+        centroid falls inside the real rasterized envelope.
+    """
+    inv_transform = ~transform
+    cols, rows = inv_transform * (cx, cy)
+    cols = np.floor(cols).astype(int)
+    rows = np.floor(rows).astype(int)
+    height, width = mask_arr.shape
+    valid = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    inside = np.zeros(len(cx), dtype=bool)
+    inside[valid] = mask_arr[rows[valid], cols[valid]].astype(bool)
+    return inside
+
+
+def _popcount_u64(bits_arr: np.ndarray) -> np.ndarray:
+    """Vectorized population count (number of set bits) for a uint64 array,
+    the standard SWAR bit-trick. Used to turn a calculate_tile_member_bitmask()
+    bitmask column into a per-tile member COUNT without a per-row Python
+    loop, since the sparse bitmask can itself have hundreds of thousands of
+    rows for a wide low-threshold envelope over a large country."""
+    x = bits_arr.astype(np.uint64)
+    x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
+    x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
+    x = (x + (x >> np.uint64(4))) & np.uint64(0x0f0f0f0f0f0f0f0f)
+    return ((x * np.uint64(0x0101010101010101)) >> np.uint64(56)).astype(np.uint64)
+
+
+def _tile_probability_from_bitmask(bm_df, all_tile_ids, num_ensembles: float) -> dict:
+    """Per-z14-tile probability (fraction of ensemble members whose envelope
+    covers that tile) derived from one threshold's calculate_tile_member_bitmask()
+    DataFrame. Shared by create_mercator_view_from_envelopes() and
+    create_admin_view_from_envelopes_new(), which both define tile-level
+    probability the same way (create_admin_view_from_envelopes_new() then
+    aggregates it UP to admin regions by area-mean, unchanged by this helper;
+    see the NOTE above calculate_tile_member_bitmask()'s own module-level
+    comment block for why an admin-region-level bitmask is NOT the right
+    quantity to compute directly).
+
+    bm_df is None (rasterize failure) is the caller's responsibility to check
+    before calling this; bm_df.empty (genuine zero-coverage) and the
+    non-empty case are both handled here, uniformly returning 0.0 for every
+    tile_id in all_tile_ids not present in bm_df.
+
+    Aligned via a vectorized pandas reindex rather than a per-tile Python
+    dict comprehension with a `.get()` call per id: called once per real
+    threshold (up to 8 for wind, 8 for gust) with all_tile_ids as large as
+    ~400k rows for a MEX-sized country, so a per-item Python loop here is
+    real, measurable, avoidable overhead of the same kind already fixed in
+    precip's own per-point raster sampling.
+    """
+    if bm_df.empty:
+        return {tid: 0.0 for tid in all_tile_ids}
+    counts = pd.Series(_popcount_u64(bm_df['bits'].to_numpy()), index=bm_df['tile_id'].to_numpy())
+    aligned = counts.reindex(all_tile_ids, fill_value=0).to_numpy(dtype=float) / num_ensembles
+    return dict(zip(all_tile_ids, aligned))
+
+
 def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wind_threshold',
                                   label='tile'):
     """
@@ -4673,17 +3271,24 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
     DataFrame per real threshold in gdf_envelopes (bit `m-1` set <=> member
     `m`'s envelope covers that tile).
 
-    The envelope-vs-tile spatial join this needs is also computed transiently,
-    twice, inside create_tracks_view_from_envelopes()/
-    create_mercator_view_from_envelopes() (once buried inside gigaspatial's
-    own internal sjoin, once as a first-party one), but both discard the
-    per-member identity as soon as it collapses to a country-wide
-    scalar/tile-count. This function does the same kind of sjoin (mirrors
-    calculate_vulnerability_tracks's own per-threshold block above almost
-    exactly) but keeps the per-member identity instead of discarding it,
-    OR-accumulating each member's own bit into a compact uint64 per tile,
-    the same technique the dashboard repo's own _RiverExtentCache uses for
-    River's raw flood-extent layer, applied here to Wind/Gust.
+    Rasterizes each member's own real envelope polygon onto a grid exactly
+    aligned to the real Web Mercator zoom-14 tile lattice (see
+    _rasterize_member_envelope_mask()'s own docstring for the two
+    correctness requirements this depends on for an exact result),
+    reproducing the exact same ground truth a gpd.sjoin() would (bit-for-bit
+    identical population sums) while running 5-10x faster per member than
+    that sjoin.
+
+    This is the one canonical per-tile coverage computation: create_tracks_
+    view_from_envelopes()/create_mercator_view_from_envelopes()/
+    create_admin_view_from_envelopes_new() all derive their own values from
+    it (see their own call sites) instead of each running a separate
+    gpd.sjoin(). create_admin_view_from_envelopes_new() consumes it at the
+    z14-tile level, same as the mercator view, then aggregates UP to admin
+    regions unchanged (area-mean for probability, raw-weighted sum for E_*);
+    see the NOTE directly following this function's own module-level comment
+    block for why an admin-region-level bitmask would be the wrong quantity
+    to compute directly.
 
     Args:
         gdf_envelopes: GeoDataFrame with columns ensemble_member,
@@ -4702,28 +3307,54 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
         gdf_envelopes. Each DataFrame has columns ['tile_id', 'bits']
         (bits: uint64), one row per distinct tile with >=1 member's envelope
         covering it, a tile with zero coverage from every member simply
-        doesn't appear, the same sparse convention River's own bitmask uses
-        (real, not a fabricated 0 row). A threshold with a real
-        zero-intersection result (e.g. no member reaches 137kt over land for
-        this storm) returns an empty DataFrame for that threshold, not an
-        error; mirrors create_tracks_view_from_envelopes's own
-        zero-intersection fallback.
+        doesn't appear, the same sparse convention River's own bitmask uses.
+        A threshold with a zero-intersection result (e.g. no member reaches
+        137kt over land for this storm) returns an empty DataFrame for that
+        threshold, not an error; mirrors create_tracks_view_from_envelopes's
+        own zero-intersection fallback.
 
         A threshold whose sjoin actually fails maps to None, not to an empty
-        DataFrame: the two are distinguishable downstream, where an empty
-        DataFrame means a legitimate 'no member reaches this threshold' and
-        None means the sjoin itself failed and no file should be written for
-        it; otherwise a self-intersecting geometry could silently persist a
-        zero-row parquet indistinguishable from a real zero-hazard result.
-        Callers MUST skip a None (see the two call sites in
-        create_views_from_envelopes_in_country, which skip writing a file for
-        it). 'tile_id' is also emitted with the SAME pandas 'string' dtype in
+        DataFrame: the two are distinguishable downstream (empty means a
+        legitimate "no member reaches this threshold", None means the sjoin
+        itself failed and no file should be written for it). Callers MUST
+        skip a None (see the two call sites in
+        create_views_from_envelopes_in_country, which skip writing a file
+        for it). 'tile_id' is emitted with the SAME pandas 'string' dtype in
         the empty and non-empty cases, so both file variants share one
         parquet schema.
     """
-    tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
     thresholds = sorted(gdf_envelopes[threshold_column].unique())
     bitmask_views = {}
+
+    if gdf_envelopes.empty or gdf_tiles.empty:
+        return {th: pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
+                for th in thresholds}
+
+    try:
+        # Reprojected + tile centroids extracted ONCE, outside the per-threshold/
+        # per-member loop below: this is the one real per-call cost (402k rows
+        # for a country the size of MEX), reused for every member at every
+        # threshold via _sample_tile_centroids_against_mask()'s own bounds-check
+        # design (a member's small mask safely no-ops for tiles outside its own
+        # extent, no bbox pre-filter needed).
+        tiles_3857 = gdf_tiles[['tile_id', 'geometry']].to_crs(3857)
+        tile_ids_arr = tiles_3857['tile_id'].to_numpy()
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Geometry is in a geographic CRS')
+            _tile_centroids = tiles_3857.geometry.centroid
+        cx = _tile_centroids.x.to_numpy()
+        cy = _tile_centroids.y.to_numpy()
+    except Exception as e:
+        # None (not an empty frame) so the caller can tell a real failure from
+        # a legitimate zero-intersection; see this function's own Returns
+        # section. A reprojection failure here is unrecoverable for every
+        # threshold, not just one, unlike the per-threshold rasterize failure
+        # handled below.
+        logger.error(f"tile_member_bitmask [{label}] tile reprojection FAILED, "
+                     f"no bitmask files will be written for this country: {e}")
+        return {th: None for th in thresholds}
+
+    tile_size_m = _z14_tile_size_m()
 
     for th in thresholds:
         envs_th = gdf_envelopes[gdf_envelopes[threshold_column] == int(th)][
@@ -4732,56 +3363,41 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
         if envs_th.empty:
             bitmask_views[th] = pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
             continue
+
         try:
-            # The CRS check/reprojection sits inside this try block so a
-            # naive-geometry CRS mismatch (gdf_tiles.crs is None or
-            # gdf_envelopes.crs is None) is caught here rather than
-            # propagating out of the unwrapped call site in
-            # create_views_from_envelopes_in_country(), which would otherwise
-            # lose that country's JSON report (and, for the wind call, the
-            # entire gust section that runs after it). In practice CRS is
-            # always EPSG:4326 for both inputs (hardcoded in
-            # convert_envelopes_to_geodataframe / geoparquet tiles), so this
-            # is defensive hardening rather than a live failure mode; it
-            # shares the same zero-intersection fallback the sjoin itself
-            # already has below.
-            if tiles_geom.crs != envs_th.crs:
-                tiles_geom_proj = tiles_geom.to_crs(envs_th.crs)
-            else:
-                tiles_geom_proj = tiles_geom
-            joined = gpd.sjoin(tiles_geom_proj, envs_th, how='inner', predicate='intersects')
-            if 'tile_id' not in joined.columns:
-                joined = joined.reset_index()
+            envs_th_3857 = envs_th.to_crs(3857) if envs_th.crs != 3857 else envs_th
+            tile_bits_accum = np.zeros(len(tile_ids_arr), dtype=np.uint64)
+            for _, row in envs_th_3857.iterrows():
+                geom = row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                member = int(row['ensemble_member'])
+                mask_arr, transform = _rasterize_member_envelope_mask(geom, tile_size_m)
+                inside = _sample_tile_centroids_against_mask(cx, cy, mask_arr, transform)
+                if inside.any():
+                    tile_bits_accum[inside] |= np.uint64(1) << np.uint64(member - 1)
         except Exception as e:
             # None (not an empty frame) so the caller can tell a real
             # failure from a legitimate zero-intersection; see this
             # function's own Returns section.
-            logger.error(f"tile_member_bitmask [{label}] sjoin FAILED at {threshold_column}={th}, "
+            logger.error(f"tile_member_bitmask [{label}] rasterize FAILED at {threshold_column}={th}, "
                          f"no bitmask file will be written for it: {e}")
             bitmask_views[th] = None
             continue
 
-        if joined.empty:
+        if not tile_bits_accum.any():
             bitmask_views[th] = pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
             continue
 
-        # Per-row bit for that row's own member, OR-reduced per tile,
-        # vectorized (no per-row Python loop), same np.unique(...,
-        # return_inverse=True) + np.bitwise_or.at pattern the dashboard
-        # repo's own _RiverExtentCache already uses for its per-batch
-        # bitmask reduction.
-        member_arr = joined['ensemble_member'].to_numpy().astype(np.uint64)
-        bits = np.uint64(1) << (member_arr - np.uint64(1))
-        tile_ids = joined['tile_id'].to_numpy()
-        uniq_tiles, inverse = np.unique(tile_ids, return_inverse=True)
-        tile_bits = np.zeros(len(uniq_tiles), dtype=np.uint64)
-        np.bitwise_or.at(tile_bits, inverse, bits)
-
+        # Sparse output, same convention as before (only tiles with at least
+        # one member's real coverage appear), via a vectorized boolean-mask
+        # select.
+        nonzero = tile_bits_accum != 0
         bitmask_views[th] = pd.DataFrame({
             # Same pandas 'string' dtype the empty-threshold frames above
             # use, so every parquet this function feeds shares one schema.
-            'tile_id': pd.array(uniq_tiles.astype(str), dtype='string'),
-            'bits': tile_bits,
+            'tile_id': pd.array(tile_ids_arr[nonzero].astype(str), dtype='string'),
+            'bits': tile_bits_accum[nonzero],
         })
 
     return bitmask_views
@@ -4790,25 +3406,21 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
 # NOTE: there is deliberately NO per-ADMIN-REGION member bitmask here.
 #
 # Running calculate_tile_member_bitmask against admin polygons instead of z14
-# tiles (bit `m` set <=> member `m`'s envelope intersects the region ANYWHERE)
-# is a real quantity, but it is not the one the admin layer renders.
-# create_admin_view_from_envelopes_new
-# defines an admin region's `probability` as the AREA-MEAN of its z14 tiles'
-# probabilities ('probability' sits in avg_cols and is aggregated with
-# "mean"), and its E_* columns as sum_over_tiles(raw_tile x prob_tile). So
-# popcount(bits)/51 does NOT reproduce the admin layer's own probability the
-# way the z14 bitmask exactly reproduces the tile layer's; for a large
-# admin-1 that a cyclone only clips it overstates by 10-100x, and the
-# dashboard's combined layer could read HIGHER than every single-hazard layer
-# it was built from.
+# tiles (bit `m` set <=> member `m`'s envelope intersects the region anywhere)
+# is a real quantity, but not the one the admin layer renders.
+# create_admin_view_from_envelopes_new defines an admin region's `probability`
+# as the AREA-MEAN of its z14 tiles' probabilities (mean, via avg_cols), and
+# its E_* columns as sum_over_tiles(raw_tile x prob_tile). popcount(bits)/51
+# does not reproduce that; for a large admin-1 a cyclone only clips, it
+# overstates by 10-100x, and the dashboard's combined layer could read higher
+# than every single-hazard layer it was built from.
 #
-# There is no per-region summary that fixes this: an exact cross-hazard union
-# needs per-member per-TILE sets, which is exactly what the z14 bitmask
-# (calculate_tile_member_bitmask above, TILE_WIND_BITMASK_MAT /
-# TILE_GUST_BITMASK_MAT) already carries. The dashboard therefore unions at
-# z14 and aggregates DOWN to admin regions with the same two aggregations
-# used here (mean for probability, raw-weighted sum for E_*), which also
-# covers river/precip for free; see services/tile_server.py's own
+# No per-region summary fixes this: an exact cross-hazard union needs
+# per-member per-TILE sets, which the z14 bitmask (calculate_tile_member_
+# bitmask above, TILE_WIND_BITMASK_MAT/TILE_GUST_BITMASK_MAT) already carries.
+# The dashboard unions at z14 and aggregates down to admin regions with the
+# same two aggregations used here (mean for probability, raw-weighted sum for
+# E_*), covering river/precip for free; see services/tile_server.py's
 # _combine_bitmask_aware_admin in the Ahead-of-the-Storm repo.
 
 
@@ -4817,7 +3429,8 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
 # Top-level function called per country per storm on every --type update run.
 # Coordinates all view generation, CCI calculation, and report writing.
 # =============================================================================
-def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=None):
+def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=None,
+                                            admin_levels_by_country=None):
     """
     Create and save all impact views for a country from hurricane envelopes.
 
@@ -4831,7 +3444,6 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     - Admin level impact views (for every admin level that has a base parquet)
     - Child Cyclone Index (CCI) views (both tile and admin level)
     - Track views (severity metrics per ensemble member)
-    - JSON impact report
     - Gust envelope core exposure views (school/HC/shelter/WASH/tiles/admin/tracks
       only, if gdf_envelopes_gust is provided; no CCI/vulnerability/report for gust)
 
@@ -4845,6 +3457,17 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             (same shape as gdf_envelopes, 'gust_threshold' column instead of
             'wind_threshold'). None or empty means no gust data for this
             storm/forecast, gust views are skipped, wind views are unaffected.
+        admin_levels_by_country: Optional bulk-precomputed {country: [levels]}
+            mapping from get_initialized_admin_levels_bulk(), the same shared
+            admin_views/ directory listing precip/river's own per-country
+            processing already reuses this way. When given, this function
+            looks this country's own levels up in it instead of calling
+            get_initialized_admin_levels(country) itself, which would re-list
+            that same shared, country-independent directory redundantly for
+            every country a caller processes in a loop. None (the default,
+            for any caller that doesn't have a bulk mapping handy, e.g. a
+            standalone/test invocation) falls back to the original
+            per-country listing so this function stays correct on its own.
 
     Note:
         Base data (mercator tiles, admin views) are loaded if available, or created
@@ -4858,17 +3481,20 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             presence), not a fixed placeholder, feeds TC_PIPELINE_RUN_LOG/
             TC_PIPELINE_COMPLETE_LOG's FILES_WRITTEN column. gust_error is None on
             success (including the normal "no gust data for this storm" case) or
-            the exception message if gust processing raised -- wind views are
+            the exception message if gust processing raised; wind views are
             still saved and files_written still reflects them (see the gust
             try/except below), but the caller can surface gust_error into
             TC_PIPELINE_RUN_LOG's error_message so a gust-specific failure is
             visible even on an otherwise STATUS=SUCCESS run, rather than only
             ever reaching a container's own stdout log.
     """
-    admin_levels = get_initialized_admin_levels(country)
-    if not admin_levels:
-        # Fallback: ensure admin1 is always processed (creates on-the-fly if missing)
-        admin_levels = [1]
+    if admin_levels_by_country is not None:
+        admin_levels = admin_levels_by_country.get(country) or [1]
+    else:
+        admin_levels = get_initialized_admin_levels(country)
+        if not admin_levels:
+            # Fallback: ensure admin1 is always processed (creates on-the-fly if missing)
+            admin_levels = [1]
 
     # Track whether any base parquets were written during this run (emergency fallbacks).
     # Returned to the caller so it can call REFRESH_BASE_LAYER_TABLES() if needed.
@@ -4880,61 +3506,90 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # levels, gust presence).
     files_written = 0
 
-    # Remove all existing output files for this country/storm/forecast run before writing
-    # new ones. This prevents stale threshold files (e.g. from a run where 137kt had a
-    # few envelope members that have since been cleaned up) from persisting on the stage.
+    # Stale-threshold cleanup (e.g. a run where 137kt had a few envelope
+    # members that have since been cleaned up) happens AFTER all new views are
+    # written, not before: deleting first and writing incrementally afterward
+    # leaves a window where, if this call is interrupted partway through,
+    # already-deleted-but-not-yet-rewritten view types are simply MISSING
+    # rather than stale, and this file's convention (data_store.file_exists()
+    # checks throughout) treats a missing file as a silent skip, not a loud
+    # error - an understated impact number, not a visible failure. Only
+    # capture the pre-run file list here; written_paths (populated at every
+    # save_*() call below) is diffed against it at the end, and only genuinely
+    # stale leftovers (existed before, never rewritten this call) are deleted.
     prefix = f"{country}_{storm}_{date}_"
-    for view_dir in ('school_views', 'hc_views', 'shelter_views', 'wash_views',
-                     'mercator_views', 'admin_views', 'track_views', 'track_tile_bitmask_views',
-                     'school_views_gust', 'hc_views_gust', 'shelter_views_gust', 'wash_views_gust',
-                     'mercator_views_gust', 'admin_views_gust', 'track_views_gust', 'track_tile_bitmask_views_gust'):
+    view_dirs_to_clean = ('school_views', 'hc_views', 'shelter_views', 'wash_views',
+                          'mercator_views', 'admin_views', 'track_views', 'track_tile_bitmask_views',
+                          'school_views_gust', 'hc_views_gust', 'shelter_views_gust', 'wash_views_gust',
+                          'mercator_views_gust', 'admin_views_gust', 'track_views_gust', 'track_tile_bitmask_views_gust')
+    existing_before = {}
+    for view_dir in view_dirs_to_clean:
         dir_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, view_dir)
         try:
-            existing = data_store.list_files(dir_path)
-            for f in existing:
-                fname = os.path.basename(f)
-                if fname.startswith(prefix):
-                    data_store.remove(f)
-                    logger.debug(f"Removed stale file: {f}")
+            existing_before[view_dir] = [f for f in data_store.list_files(dir_path)
+                                         if os.path.basename(f).startswith(prefix)]
         except Exception as e:
-            logger.warning(f"Could not clean up {view_dir} for {country}/{storm}/{date}: {e}")
+            logger.warning(f"Could not list {view_dir} for {country}/{storm}/{date}: {e}")
+            existing_before[view_dir] = []
+
+    # Populated at every save_*() call site below with the real path each one
+    # wrote, so the end-of-function cleanup step can tell a genuinely stale
+    # leftover (in existing_before, never added here) from a file this call
+    # rewrote (in existing_before AND here, left alone).
+    written_paths = set()
 
     logger.info(f"  Processing {country}...")
 
     # Schools
     logger.info(f"    Processing schools...")
-    gdf_schools = fetch_schools(country, rewrite=0)
+    gdf_schools = fetch_schools(country, rewrite=0, fast_fail=True)
+    # Buffered ONCE here and reused for every one of this call's own
+    # school-facing calls below (wind view, wind tracks, and, when gust data
+    # is present, gust view and gust tracks): see _precompute_facility_
+    # buffer()'s own docstring for why a single buffer is correct to reuse
+    # across all of them, instead of each independently re-buffering the
+    # exact same gdf_schools.
+    gdf_schools_buff = _precompute_facility_buffer(gdf_schools, 'school_id_giga', 'school')
 
-    wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes)
+    wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes, precomputed_buff=gdf_schools_buff)
     for wind_th in wind_school_views:
-        save_school_view(wind_school_views[wind_th], country, storm, date, wind_th)
+        written_paths.add(save_school_view(wind_school_views[wind_th], country, storm, date, wind_th))
     files_written += len(wind_school_views)
     logger.info(f"    Created {len(wind_school_views)} school views")
 
     # Health centers
     logger.info(f"    Processing health centers...")
-    gdf_hcs = fetch_health_centers(country, rewrite=0)
-    wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes)
+    gdf_hcs = fetch_health_centers(country, rewrite=0, fast_fail=True)
+    # Same single-buffer reuse as gdf_schools_buff above, filtered to
+    # HC_FACILITY_TYPES first (_filter_hcs_to_relevant_types) so the reused
+    # buffer matches what every HC-facing call below would have filtered to
+    # on its own.
+    gdf_hcs_buff = _precompute_facility_buffer(gdf_hcs, 'osm_id', 'health center', filter_fn=_filter_hcs_to_relevant_types)
+    wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, precomputed_buff=gdf_hcs_buff)
     for wind_th in wind_hc_views:
-        save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th)
+        written_paths.add(save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th))
     files_written += len(wind_hc_views)
     logger.info(f"    Created {len(wind_hc_views)} health center views")
 
     # Shelters
     logger.info(f"    Processing shelters...")
-    gdf_shelters = fetch_shelters(country, rewrite=0)
-    wind_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes)
+    gdf_shelters = fetch_shelters(country, rewrite=0, fast_fail=True)
+    # Same single-buffer reuse as gdf_schools_buff above.
+    gdf_shelters_buff = _precompute_facility_buffer(gdf_shelters, 'osm_id', 'shelter')
+    wind_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, precomputed_buff=gdf_shelters_buff)
     for wind_th in wind_shelter_views:
-        save_shelter_view(wind_shelter_views[wind_th], country, storm, date, wind_th)
+        written_paths.add(save_shelter_view(wind_shelter_views[wind_th], country, storm, date, wind_th))
     files_written += len(wind_shelter_views)
     logger.info(f"    Created {len(wind_shelter_views)} shelter views")
 
     # WASH
     logger.info(f"    Processing WASH...")
-    gdf_wash = fetch_wash(country, rewrite=0)
-    wind_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes)
+    gdf_wash = fetch_wash(country, rewrite=0, fast_fail=True)
+    # Same single-buffer reuse as gdf_schools_buff above.
+    gdf_wash_buff = _precompute_facility_buffer(gdf_wash, 'osm_id', 'WASH facility')
+    wind_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, precomputed_buff=gdf_wash_buff)
     for wind_th in wind_wash_views:
-        save_wash_view(wind_wash_views[wind_th], country, storm, date, wind_th)
+        written_paths.add(save_wash_view(wind_wash_views[wind_th], country, storm, date, wind_th))
     files_written += len(wind_wash_views)
     logger.info(f"    Created {len(wind_wash_views)} WASH views")
 
@@ -4951,31 +3606,58 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             wrote_base_parquet = True
     except Exception as e:
         logger.error(f"    {country}: Mercator view missing, creating on-the-fly ({e}). Run --type initialize first.")
-        view = create_mercator_country_layer(country, zoom, rewrite=0)
+        view = create_mercator_country_layer(country, zoom, rewrite=0, fast_fail=True)
         gdf_tiles, _ = add_admin_ids(view, country)
         save_mercator_view(gdf_tiles, country, zoom)
         wrote_base_parquet = True
         logger.info(f"    Created and saved base mercator tiles: {len(gdf_tiles)} tiles")
 
-    wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes)
+    # Population columns are a hard init-time requirement (same check
+    # create_mercator_view_from_envelopes()/create_admin_view_from_envelopes_new()/
+    # create_tracks_view_from_envelopes() each also run internally as a
+    # defense-in-depth default for other callers). Checked HERE too, before
+    # the bitmask precompute below, so a country with incomplete base data
+    # fails immediately rather than paying for a full rasterize pass first.
+    # gdf_tiles is not reassigned below this point (wind or gust), so one
+    # check here covers both hazards.
+    _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
+    if _missing_pop_cols:
+        raise ValueError(
+            f"gdf_tiles is missing {_missing_pop_cols}, run "
+            f"'--type patch --columns {' '.join(_missing_pop_cols)}' for this country "
+            f"before mercator tile impact views can be computed."
+        )
+
+    # Per-tile, per-member coverage bitmask: computed ONCE per hazard here and
+    # reused by every view below (mercator tiles, every admin level, tracks,
+    # and this function's own bitmask MAT save) instead of each independently
+    # recomputing this expensive per-member reprojection+rasterize pass.
+    # Repeating it 4x per hazard (8 total) with no memory released between is
+    # an avoidable OOM risk at large-country scale. See
+    # calculate_tile_member_bitmask's own docstring for the computation itself.
+    wind_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
+                                                       threshold_column='wind_threshold',
+                                                       label='wind tile')
+
+    wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, bitmask_views=wind_bitmask_views)
     for wind_th in wind_tiles_views:
-        save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom)
+        written_paths.add(save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom))
     files_written += len(wind_tiles_views)
     logger.info(f"    Created {len(wind_tiles_views)} tile views")
 
     # CCI for tiles
     cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
-    save_cci_tiles(cci_tiles_view, country, storm, date, zoom)
+    written_paths.add(save_cci_tiles(cci_tiles_view, country, storm, date, zoom))
     files_written += 1
 
     # Vulnerability (people/children in need): wind-dependent poverty weighting
     vuln_tiles_view = calculate_vulnerability_view(wind_tiles_views, gdf_tiles)
-    save_vulnerability_tiles(vuln_tiles_view, country, storm, date, zoom)
+    written_paths.add(save_vulnerability_tiles(vuln_tiles_view, country, storm, date, zoom))
     files_written += 1
 
     # Per-member vulnerability: analogous to per-threshold track parquets
     vuln_tracks_view = calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles)
-    save_vulnerability_tracks(vuln_tracks_view, country, storm, date, zoom)
+    written_paths.add(save_vulnerability_tracks(vuln_tracks_view, country, storm, date, zoom))
     files_written += 1
     logger.info(f"    Created vulnerability tracks view ({len(vuln_tracks_view)} members)")
 
@@ -4991,7 +3673,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             logger.info(f"    Loaded existing admin{admin_level}: {len(gdf_admin)} regions")
         except Exception as e:
             logger.error(f"    {country}: Admin{admin_level} view missing, creating on-the-fly ({e}). Run --type initialize first.")
-            gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=admin_level)
+            gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=admin_level, fast_fail=True)
             save_admin_view(gdf_admin, country, admin_level=admin_level)
             wrote_base_parquet = True
             logger.info(f"    Created and saved base admin{admin_level}: {len(gdf_admin)} regions")
@@ -5009,10 +3691,21 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         gdf_admin_by_level[admin_level] = gdf_admin
         gdf_tiles_for_admin_by_level[admin_level] = gdf_tiles_for_admin
 
-        wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles_for_admin, gdf_envelopes)
+        # precomputed_tile_views reuses wind_tiles_views (this country's
+        # already-computed mercator tile view) for admin level 1 only:
+        # `gdf_tiles_for_admin is gdf_tiles` is the same identity check its
+        # construction above already keys off (admin_level == 1 sets
+        # gdf_tiles_for_admin = gdf_tiles directly), so this stays correct
+        # even if admin_levels is reordered. See
+        # create_admin_view_from_envelopes_new()'s docstring for why this
+        # reuse is safe (byte-identical per-tile inputs).
+        wind_admin_views = create_admin_view_from_envelopes_new(
+            gdf_admin, gdf_tiles_for_admin, gdf_envelopes,
+            bitmask_views=wind_bitmask_views,
+            precomputed_tile_views=(wind_tiles_views if gdf_tiles_for_admin is gdf_tiles else None))
         for wind_th in wind_admin_views:
-            save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th,
-                                  admin_level=admin_level)
+            written_paths.add(save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th,
+                                                     admin_level=admin_level))
         files_written += len(wind_admin_views)
         logger.info(f"    Created {len(wind_admin_views)} admin{admin_level} views")
 
@@ -5032,7 +3725,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             agg['id'] = agg['zone_id'].map(id_map)
         agg = agg.groupby("id").agg(agg_dict).reset_index()
         cci_admin_view = agg.rename(columns={'id': 'tile_id'})
-        save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level)
+        written_paths.add(save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level))
         files_written += 1
 
         # Vulnerability for this admin level
@@ -5043,35 +3736,23 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             vagg['id'] = vagg['zone_id'].map(id_map)
         vagg = vagg.groupby("id").agg(vagg_dict).reset_index()
         vuln_admin_view = vagg.rename(columns={'id': 'tile_id'})
-        save_vulnerability_admin(vuln_admin_view, country, storm, date, admin_level=admin_level)
+        written_paths.add(save_vulnerability_admin(vuln_admin_view, country, storm, date, admin_level=admin_level))
         files_written += 1
-
-    # Keep a reference to admin1 for the JSON report (always in admin_levels or generated above)
-    try:
-        gdf_admin = load_admin_view(country, admin_level=1)
-    except Exception:
-        gdf_admin = create_admin_country_layer(country, rewrite=0, admin_level=1)
-
-    agg_dict = {col: (lambda x: x.sum(min_count=1)) for col in sum_cols_cci}
-    agg = cci_tiles_view.groupby("id").agg(agg_dict).reset_index()
-    cci_admin_view = agg.rename(columns={'id': 'tile_id'})
-
-    # Re-load admin1 wind views for the report (already saved above)
-    wind_admin_views = create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes)
 
     # Tracks
     logger.info(f"    Processing tracks...")
-    wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=gdf_shelters, gdf_wash=gdf_wash)
+    wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=gdf_shelters, gdf_wash=gdf_wash,
+                                                           bitmask_views=wind_bitmask_views,
+                                                           schools_buff=gdf_schools_buff, hcs_buff=gdf_hcs_buff,
+                                                           shelters_buff=gdf_shelters_buff, wash_buff=gdf_wash_buff)
     for wind_th in wind_tracks_views:
-        save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th)
+        written_paths.add(save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th))
     files_written += len(wind_tracks_views)
     logger.info(f"    Created {len(wind_tracks_views)} track views")
 
-    # Per-tile, per-member coverage bitmask: see calculate_tile_member_bitmask's
-    # own docstring for the full "why".
-    wind_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
-                                                       threshold_column='wind_threshold',
-                                                       label='wind tile')
+    # Per-tile, per-member coverage bitmask: already computed once, above,
+    # and reused here rather than recomputed (see the comment at its first
+    # computation for the full "why").
     # A None entry means that threshold's sjoin genuinely FAILED (see
     # calculate_tile_member_bitmask's own Returns section), skip it rather
     # than persisting a zero-row parquet that downstream cannot tell apart
@@ -5080,17 +3761,10 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     for wind_th, bm in wind_bitmask_views.items():
         if bm is None:
             continue
-        save_tracks_tile_bitmask_view(bm, country, storm, date, wind_th)
+        written_paths.add(save_tracks_tile_bitmask_view(bm, country, storm, date, wind_th))
         wind_bitmask_written += 1
     files_written += wind_bitmask_written
     logger.info(f"    Created {wind_bitmask_written} tile-member bitmask views")
-
-    df_tracks = get_tracks(date, storm)
-    gdf_tracks = convert_to_geodataframe(df_tracks)
-
-    json_report = do_report(wind_school_views, wind_hc_views, wind_tiles_views, wind_admin_views, cci_tiles_view, cci_admin_view, gdf_admin, gdf_tracks, country, storm, date, wind_shelter_views=wind_shelter_views, wind_wash_views=wind_wash_views, vulnerability_tiles_view=vuln_tiles_view)
-    save_json_report(json_report, country, storm, date)
-    files_written += 1
 
     # --- Gust envelopes (optional, core exposure views only) ---
     # No CCI, vulnerability, or JSON report for gust
@@ -5103,57 +3777,73 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         try:
             logger.info(f"    Processing gust envelopes ({len(gdf_envelopes_gust)} records)...")
 
-            gust_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes_gust, threshold_column='gust_threshold')
+            # Same precomputed buffers as wind's own view calls above are reused
+            # here too: gdf_schools/gdf_hcs/gdf_shelters/gdf_wash are unchanged
+            # between wind and gust processing (only the envelopes differ), so
+            # the buffered geometry computed once at the top of this function
+            # remains correct for gust's own facility calls as well.
+            gust_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_schools_buff)
             for gth in gust_school_views:
-                save_school_view(gust_school_views[gth], country, storm, date, gth, dataset='gust')
+                written_paths.add(save_school_view(gust_school_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_school_views)
 
-            gust_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes_gust, threshold_column='gust_threshold')
+            gust_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_hcs_buff)
             for gth in gust_hc_views:
-                save_hc_view(gust_hc_views[gth], country, storm, date, gth, dataset='gust')
+                written_paths.add(save_hc_view(gust_hc_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_hc_views)
 
-            gust_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes_gust, threshold_column='gust_threshold')
+            gust_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_shelters_buff)
             for gth in gust_shelter_views:
-                save_shelter_view(gust_shelter_views[gth], country, storm, date, gth, dataset='gust')
+                written_paths.add(save_shelter_view(gust_shelter_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_shelter_views)
 
-            gust_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes_gust, threshold_column='gust_threshold')
+            gust_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_wash_buff)
             for gth in gust_wash_views:
-                save_wash_view(gust_wash_views[gth], country, storm, date, gth, dataset='gust')
+                written_paths.add(save_wash_view(gust_wash_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_wash_views)
 
-            gust_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes_gust, threshold_column='gust_threshold')
+            # Per-tile, per-member coverage bitmask: computed ONCE here, same
+            # hoisting rationale as wind's own bitmask above (see that
+            # comment for the full "why").
+            gust_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes_gust, gdf_tiles,
+                                                               threshold_column='gust_threshold',
+                                                               label='gust tile')
+
+            gust_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes_gust, threshold_column='gust_threshold',
+                                                                    bitmask_views=gust_bitmask_views)
             for gth in gust_tiles_views:
-                save_tiles_view(gust_tiles_views[gth], country, storm, date, gth, zoom, dataset='gust')
+                written_paths.add(save_tiles_view(gust_tiles_views[gth], country, storm, date, gth, zoom, dataset='gust'))
             files_written += len(gust_tiles_views)
 
             for admin_level in admin_levels:
+                # Same admin-level-1 reuse as wind's own call above, this
+                # time against gust_tiles_views: see wind's own call site
+                # comment and create_admin_view_from_envelopes_new()'s
+                # docstring for the full "why".
                 gust_admin_views = create_admin_view_from_envelopes_new(
                     gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level],
-                    gdf_envelopes_gust, threshold_column='gust_threshold')
+                    gdf_envelopes_gust, threshold_column='gust_threshold', bitmask_views=gust_bitmask_views,
+                    precomputed_tile_views=(gust_tiles_views if gdf_tiles_for_admin_by_level[admin_level] is gdf_tiles else None))
                 for gth in gust_admin_views:
-                    save_admin_tiles_view(gust_admin_views[gth], country, storm, date, gth,
-                                          admin_level=admin_level, dataset='gust')
+                    written_paths.add(save_admin_tiles_view(gust_admin_views[gth], country, storm, date, gth,
+                                                             admin_level=admin_level, dataset='gust'))
                 files_written += len(gust_admin_views)
 
             gust_tracks_views = create_tracks_view_from_envelopes(
                 gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes_gust, index_column='ensemble_member',
-                gdf_shelters=gdf_shelters, gdf_wash=gdf_wash, threshold_column='gust_threshold')
+                gdf_shelters=gdf_shelters, gdf_wash=gdf_wash, threshold_column='gust_threshold',
+                bitmask_views=gust_bitmask_views,
+                schools_buff=gdf_schools_buff, hcs_buff=gdf_hcs_buff,
+                shelters_buff=gdf_shelters_buff, wash_buff=gdf_wash_buff)
             for gth in gust_tracks_views:
-                save_tracks_view(gust_tracks_views[gth], country, storm, date, gth, dataset='gust')
+                written_paths.add(save_tracks_view(gust_tracks_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_tracks_views)
 
-            # Same as wind's own bitmask above: see
-            # calculate_tile_member_bitmask's own docstring.
-            gust_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes_gust, gdf_tiles,
-                                                               threshold_column='gust_threshold',
-                                                               label='gust tile')
             # Same skip-on-None contract as the wind call site above.
             for gth, bm in gust_bitmask_views.items():
                 if bm is None:
                     continue
-                save_tracks_tile_bitmask_view(bm, country, storm, date, gth, dataset='gust')
+                written_paths.add(save_tracks_tile_bitmask_view(bm, country, storm, date, gth, dataset='gust'))
                 files_written += 1
 
             logger.info(f"    Created gust views ({len(gust_school_views)} thresholds)")
@@ -5166,6 +3856,22 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             )
     else:
         logger.info(f"    No gust envelope data for {country}/{storm}/{date}, skipping gust views")
+
+    # Stale-threshold cleanup, deferred from the top of this function (see the
+    # comment there): delete only pre-existing files this call never rewrote.
+    # Matched by basename, not exact path string, since data_store.list_files()'s
+    # returned path format isn't guaranteed identical to what write_dataset() was
+    # given; the removal itself still uses list_files()'s own returned string,
+    # the same pattern the original upfront-delete loop already relied on.
+    written_basenames = {os.path.basename(p) for p in written_paths if p}
+    for view_dir, existing in existing_before.items():
+        for f in existing:
+            if os.path.basename(f) not in written_basenames:
+                try:
+                    data_store.remove(f)
+                    logger.debug(f"Removed stale file: {f}")
+                except Exception as e:
+                    logger.warning(f"Could not remove stale file {f} in {view_dir}: {e}")
 
     return wrote_base_parquet, files_written, gust_error
 

@@ -121,7 +121,7 @@ jobs:
               date_str = current.strftime('%Y-%m-%d')
               print(f'Processing date: {date_str}')
 
-              # run_precip_analysis() now respects --date (MET_FORECASTS retains one row
+              # run_precip_analysis() respects --date (MET_FORECASTS retains one row
               # per past forecast cycle, same as TC_ENVELOPES_COMBINED retains historical
               # envelopes), so this correctly backfills precip for date_str's own cycle
               # instead of redundantly reprocessing today's latest cycle each iteration.

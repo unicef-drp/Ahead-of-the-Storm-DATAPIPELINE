@@ -46,6 +46,14 @@ class Config:
     # Azure Blob Storage Configuration
     ACCOUNT_URL = os.getenv('ACCOUNT_URL')
     SAS_TOKEN = os.getenv('SAS_TOKEN')
+    # CONTAINER_NAME must be set explicitly and passed to ADLSDataStore rather than
+    # left to its own container=config.ADLS_CONTAINER_NAME default: that default reads
+    # the generic ADLS_CONTAINER_NAME env var, the same one HAZARD_DATA_SOURCE=BLOB's
+    # own giga-spatial calls (and any other bare ADLSDataStore() construction elsewhere
+    # in this repo) already rely on for an unrelated shared storage account. Leaving
+    # this repo's own output store to that same default risks silently writing to
+    # whatever container ADLS_CONTAINER_NAME happens to point at for that other purpose.
+    CONTAINER_NAME = os.getenv('CONTAINER_NAME')
     DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL').strip().upper()
 
     # Hazard source data (wind/gust envelopes, tracks, precip/runoff) read mode.
@@ -81,11 +89,7 @@ class Config:
     STORMS_FILE = os.getenv('STORMS_FILE', 'storms.json')
     VIEWS_DIR = os.getenv('VIEWS_DIR', 'aos_views')
     ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR', 'geodb')
-    
-    # Report Configuration (optional)
-    REPORTS_JSON_DIR = os.getenv('REPORTS_JSON_DIR', 'jsons')  # Subdirectory for JSON reports under RESULTS_DIR
-    REPORT_TEMPLATE_PATH = os.getenv('REPORT_TEMPLATE_PATH', 'impact-report-template.html')  # HTML template path
-    
+
     @classmethod
     def validate_snowflake_config(cls):
         """Validate that all required Snowflake configuration is present"""
@@ -130,14 +134,19 @@ class Config:
     def validate_azure_config(cls):
         """Validate that all required Azure configuration is present"""
         if cls.DATA_PIPELINE_DB == 'BLOB':
-            required_vars = ['ACCOUNT_URL', 'SAS_TOKEN']
+            required_vars = ['ACCOUNT_URL', 'SAS_TOKEN', 'CONTAINER_NAME']
             missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
             if missing:
                 raise ValueError(f"Missing Azure environment variables: {', '.join(missing)}")
     
     @classmethod
     def validate_storage_config(cls):
-        """Validate storage configuration based on DATA_PIPELINE_DB setting"""
+        """Validate storage configuration based on DATA_PIPELINE_DB setting.
+
+        Not currently called anywhere; get_data_store() in data_store_utils.py
+        duplicates this same dispatch/unrecognized-value logic inline instead of
+        calling this method. Not a behavioral bug today (both implementations are
+        equivalent), but keep them in sync if either one changes."""
         if cls.DATA_PIPELINE_DB == 'BLOB':
             cls.validate_azure_config()
         elif cls.DATA_PIPELINE_DB == 'SNOWFLAKE':
@@ -152,10 +161,18 @@ class Config:
     def validate_hazard_data_source_config(cls):
         """Validate configuration for HAZARD_DATA_SOURCE (upstream hazard
         source data read mode), independent of validate_storage_config(),
-        which is about this repo's own output/cache instead. Only ever
-        called for LOCAL/BLOB (via get_hazard_data_store()); the SNOWFLAKE
-        case needs no extra validation beyond the existing Snowflake
-        credential checks already performed elsewhere."""
+        which is about this repo's own output/cache instead. Every real
+        caller today branches around this function entirely for SNOWFLAKE
+        (get_hazard_met_data_store()/get_river_forecasts_data_store() call
+        get_met_forecasts_data_store()/get_river_forecasts_data_store()'s own
+        Snowflake path directly), so the SNOWFLAKE branch below is currently
+        unreached in practice; it exists so a future uniform validation pass
+        does not hard-fail on the default HAZARD_DATA_SOURCE value, and so
+        SNOWFLAKE_STAGE_NAME specifically is actually checked somewhere: the
+        other six Snowflake credentials are covered by validate_snowflake_config()
+        via the pointer-table query's own connection setup, but STAGE_NAME is
+        only otherwise checked by validate_snowflake_storage_config(), which is
+        wired to DATA_PIPELINE_DB=SNOWFLAKE, not HAZARD_DATA_SOURCE."""
         if cls.HAZARD_DATA_SOURCE == 'LOCAL':
             required_vars = ['HAZARD_LOCAL_WIND_DIR', 'HAZARD_LOCAL_TRACKS_DIR', 'HAZARD_LOCAL_MET_DIR']
             missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
@@ -166,6 +183,9 @@ class Config:
             missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
             if missing:
                 raise ValueError(f"Missing HAZARD_DATA_SOURCE=BLOB environment variables: {', '.join(missing)}")
+        elif cls.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
+            if _is_missing(cls.SNOWFLAKE_STAGE_NAME):
+                raise ValueError("Missing SNOWFLAKE_STAGE_NAME (required for HAZARD_DATA_SOURCE=SNOWFLAKE)")
         else:
             raise ValueError(
                 f"Unrecognized HAZARD_DATA_SOURCE value: '{cls.HAZARD_DATA_SOURCE}' "

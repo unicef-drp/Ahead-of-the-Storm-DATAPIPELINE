@@ -254,7 +254,7 @@ EXECUTE JOB SERVICE
 
 ### Option 3: Running as a Scheduled Job (Automatic Processing)
 
-**Not the live production scheduling mechanism** -- the real live scheduler is a Databricks Job that
+**Not the live production scheduling mechanism**: the real live scheduler is a Databricks Job that
 calls the pipeline functions directly rather than launching an SPCS container (see this repo's root
 `README.md`, "Production Scheduling"). This option remains available as a manual/on-demand SPCS run
 path; the `CREATE JOB` below is illustrative, not deployed.

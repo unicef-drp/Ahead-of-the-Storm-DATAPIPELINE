@@ -6,7 +6,7 @@
 # MAGIC dependencies, the giga-spatial patches this repo still needs, and Snowflake connectivity.
 # MAGIC
 # MAGIC Re-run whenever the cluster/runtime, `requirements.txt`, or the installed giga-spatial version
-# MAGIC changes. Each section prints a clear pass/fail. Nothing here writes to Snowflake -- the
+# MAGIC changes. Each section prints a clear pass/fail. Nothing here writes to Snowflake; the
 # MAGIC connectivity check is a read-only `SELECT CURRENT_VERSION()`.
 
 # COMMAND ----------
@@ -116,7 +116,7 @@ try:
         p.write_text(text.replace(old, new))
         patch_results["healthsites_overpass_bypass"] = "PATCHED"
     else:
-        patch_results["healthsites_overpass_bypass"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before relying on this cluster"
+        patch_results["healthsites_overpass_bypass"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before relying on this cluster"
 except Exception as e:
     patch_results["healthsites_overpass_bypass"] = f"ERROR: {e}"
 
@@ -133,7 +133,7 @@ try:
         text = text.replace(old4, new4)
         patch_results["list_quoting"] = "PATCHED"
     else:
-        patch_results["list_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before relying on this cluster"
+        patch_results["list_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before relying on this cluster"
 
     old5 = 'get_command = f"GET {stage_path} \'file://{temp_dir_normalized}\'"'
     new5 = "get_command = f\"GET '{stage_path}' 'file://{temp_dir_normalized}'\""
@@ -143,7 +143,7 @@ try:
         text = text.replace(old5, new5)
         patch_results["get_quoting"] = "PATCHED"
     else:
-        patch_results["get_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before relying on this cluster"
+        patch_results["get_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before relying on this cluster"
 
     p.write_text(text)
 except Exception as e:

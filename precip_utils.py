@@ -4,17 +4,14 @@ Precipitation/Runoff Utilities Module
 
 Reads ambient global precipitation (tp) and runoff (ro) ensemble forecasts,
 produced every pipeline cycle by TC-ECMWF-Forecast-Pipeline regardless of
-whether any named storm is active. By default (config.HAZARD_DATA_SOURCE=
-SNOWFLAKE), data lands in Snowflake as a pointer table (MET_FORECASTS)
-referencing dense Zarr files on the stage, one file per param per forecast
-cycle, each holding a (51-member, 25-step) accumulated grid. When
-HAZARD_DATA_SOURCE is LOCAL/BLOB, the same Zarr files are read directly from
-TC-ECMWF-Forecast-Pipeline's own met_data/ output instead (see
-get_hazard_met_data_store()/get_latest_met_forecast_local()/
-get_met_forecast_for_date_local() below) -- get_latest_met_forecast()/
-get_met_forecast_for_date() dispatch between the two automatically. This
-module downloads and reads those Zarr files, and computes exceedance-
-probability grids from them.
+whether any named storm is active. The MET_FORECASTS pointer table (which
+cycle exists, and its STAGE_PATH) is always read from Snowflake regardless
+of config.HAZARD_DATA_SOURCE (see get_latest_met_forecast()'s own docstring
+for why); only the actual Zarr file body read dispatches on that setting:
+SNOWFLAKE (default) reads from the stage, LOCAL/BLOB read the same files
+directly from TC-ECMWF-Forecast-Pipeline's own met_data/ output instead
+(see get_hazard_met_data_store() below). This module downloads and reads
+those Zarr files, and computes exceedance-probability grids from them.
 
 Usage:
     from precip_utils import get_latest_met_forecast, read_precip_window, \
@@ -25,10 +22,8 @@ Usage:
 """
 
 import os
-import re
 import tempfile
 import logging
-from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -107,16 +102,12 @@ def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dic
     """
     MET_FORECASTS row for a param ('tp' or 'ro') on a specific calendar date,
     for historical backfills (--type update --date ...). MET_FORECASTS
-    retains one row per past forecast cycle, same as TC_ENVELOPES_COMBINED
-    retains historical storm envelopes, it is not overwritten to only ever
-    hold the latest row, so a historical cycle's Zarr file is genuinely
-    available to re-read, this mirrors update_storms()'s own
-    `storms_df[storms_df['DATE'] == target_date_obj]` exact-date-match
-    pattern for wind/gust rather than treating precip as un-backfillable.
-
-    If multiple cycles exist for that calendar date (e.g. 00Z and 12Z), the
-    latest one on that date is used, same "latest wins" tie-break as
-    get_latest_met_forecast_snowflake() uses across the whole table.
+    retains one row per past forecast cycle rather than being overwritten to
+    only hold the latest row, so a historical cycle's Zarr file is genuinely
+    available to re-read. If multiple cycles exist for that calendar date
+    (e.g. 00Z and 12Z), the latest one on that date is used, same "latest
+    wins" tie-break as get_latest_met_forecast_snowflake() uses across the
+    whole table.
 
     Args:
         param: 'tp' (total precipitation) or 'ro' (runoff).
@@ -150,12 +141,9 @@ def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dic
 # TC-ECMWF-Forecast-Pipeline's own met_data/ output instead of MET_FORECASTS.
 # Path convention matches TC-ECMWF-Forecast-Pipeline's ecmwf_met_downloader.py:
 # `run_str = f'{forecast_date:%Y%m%d}_{run_time:02d}'`,
-# `zip_path = output_dir / f'{param}_{run_str}.zarr.zip'` -- flat, no
+# `zip_path = output_dir / f'{param}_{run_str}.zarr.zip'`, flat, no
 # subdirectory (e.g. met_data/tp_20260701_18.zarr.zip).
 # =============================================================================
-
-_MET_FILENAME_RE = re.compile(r'^([a-z]+)_(\d{8})_(\d{2})\.zarr\.zip$')
-
 
 def get_hazard_met_data_store():
     """
@@ -163,74 +151,48 @@ def get_hazard_met_data_store():
     governed by config.HAZARD_DATA_SOURCE. SNOWFLAKE (default) is identical
     to get_met_forecasts_data_store(); LOCAL/BLOB read TC-ECMWF-Forecast-
     Pipeline's own met_data/ output instead.
+
+    This governs only the FILE BODY read (once get_latest_met_forecast()/
+    get_met_forecast_for_date() below have already identified which cycle
+    and STAGE_PATH to read), never the POINTER lookup itself: see those two
+    functions' own docstrings for why the pointer step is unconditionally
+    Snowflake regardless of this setting.
     """
     if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
         return get_met_forecasts_data_store()
     from data_store_utils import get_hazard_data_store
     if app_config.HAZARD_DATA_SOURCE == 'LOCAL':
         return get_hazard_data_store(base_path=app_config.HAZARD_LOCAL_MET_DIR)
-    return get_hazard_data_store()  # BLOB -- shared container, files under 'met/'
-
-
-def _list_local_met_files(param: str):
-    """Returns [(forecast_time datetime, relative_path), ...] for a given
-    param, found in the configured LOCAL/BLOB met directory. Empty list if
-    the directory can't be listed or has no matching files -- an expected
-    outcome (e.g. before the first cycle), not an error."""
-    data_store = get_hazard_met_data_store()
-    search_dir = '.' if app_config.HAZARD_DATA_SOURCE == 'LOCAL' else 'met'
-    try:
-        files = data_store.list_files(search_dir)
-    except Exception as e:
-        logger.info(f"Could not list local/blob met files at '{search_dir}': {e}")
-        return []
-
-    results = []
-    for f in files:
-        basename = f.rsplit('/', 1)[-1]
-        m = _MET_FILENAME_RE.match(basename)
-        if not m or m.group(1) != param:
-            continue
-        dt = datetime.strptime(f"{m.group(2)}{m.group(3)}", "%Y%m%d%H")
-        results.append((dt, f))
-    return results
-
-
-def get_latest_met_forecast_local(param: str) -> Optional[dict]:
-    """LOCAL/BLOB equivalent of get_latest_met_forecast_snowflake()."""
-    candidates = _list_local_met_files(param)
-    if not candidates:
-        logger.info(f"No local/blob met files found for param='{param}'")
-        return None
-    dt, path = max(candidates, key=lambda c: c[0])
-    return {'forecast_time': dt, 'stage_path': path}
-
-
-def get_met_forecast_for_date_local(param: str, target_date) -> Optional[dict]:
-    """LOCAL/BLOB equivalent of get_met_forecast_for_date_snowflake()."""
-    target = pd.to_datetime(target_date).date()
-    candidates = [(dt, path) for dt, path in _list_local_met_files(param) if dt.date() == target]
-    if not candidates:
-        logger.info(f"No local/blob met files found for param='{param}' on {target_date}")
-        return None
-    dt, path = max(candidates, key=lambda c: c[0])
-    return {'forecast_time': dt, 'stage_path': path}
+    return get_hazard_data_store()  # BLOB, shared container, files under 'met/'
 
 
 def get_latest_met_forecast(param: str) -> Optional[dict]:
-    """Dispatches to get_latest_met_forecast_snowflake() or
-    get_latest_met_forecast_local() based on config.HAZARD_DATA_SOURCE."""
-    if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
-        return get_latest_met_forecast_snowflake(param)
-    return get_latest_met_forecast_local(param)
+    """
+    Latest MET_FORECASTS row for a param ('tp' or 'ro'), ALWAYS via real
+    Snowflake (get_latest_met_forecast_snowflake()), regardless of
+    config.HAZARD_DATA_SOURCE.
+
+    Does NOT dispatch to a LOCAL/BLOB file-listing equivalent: a Blob-mirror
+    of MET_FORECASTS can lag the real table by days, so a file-listing
+    "latest" pointer risks staleness. Matches
+    glofas_utils.get_latest_river_forecast()'s own always-Snowflake pattern:
+    MET_FORECASTS.STAGE_PATH already uses the identical relative-path
+    convention the LOCAL/BLOB file body read expects (e.g.
+    'met/20260907_00/tp_20260907_00.zarr.zip'), so this Snowflake-sourced
+    STAGE_PATH still passes straight into get_hazard_met_data_store() for the
+    actual file read with no other change needed.
+    """
+    return get_latest_met_forecast_snowflake(param)
 
 
 def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
-    """Dispatches to get_met_forecast_for_date_snowflake() or
-    get_met_forecast_for_date_local() based on config.HAZARD_DATA_SOURCE."""
-    if app_config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
-        return get_met_forecast_for_date_snowflake(param, target_date)
-    return get_met_forecast_for_date_local(param, target_date)
+    """
+    MET_FORECASTS row for a param ('tp' or 'ro') on a specific calendar date,
+    ALWAYS via real Snowflake (get_met_forecast_for_date_snowflake()),
+    regardless of config.HAZARD_DATA_SOURCE. See get_latest_met_forecast()'s
+    own docstring immediately above for the full "why".
+    """
+    return get_met_forecast_for_date_snowflake(param, target_date)
 
 
 # =============================================================================
@@ -266,6 +228,11 @@ def read_precip_window(stage_path: str, data_store, step_a_hour: int, step_b_hou
     with tempfile.NamedTemporaryFile(suffix='.zarr.zip') as tmp:
         tmp.write(raw_bytes)
         tmp.flush()
+        # Real ~1.3GB (tp) / ~266MB (ro) object, dead weight once flushed to
+        # disk (the Zarr store below reads back from tmp.name, never from
+        # raw_bytes again); freeing it here keeps this real transient
+        # allocation off this function's own peak.
+        del raw_bytes
 
         store = zarr.storage.ZipStore(tmp.name, mode='r')
         try:
@@ -292,6 +259,91 @@ def read_precip_window(stage_path: str, data_store, step_a_hour: int, step_b_hou
             store.close()
 
     return member_numbers, lat_min, lat_max, lon_min, lon_max, period_grid_mm
+
+
+def read_precip_windows(stage_path: str, data_store, windows_h):
+    """
+    Same real (member_numbers, lat_min, lat_max, lon_min, lon_max,
+    period_grid_mm) result read_precip_window() returns, for EVERY window in
+    `windows_h` at once, from a SINGLE download+open of the Zarr file.
+
+    Downloads and opens the Zarr file once, then slices each window from the
+    one open array, since the file is large (tp ~1.3GB, ro ~266MB) and a
+    single file holds every step any window needs. Slices out each requested
+    window's own [0, step_b_hour) diff from the one already-open array,
+    matching read_precip_window()'s own accumulated-from-T+0 semantics
+    exactly (see that function's own docstring).
+
+    Args:
+        stage_path: STAGE_PATH value from a MET_FORECASTS row.
+        data_store: giga-spatial DataStore instance (LOCAL/BLOB/SNOWFLAKE).
+        windows_h: iterable of window end hours (e.g. PRECIP_WINDOWS_H),
+            each a real step in the Zarr's own `steps` attribute.
+
+    Returns:
+        dict {window_h: (member_numbers, lat_min, lat_max, lon_min, lon_max,
+        period_grid_mm)}, same per-window shape/semantics read_precip_window()
+        returns for that same window. May have fewer entries than windows_h
+        if a specific window's own step is missing/malformed (logged, not
+        raised): a per-window failure never loses any other window's already-
+        successfully-extracted data. Only a failure that prevents the file
+        itself from being downloaded/opened/read (network error, corrupt
+        zip, missing T+0 baseline) raises, exactly like read_precip_window()
+        already does for that same class of failure.
+    """
+    raw_bytes = data_store.read_file(stage_path)
+
+    with tempfile.NamedTemporaryFile(suffix='.zarr.zip') as tmp:
+        tmp.write(raw_bytes)
+        tmp.flush()
+        # Real ~1.3GB (tp) / ~266MB (ro) object, dead weight once flushed to
+        # disk (the Zarr store below reads back from tmp.name, never from
+        # raw_bytes again); freeing it here keeps this real transient
+        # allocation off this function's own peak.
+        del raw_bytes
+
+        store = zarr.storage.ZipStore(tmp.name, mode='r')
+        try:
+            root = zarr.open_group(store=store, mode='r')
+            z = root['data']  # shape (51, 25, n_lat, n_lon), float16, mm accumulated from T+0
+            attrs = dict(root.attrs)
+            steps = list(attrs['steps'])  # [0, 6, 12, ..., 144]
+
+            member_numbers = list(attrs.get('member_numbers', range(1, z.shape[0] + 1)))
+            lat_min, lat_max = float(attrs['lat_min']), float(attrs['lat_max'])
+            lon_min, lon_max = float(attrs['lon_min']), float(attrs['lon_max'])
+
+            # T+0 baseline read once, shared by every window (every real call
+            # site so far always passes step_a_hour=0, matching
+            # read_precip_window()'s own accumulated-from-T+0 convention). A
+            # missing T+0 step means every window is unreadable from this
+            # file, so this one still raises rather than returning an empty
+            # dict; each caller already handles a total read failure the
+            # same way it always has (its own try/except around this call).
+            if 0 not in steps:
+                raise ValueError(f"T+0 step not in available steps {steps} for {stage_path}")
+            data_0 = np.asarray(z[:, steps.index(0), :, :]).astype('float32')
+
+            # Per-window extraction is its own try/except: a single
+            # missing/malformed window must not lose every OTHER window's
+            # already-successfully-extracted data, since a real caller
+            # (run_precip_analysis()) processes each window independently
+            # regardless of whether the others succeeded.
+            result = {}
+            for window_h in windows_h:
+                try:
+                    if window_h not in steps:
+                        raise ValueError(
+                            f"Requested window [0, {window_h}] not in available steps {steps} for {stage_path}"
+                        )
+                    data_b = np.asarray(z[:, steps.index(window_h), :, :]).astype('float32')
+                    result[window_h] = (member_numbers, lat_min, lat_max, lon_min, lon_max, data_b - data_0)
+                except Exception as e:
+                    logger.warning(f"Failed to extract window {window_h}h from {stage_path}: {e}")
+        finally:
+            store.close()
+
+    return result
 
 
 # =============================================================================
@@ -330,17 +382,17 @@ def exceedance_bitmask(period_grid: np.ndarray, threshold_mm: float, member_numb
     Per-grid-cell 64-bit ensemble-member bitmask (bit `member_numbers[i]-1`
     set <=> member i's own accumulated rainfall exceeds threshold_mm at that
     cell), the same real per-member exceedance data exceedance_probability()
-    collapses via `.sum(axis=0)/51`, kept instead of discarded. Exists to
-    let a downstream tile-level bitmask (calculate_precip_tile_member_
-    bitmask, impact_analysis.py) be computed and persisted, mirroring
-    Wind/River's own per-member bitmask outputs -- this is the same real
-    per-member exceedance check `_combine_bitmask_aware`'s own rain branch
-    (services/tile_server.py, the dashboard repo) already does live, per
-    request, moved here so it becomes a real pipeline output instead.
+    collapses via `.sum(axis=0)/51`, kept instead of discarded. Exists so a
+    downstream tile-level bitmask (calculate_precip_tile_member_bitmask,
+    impact_analysis.py) can be computed and persisted as a real pipeline
+    output, mirroring Wind/River's own per-member bitmask outputs; this is
+    the same real per-member exceedance check `_combine_bitmask_aware`'s own
+    rain branch (services/tile_server.py, the dashboard repo) does live, per
+    request.
 
     `member_numbers` (NOT a plain 0-50 range) matters: read_precip_window()
     returns this from the Zarr's own `member_numbers` attribute, defaulting
-    to `range(1, 52)` only when that attribute is absent -- a real ensemble
+    to `range(1, 52)` only when that attribute is absent; a real ensemble
     member's own number, not its array position, is what determines which
     bit gets set, so a Zarr with a genuinely non-contiguous or reordered
     member axis (e.g. a missing perturbed member for this cycle) still sets
@@ -357,16 +409,34 @@ def exceedance_bitmask(period_grid: np.ndarray, threshold_mm: float, member_numb
     Returns:
         (n_lat, n_lon) uint64 array, bit `m-1` set <=> member `m` exceeds
         threshold_mm at that cell. A cell with zero exceeding members is
-        0, not a special/missing value -- a real, common outcome.
+        0, not a special/missing value, a real, common outcome.
     """
     member_arr = np.asarray(member_numbers, dtype=np.uint64)
+    if member_arr.shape[0] != period_grid.shape[0]:
+        raise ValueError(
+            f"exceedance_bitmask: member_numbers has {member_arr.shape[0]} entries but "
+            f"period_grid's own member axis has {period_grid.shape[0]}; these must be 1:1 "
+            "aligned (see this function's own docstring), a mismatch here would otherwise "
+            "silently OR in the wrong member's bit or silently drop trailing members instead "
+            "of failing loud."
+        )
     member_bits = np.uint64(1) << (member_arr - np.uint64(1))
-    exceeds = period_grid > threshold_mm  # (n_members, n_lat, n_lon) bool
-    # Same vectorized per-member-bit OR-reduction _combine_bitmask_aware's
-    # own rain branch already uses (dashboard repo, services/tile_server.py):
-    # broadcast each member's own bit value across its own exceedance mask,
-    # then OR-reduce across the member axis.
-    return np.bitwise_or.reduce(exceeds.astype(np.uint64) * member_bits[:, None, None], axis=0)
+    # Accumulated in place, one member at a time, rather than building the
+    # full (n_members, n_lat, n_lon) `exceeds.astype(uint64) * member_bits`
+    # intermediate (two real, simultaneous ~283MB-at-MEX-grid-scale
+    # allocations for a single call): the per-member OR-reduction this
+    # computes is identical, `member_bits[i]` is OR'd into `out` wherever
+    # member i's own accumulated rainfall exceeds threshold_mm, exactly the
+    # same real per-member exceedance check `_combine_bitmask_aware`'s own
+    # rain branch (dashboard repo, services/tile_server.py) does live, per
+    # request, mirroring calculate_precip_tile_member_bitmask's own comment
+    # on this same computation. NaN handling is unchanged: a NaN comparison
+    # is always False in either form, so a NaN cell never sets any bit here,
+    # same as exceedance_probability's own explicit NaN warning above assumes.
+    out = np.zeros(period_grid.shape[1:], dtype=np.uint64)
+    for i in range(period_grid.shape[0]):
+        out[period_grid[i] > threshold_mm] |= member_bits[i]
+    return out
 
 
 def ratio_exceedance_probability(

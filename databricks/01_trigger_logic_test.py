@@ -7,7 +7,9 @@
 # MAGIC (ORCHESTRATION repo, `09_orchestration/03_procedures.sql`), "is there new work, and have I
 # MAGIC already started it," can be replicated correctly from Databricks. The compute+write path
 # MAGIC itself, calling the pipeline functions directly on an already-running cluster instead of
-# MAGIC launching an SPCS container, is what `04_production_scheduler.py` runs on a live schedule.
+# MAGIC launching an SPCS container, is what `04_scheduler_windgust.py` (the live wind/gust
+# MAGIC scheduler; this notebook's dedup logic only covers the wind/gust half of the pipeline, not
+# MAGIC precip/river) runs on a live schedule.
 # MAGIC
 # MAGIC What this does NOT test: the real procedure's `EXECUTE JOB SERVICE` call itself, which launches
 # MAGIC the DATAPIPELINE SPCS container. That step is Snowflake-SPCS-specific and has no Databricks
@@ -69,7 +71,7 @@ try:
         text = text.replace(old4, new4)
         patch_results["list_quoting"] = "PATCHED"
     else:
-        patch_results["list_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["list_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     old5 = 'get_command = f"GET {stage_path} \'file://{temp_dir_normalized}\'"'
     new5 = "get_command = f\"GET '{stage_path}' 'file://{temp_dir_normalized}'\""
@@ -79,7 +81,7 @@ try:
         text = text.replace(old5, new5)
         patch_results["get_quoting"] = "PATCHED"
     else:
-        patch_results["get_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["get_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     p.write_text(text)
 except Exception as e:
@@ -163,7 +165,7 @@ print(f"Unprocessed forecast runs right now: {len(unprocessed)}")
 for row in unprocessed:
     print(" ", row)
 if not unprocessed:
-    print("(0 is a real, valid answer -- it means production's own live scheduler currently has")
+    print("(0 is a real, valid answer: it means production's own live scheduler currently has")
     print(" nothing new to launch either, not that this query is broken.)")
 
 # COMMAND ----------
@@ -227,7 +229,7 @@ try:
     )
     real_envelope_count = cur.fetchone()[0]
     print(f"Real TC_ENVELOPES_COMBINED rows for '{TEST_STORM_ID}': {real_envelope_count} (must be 0)")
-    assert real_envelope_count == 0, "Synthetic STORM_ID unexpectedly matches real data -- STOP, do not proceed"
+    assert real_envelope_count == 0, "Synthetic STORM_ID unexpectedly matches real data, STOP, do not proceed"
 
     # Clean slate: remove any leftover row from a prior interrupted test run.
     cur.execute("DELETE FROM TC_PIPELINE_RUN_LOG WHERE STORM_ID = %s", (TEST_STORM_ID,))
@@ -258,7 +260,7 @@ try:
     )
     still_eligible = cur.fetchone()[0]
     print(f"Step B: eligible for a second trigger immediately after marking? {still_eligible} (must be False)")
-    assert still_eligible is False, "Marker did not correctly exclude a second trigger -- real bug"
+    assert still_eligible is False, "Marker did not correctly exclude a second trigger, real bug"
 
     print()
     print("PASS: marker-write + re-exclusion round trip works correctly.")
