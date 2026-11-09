@@ -7,7 +7,9 @@
 # MAGIC (ORCHESTRATION repo, `09_orchestration/03_procedures.sql`), "is there new work, and have I
 # MAGIC already started it," can be replicated correctly from Databricks. The compute+write path
 # MAGIC itself, calling the pipeline functions directly on an already-running cluster instead of
-# MAGIC launching an SPCS container, is what `04_production_scheduler.py` runs on a live schedule.
+# MAGIC launching an SPCS container, is what `04_scheduler_windgust.py` (the live wind/gust
+# MAGIC scheduler; this notebook's dedup logic only covers the wind/gust half of the pipeline, not
+# MAGIC precip/river) runs on a live schedule.
 # MAGIC
 # MAGIC What this does NOT test: the real procedure's `EXECUTE JOB SERVICE` call itself, which launches
 # MAGIC the DATAPIPELINE SPCS container. That step is Snowflake-SPCS-specific and has no Databricks
@@ -35,9 +37,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install pandas>=2.0.0 numpy>=1.24.0 geopandas>=0.13.0 shapely>=2.0.0 pyproj>=3.4.0 \
-# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0" "snowflake-connector-python[pandas]>=3.0.0" \
-# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4" "psutil>=5.9.0" "pycountry>=22.3.5" \
-# MAGIC     "quantulum3[classifier]>=0.1.0"
+# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0,<3" "snowflake-connector-python[pandas]>=3.0.0" \
+# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4,<0.10" "psutil>=5.9.0" "pycountry>=22.3.5" \
+# MAGIC     "quantulum3[classifier]>=0.1.0" "SQLAlchemy>=2.0,<2.1"
 
 # COMMAND ----------
 
@@ -69,7 +71,7 @@ try:
         text = text.replace(old4, new4)
         patch_results["list_quoting"] = "PATCHED"
     else:
-        patch_results["list_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["list_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     old5 = 'get_command = f"GET {stage_path} \'file://{temp_dir_normalized}\'"'
     new5 = "get_command = f\"GET '{stage_path}' 'file://{temp_dir_normalized}'\""
@@ -79,7 +81,7 @@ try:
         text = text.replace(old5, new5)
         patch_results["get_quoting"] = "PATCHED"
     else:
-        patch_results["get_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["get_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     p.write_text(text)
 except Exception as e:
@@ -123,11 +125,10 @@ print("Environment configured. Repo path on sys.path:", REPO_PATH in sys.path)
 # MAGIC %md
 # MAGIC ## 3. Replicate the real match-counting query (read-only)
 # MAGIC
-# MAGIC This is the same SELECT that `CHECK_AND_TRIGGER_DATAPIPELINE()` runs in production, and the
-# MAGIC same query logic now used by the live production scheduler: unprocessed forecast runs (no
-# MAGIC SUCCESS, and no TRIGGERED/IN_PROGRESS younger than 6h) within 1500km of an active country, in
-# MAGIC the last 2 days. Whatever this returns right now is the same real answer the live production
-# MAGIC task gets on its next 30-minute tick. This section changes nothing, it only reads.
+# MAGIC This reproduces the (storm, cycle) decision of `CHECK_AND_TRIGGER_DATAPIPELINE()`: unprocessed
+# MAGIC forecast runs (no SUCCESS, and no TRIGGERED/IN_PROGRESS younger than 6h) within 1500km of an
+# MAGIC active country, in the last 2 days. The Databricks wind job (`04_scheduler_windgust.py`) uses a
+# MAGIC per-country variant of this logic. This section changes nothing, it only reads.
 
 # COMMAND ----------
 
@@ -141,7 +142,7 @@ cur.execute("""
     JOIN   PIPELINE_COUNTRIES pc
            ON ST_DWITHIN(pc.COUNTRY_BOUNDARY, te.ENVELOPE_REGION, 1500000)
     WHERE  pc.ACTIVE = TRUE
-      AND  te.FORECAST_TIME >= DATEADD('day', -2, CURRENT_TIMESTAMP())
+      AND  te.FORECAST_TIME >= DATEADD('day', -2, SYSDATE())
       AND  NOT EXISTS (
                SELECT 1
                FROM   TC_PIPELINE_RUN_LOG rl
@@ -163,7 +164,7 @@ print(f"Unprocessed forecast runs right now: {len(unprocessed)}")
 for row in unprocessed:
     print(" ", row)
 if not unprocessed:
-    print("(0 is a real, valid answer -- it means production's own live scheduler currently has")
+    print("(0 is a real, valid answer: it means production's own live scheduler currently has")
     print(" nothing new to launch either, not that this query is broken.)")
 
 # COMMAND ----------
@@ -227,7 +228,7 @@ try:
     )
     real_envelope_count = cur.fetchone()[0]
     print(f"Real TC_ENVELOPES_COMBINED rows for '{TEST_STORM_ID}': {real_envelope_count} (must be 0)")
-    assert real_envelope_count == 0, "Synthetic STORM_ID unexpectedly matches real data -- STOP, do not proceed"
+    assert real_envelope_count == 0, "Synthetic STORM_ID unexpectedly matches real data, STOP, do not proceed"
 
     # Clean slate: remove any leftover row from a prior interrupted test run.
     cur.execute("DELETE FROM TC_PIPELINE_RUN_LOG WHERE STORM_ID = %s", (TEST_STORM_ID,))
@@ -258,7 +259,7 @@ try:
     )
     still_eligible = cur.fetchone()[0]
     print(f"Step B: eligible for a second trigger immediately after marking? {still_eligible} (must be False)")
-    assert still_eligible is False, "Marker did not correctly exclude a second trigger -- real bug"
+    assert still_eligible is False, "Marker did not correctly exclude a second trigger, real bug"
 
     print()
     print("PASS: marker-write + re-exclusion round trip works correctly.")
@@ -283,10 +284,6 @@ finally:
 # MAGIC marker-write/re-exclusion) works correctly from Databricks, with zero risk to live production
 # MAGIC dedup state.
 # MAGIC
-# MAGIC Known real gap this does NOT address (documented separately, not fixed here): the production
-# MAGIC procedure only checks `TC_ENVELOPES_COMBINED` (wind/gust storm proximity). There is no
-# MAGIC equivalent ambient freshness check against `MET_FORECASTS`/`RIVER_FORECASTS`, so during a
-# MAGIC storm-quiet period worldwide, precip/river-flood currently never runs at all in production. A
-# MAGIC Databricks-based scheduler polling on its own cadence (rather than waiting for a storm-triggered
-# MAGIC SPCS launch) could close this gap by checking ambient data freshness directly; that would be a
-# MAGIC real design change, not something this notebook implements.
+# MAGIC The production procedure only checks `TC_ENVELOPES_COMBINED` (wind/gust storm proximity).
+# MAGIC Ambient precip and river-flood are covered by `05_scheduler_precip.py` and
+# MAGIC `06_scheduler_river.py`, which poll on their own schedule.

@@ -21,7 +21,7 @@
 # This container runs the hurricane impact analysis pipeline including:
 # - Reading hurricane track and envelope data from Snowflake tables
 # - Processing geospatial impact analysis (schools, health centers, shelters, WASH, population)
-# - Generating impact views and reports
+# - Generating impact views
 # - Writing results to Snowflake internal stage
 #
 # The container will execute main_pipeline.py and terminate when complete.
@@ -80,7 +80,6 @@ COPY glofas_utils.py /app/
 COPY config.py /app/
 COPY data_store_utils.py /app/
 COPY snowflake_utils.py /app/
-COPY reports.py /app/
 COPY country_utils.py /app/
 
 # Copy requirements

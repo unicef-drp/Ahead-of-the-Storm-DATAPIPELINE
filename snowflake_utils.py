@@ -7,28 +7,28 @@ It serves as a focused toolkit for connecting to Snowflake and retrieving hurric
 
 Key Components:
 - Snowflake connection management (supports SPCS OAuth and password authentication)
-- Hurricane track data retrieval from TC_TRACKS table
+- Hurricane track discovery from TC_TRACKS table
 - Hurricane envelope data retrieval from TC_ENVELOPES_COMBINED table
 - Data format conversion utilities (WKT to GeoDataFrame)
-- Metadata queries (available wind thresholds, latest forecast times)
+- Metadata queries (countries in range of a storm, storm/forecast discovery)
 - HAZARD_DATA_SOURCE=LOCAL/BLOB readers (get_envelopes_local()/
-  get_gust_envelopes_local()/get_tracks_local()) that read the same data
+  get_gust_envelopes_local()/get_storms_local()) that read the same data
   directly from TC-ECMWF-Forecast-Pipeline's own output instead of
-  Snowflake, plus dispatch functions (get_envelopes()/get_gust_envelopes()/
-  get_tracks()) that pick Snowflake vs LOCAL/BLOB based on
-  config.HAZARD_DATA_SOURCE -- callers outside this module should use the
-  dispatch functions, not the raw *_from_snowflake()/get_snowflake_tracks()
-  ones directly, so they work under any HAZARD_DATA_SOURCE setting.
+  Snowflake, plus dispatch functions (get_envelopes()/get_gust_envelopes())
+  that pick Snowflake vs LOCAL/BLOB based on config.HAZARD_DATA_SOURCE;
+  callers outside this module should use the dispatch functions, not the
+  raw *_from_snowflake() ones directly, so they work under any
+  HAZARD_DATA_SOURCE setting.
 
 Usage:
-    from snowflake_utils import get_envelopes, get_tracks
+    from snowflake_utils import get_envelopes
     envelopes = get_envelopes('JERRY', '2025-10-10 00:00:00')
-    tracks = get_tracks('20251010000000', 'JERRY')
 """
 
 import io
 import os
-from typing import Optional, List, Dict, Any
+import re
+from typing import Optional, List, Any
 from datetime import datetime
 
 import pandas as pd
@@ -97,14 +97,14 @@ def _execute_query(query: str, params: Optional[List[Any]] = None) -> pd.DataFra
         failed attempt), whether this function returns normally or raises.
         Raises on a genuine query failure rather than swallowing it into an
         empty DataFrame (deliberate fail-loud design, matches
-        get_countries_in_range()'s own reasoning below) -- every CURRENT
+        get_countries_in_range()'s own reasoning below); every CURRENT
         caller already wraps its own call site in try/except (main_pipeline.py's
         update_storms()/run_precip_analysis()/run_river_flood_analysis(), and
         glofas_utils.py's/precip_utils.py's own Snowflake-reading functions,
         which are themselves only ever called from those wrapped call sites).
         A FUTURE direct caller that bypasses those wrapped entry points will
-        get an unhandled exception here instead of a silent empty result --
-        wrap your own call site, don't rely on this function to swallow errors.
+        get an unhandled exception here instead of a silent empty result.
+        Wrap your own call site, don't rely on this function to swallow errors.
     """
     conn = None
     try:
@@ -304,68 +304,25 @@ def _get_password_connection():
         raise
 
 # =============================================================================
-# TRACK DATA RETRIEVAL
-# =============================================================================
-
-def get_snowflake_tracks(date: str, storm: str) -> pd.DataFrame:
-    """
-    Get hurricane track data from Snowflake TC_TRACKS table for report generation.
-    
-    Retrieves track points with coordinates, wind speeds, and pressure for all
-    ensemble members at a specific forecast time.
-    
-    Args:
-        date: Forecast date in YYYYMMDDHHMMSS format or datetime string
-        storm: Storm identifier (e.g., 'JERRY', 'FUNG-WONG')
-    
-    Returns:
-        pd.DataFrame: Hurricane track data with columns:
-            - ENSEMBLE_MEMBER
-            - VALID_TIME
-            - LEAD_TIME
-            - LATITUDE
-            - LONGITUDE
-            - WIND_SPEED_KNOTS
-            - PRESSURE_HPA
-        Returns empty DataFrame on error.
-    """
-    forecast_datetime = _normalize_forecast_time(date)
-    logger.info(f"Loading tracks for storm={storm}, forecast_time={forecast_datetime}")
-    
-    query = '''
-    SELECT 
-        ENSEMBLE_MEMBER,
-        VALID_TIME,
-        LEAD_TIME,
-        LATITUDE,
-        LONGITUDE,
-        WIND_SPEED_KNOTS,
-        PRESSURE_HPA
-    FROM TC_TRACKS
-    WHERE TRACK_ID = %s AND FORECAST_TIME = %s
-    ORDER BY ENSEMBLE_MEMBER, VALID_TIME
-    '''
-    
-    return _execute_query(query, params=[storm, forecast_datetime])
-
-# =============================================================================
 # HAZARD_DATA_SOURCE=LOCAL/BLOB: read upstream hazard source data directly
 # from TC-ECMWF-Forecast-Pipeline's own output instead of Snowflake. Governed
 # by config.HAZARD_DATA_SOURCE, independent of DATA_PIPELINE_DB (which only
 # ever governs THIS repo's own output/cache).
 # =============================================================================
 
-def _read_hazard_file(hazard_type: str, filename: str, storm: Optional[str] = None) -> Optional[bytes]:
+def _read_hazard_file(hazard_type: str, filename: str) -> Optional[bytes]:
     """
     Read one file's bytes from the configured HAZARD_DATA_SOURCE (LOCAL or
-    BLOB) location for a given hazard type ('wind' or 'tracks' -- 'met' is
-    handled separately by precip_utils._list_local_met_files(), which lists
-    a whole directory rather than looking up one filename at a time).
+    BLOB) location for a given hazard type ('wind' or 'tracks'; 'met' has no
+    LOCAL/BLOB file-listing equivalent at all, precip_utils.
+    get_latest_met_forecast()/get_met_forecast_for_date() always query real
+    Snowflake for the pointer step, matching river's own pattern, see those
+    functions' own docstrings for why).
 
     Looks in the flat top-level directory, matching TC-ECMWF-Forecast-
     Pipeline's own glob/write convention for wind/gust envelopes and tracks.
 
-    Returns None if the file isn't found -- a genuinely missing cycle (e.g.
+    Returns None if the file isn't found, a genuinely missing cycle (e.g.
     this storm never had a gust forecast, or this forecast_time predates
     local retention), mirrors get_envelopes_from_snowflake()'s own "returns
     empty DataFrame" behavior for a missing row, not an error.
@@ -376,7 +333,14 @@ def _read_hazard_file(hazard_type: str, filename: str, storm: Optional[str] = No
         'wind': config.HAZARD_LOCAL_WIND_DIR,
         'tracks': config.HAZARD_LOCAL_TRACKS_DIR,
     }
-    blob_prefix_by_type = {'wind': 'wind', 'tracks': 'tracks'}
+    # This mapping intentionally differs from HAZARD_LOCAL_WIND_DIR's key naming: Blob's
+    # actual prefixes are glofas, tracks, met, envelopes, geodb - no 'wind/' prefix - so
+    # 'wind' maps to 'envelopes'. TC-ECMWF-Forecast-Pipeline's own upload_to_blob() calls
+    # (github_actions/main.py step7_load(), snowflake/spcs_pipeline.py phase4_snowflake_loading())
+    # write wind/gust envelope CSVs under the 'envelopes/' container prefix. The
+    # hazard_type key stays 'wind' to match HAZARD_LOCAL_WIND_DIR's own naming for the
+    # LOCAL case above, an unrelated, independently correct config value.
+    blob_prefix_by_type = {'wind': 'envelopes', 'tracks': 'tracks'}
 
     if config.HAZARD_DATA_SOURCE == 'LOCAL':
         data_store = get_hazard_data_store(base_path=local_dir_by_type[hazard_type])
@@ -408,14 +372,14 @@ def get_envelopes_local(track_id: str, forecast_time: str) -> pd.DataFrame:
             '20260702000000').
 
     Returns:
-        pd.DataFrame: same shape as get_envelopes_from_snowflake() --
+        pd.DataFrame: same shape as get_envelopes_from_snowflake():
             FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER, LEAD_TIME_RANGE,
             WIND_THRESHOLD, ENVELOPE_REGION (WKT). Empty DataFrame if no
             local/blob file exists for this storm/forecast_time.
     """
     dt = datetime.strptime(_normalize_forecast_time(forecast_time), DATE_FORMAT_STANDARD)
     filename = f"{track_id}_{dt.strftime('%Y%m%d')}T{dt.strftime('%H')}Z_envelopes_combined.csv"
-    raw = _read_hazard_file('wind', filename, storm=track_id)
+    raw = _read_hazard_file('wind', filename)
     if raw is None:
         logger.info(f"No local/blob envelope file found: {filename}")
         return pd.DataFrame()
@@ -443,7 +407,7 @@ def get_gust_envelopes_local(track_id: str, forecast_time: str) -> pd.DataFrame:
     """
     dt = datetime.strptime(_normalize_forecast_time(forecast_time), DATE_FORMAT_STANDARD)
     filename = f"{track_id}_{dt.strftime('%Y%m%d')}T{dt.strftime('%H')}Z_gust_envelopes_combined.csv"
-    raw = _read_hazard_file('wind', filename, storm=track_id)
+    raw = _read_hazard_file('wind', filename)
     if raw is None:
         logger.info(f"No local/blob gust envelope file found: {filename}")
         return pd.DataFrame()
@@ -454,96 +418,78 @@ def get_gust_envelopes_local(track_id: str, forecast_time: str) -> pd.DataFrame:
     return df[['FORECAST_TIME', 'TRACK_ID', 'ENSEMBLE_MEMBER', 'LEAD_TIME_RANGE', 'GUST_THRESHOLD', 'ENVELOPE_REGION']]
 
 
-def get_tracks_local(date: str, storm: str) -> pd.DataFrame:
-    """
-    LOCAL/BLOB equivalent of get_snowflake_tracks(), reading directly from
-    TC-ECMWF-Forecast-Pipeline's own transformed-tracks output instead of
-    TC_TRACKS. Local files carry many more columns (radius/wind-field-polygon
-    fields, matching get_hurricane_data_from_snowflake()'s wider shape, not
-    get_snowflake_tracks()'s) -- this projects down to the same 7 columns for
-    exact shape parity with get_snowflake_tracks().
+# Matches TC-ECMWF-Forecast-Pipeline's real, already-in-production track filename
+# shape exactly (f"transformed_tc_tracks_{date_str}_r{run_str}_storm_{storm}_extracted_
+# transformed.csv"), anchored to the full known filename, not the more generic
+# date/storm regexes TC-ECMWF's own pipeline_core.py uses elsewhere for the same
+# purpose, to avoid any false-positive match against an unrelated file that happens
+# to contain a similar substring.
+_TRACKS_FILENAME_RE = re.compile(
+    r'^transformed_tc_tracks_(\d{4}-\d{2}-\d{2})_r(\d{2})_storm_([A-Z0-9-]+)_extracted_transformed\.csv$'
+)
 
-    Args:
-        date: Forecast date in YYYYMMDDHHMMSS format or datetime string.
-        storm: Storm identifier (e.g., 'BAVI').
+
+def get_storms_local() -> pd.DataFrame:
+    """
+    LOCAL/BLOB equivalent of get_snowflake_data(): discovers every distinct
+    (storm, forecast_time) combination that has ever been written by
+    TC-ECMWF-Forecast-Pipeline, without any Snowflake dependency, so
+    update_storms() (main_pipeline.py) can discover a new storm under
+    HAZARD_DATA_SOURCE=LOCAL/BLOB where nothing ever writes to TC_TRACKS.
+
+    Lists the tracks/ directory (Blob) or HAZARD_LOCAL_TRACKS_DIR (local) and
+    parses each filename with the exact real filename shape the pipeline
+    writes (_TRACKS_FILENAME_RE), pure
+    filename parsing, no file contents ever read. ENSEMBLE_COUNT,
+    get_snowflake_data()'s only other real column, would require reading
+    file contents to compute; it has no real consumers in this codebase, so
+    it is still included in the returned DataFrame for exact schema parity
+    with get_snowflake_data(), left as NaN rather than computed.
 
     Returns:
-        pd.DataFrame: ENSEMBLE_MEMBER, VALID_TIME, LEAD_TIME, LATITUDE,
-            LONGITUDE, WIND_SPEED_KNOTS, PRESSURE_HPA. Empty DataFrame if no
-            local/blob tracks file exists for this storm/date.
+        pd.DataFrame: TRACK_ID, FORECAST_TIME (as a real datetime, matching
+            get_snowflake_data()'s own dtype so downstream
+            pd.to_datetime()/.dt accessor calls in update_storms() work
+            unchanged), ENSEMBLE_COUNT (always NaN, see above). Empty (but
+            correctly-shaped) DataFrame if the tracks directory doesn't
+            exist yet or contains no matching files, a genuine "nothing
+            to discover yet" result, not an error.
     """
-    dt = datetime.strptime(_normalize_forecast_time(date), DATE_FORMAT_STANDARD)
-    date_str = dt.strftime('%Y-%m-%d')
-    run_str = dt.strftime('%H')
-    # step3_transform's _transform_worker always writes flat with a
-    # "transformed_" prefix (pipeline_core.py:320), for both GHA and SPCS
-    # entry points.
-    filename = f"transformed_tc_tracks_{date_str}_r{run_str}_storm_{storm}_extracted_transformed.csv"
-    raw = _read_hazard_file('tracks', filename, storm=storm)
-    if raw is None:
-        logger.info(f"No local/blob tracks file found for storm={storm}, date={date}")
-        return pd.DataFrame()
+    from data_store_utils import get_hazard_data_store
 
-    df = pd.read_csv(io.BytesIO(raw))
-    df.columns = df.columns.str.upper()
-    return df[['ENSEMBLE_MEMBER', 'VALID_TIME', 'LEAD_TIME', 'LATITUDE', 'LONGITUDE', 'WIND_SPEED_KNOTS', 'PRESSURE_HPA']]
+    if config.HAZARD_DATA_SOURCE == 'LOCAL':
+        data_store = get_hazard_data_store(base_path=config.HAZARD_LOCAL_TRACKS_DIR)
+        search_dir = '.'
+    else:  # BLOB
+        data_store = get_hazard_data_store()
+        search_dir = 'tracks'
 
-def get_hurricane_data_from_snowflake(track_id: str, forecast_time: str) -> pd.DataFrame:
-    """
-    Get detailed hurricane track data from Snowflake TC_TRACKS table.
-    
-    Retrieves comprehensive track data including wind field polygons and radius
-    information for multiple wind thresholds.
-    
-    Args:
-        track_id: Storm identifier (e.g., 'JERRY', 'FUNG-WONG')
-        forecast_time: Forecast time (e.g., '2025-10-10 00:00:00')
-    
-    Returns:
-        pd.DataFrame: Hurricane track data with columns:
-            - FORECAST_TIME, TRACK_ID, ENSEMBLE_MEMBER
-            - VALID_TIME, LEAD_TIME
-            - LATITUDE, LONGITUDE
-            - PRESSURE_HPA, WIND_SPEED_KNOTS
-            - Radius data for 34kt, 50kt, 64kt winds (NE, SE, SW, NW)
-            - WIND_FIELD_POLYGON_34KT, WIND_FIELD_POLYGON_50KT, WIND_FIELD_POLYGON_64KT (WKT)
-        Returns empty DataFrame on error.
-    """
-    forecast_datetime = _normalize_forecast_time(forecast_time)
-    
-    query = """
-    SELECT 
-        FORECAST_TIME,
-        TRACK_ID,
-        ENSEMBLE_MEMBER,
-        VALID_TIME,
-        LEAD_TIME,
-        LATITUDE,
-        LONGITUDE,
-        PRESSURE_HPA,
-        WIND_SPEED_KNOTS,
-        RADIUS_OF_MAXIMUM_WINDS_KM,
-        RADIUS_34_KNOT_WINDS_NE_KM,
-        RADIUS_34_KNOT_WINDS_SE_KM,
-        RADIUS_34_KNOT_WINDS_SW_KM,
-        RADIUS_34_KNOT_WINDS_NW_KM,
-        RADIUS_50_KNOT_WINDS_NE_KM,
-        RADIUS_50_KNOT_WINDS_SE_KM,
-        RADIUS_50_KNOT_WINDS_SW_KM,
-        RADIUS_50_KNOT_WINDS_NW_KM,
-        RADIUS_64_KNOT_WINDS_NE_KM,
-        RADIUS_64_KNOT_WINDS_SE_KM,
-        RADIUS_64_KNOT_WINDS_SW_KM,
-        RADIUS_64_KNOT_WINDS_NW_KM,
-        ST_ASWKT(WIND_FIELD_POLYGON_34KT) AS WIND_FIELD_POLYGON_34KT,
-        ST_ASWKT(WIND_FIELD_POLYGON_50KT) AS WIND_FIELD_POLYGON_50KT,
-        ST_ASWKT(WIND_FIELD_POLYGON_64KT) AS WIND_FIELD_POLYGON_64KT
-    FROM TC_TRACKS
-    WHERE TRACK_ID = %s AND FORECAST_TIME = %s
-    ORDER BY ENSEMBLE_MEMBER, LEAD_TIME
-    """
-    
-    return _execute_query(query, params=[track_id, forecast_datetime])
+    try:
+        files = data_store.list_files(search_dir)
+    except Exception as e:
+        logger.warning(f"Could not list '{search_dir}' for storm discovery: {e}")
+        return pd.DataFrame({'TRACK_ID': [], 'FORECAST_TIME': [], 'ENSEMBLE_COUNT': []})
+
+    rows = []
+    for f in files:
+        basename = f.rsplit('/', 1)[-1]
+        m = _TRACKS_FILENAME_RE.match(basename)
+        if not m:
+            continue
+        date_str, run_str, storm = m.groups()
+        rows.append({
+            'TRACK_ID': storm,
+            'FORECAST_TIME': f'{date_str} {run_str}:00:00',
+            'ENSEMBLE_COUNT': float('nan'),
+        })
+
+    if not rows:
+        return pd.DataFrame({'TRACK_ID': [], 'FORECAST_TIME': [], 'ENSEMBLE_COUNT': []})
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=['TRACK_ID', 'FORECAST_TIME'])
+    df['FORECAST_TIME'] = pd.to_datetime(df['FORECAST_TIME'])
+    return df.sort_values(['FORECAST_TIME', 'TRACK_ID']).reset_index(drop=True)
+
 
 # =============================================================================
 # ENVELOPE DATA RETRIEVAL
@@ -640,7 +586,7 @@ def convert_envelopes_to_geodataframe(envelopes_df: pd.DataFrame) -> gpd.GeoData
     """
     if envelopes_df.empty:
         return gpd.GeoDataFrame()
-    
+
     # Parse WKT polygons
     geometries = []
     for wkt_str in envelopes_df['ENVELOPE_REGION']:
@@ -682,8 +628,8 @@ def convert_envelopes_to_geodataframe(envelopes_df: pd.DataFrame) -> gpd.GeoData
 # =============================================================================
 # HAZARD_DATA_SOURCE DISPATCH
 #
-# These three are what impact_analysis.py should call instead of the raw
-# *_from_snowflake()/get_snowflake_tracks() functions above -- same call
+# These two are what impact_analysis.py should call instead of the raw
+# *_from_snowflake() functions above, same call
 # signature, but routed to the LOCAL/BLOB reader when config.HAZARD_DATA_SOURCE
 # says so.
 # =============================================================================
@@ -704,122 +650,11 @@ def get_gust_envelopes(track_id: str, forecast_time: str) -> pd.DataFrame:
     return get_gust_envelopes_local(track_id, forecast_time)
 
 
-def get_tracks(date: str, storm: str) -> pd.DataFrame:
-    """Dispatches to get_snowflake_tracks() or get_tracks_local() based on
-    config.HAZARD_DATA_SOURCE."""
-    if config.HAZARD_DATA_SOURCE == 'SNOWFLAKE':
-        return get_snowflake_tracks(date, storm)
-    return get_tracks_local(date, storm)
-
 # =============================================================================
 # METADATA QUERIES
 # =============================================================================
 
-def get_available_wind_thresholds(storm: str, forecast_time: str) -> List[str]:
-    """
-    Get available wind thresholds for a specific storm and forecast time.
-    
-    Queries Snowflake to determine which wind thresholds have envelope data
-    available for the specified storm and forecast time.
-    
-    Args:
-        storm: Storm name (e.g., 'FENGSHEN', 'FUNG-WONG')
-        forecast_time: Forecast time string (e.g., '2025-10-20 00:00:00' or '20251020000000')
-    
-    Returns:
-        List[str]: Available wind thresholds as strings, sorted numerically.
-                  Returns empty list if none found or on error.
-    """
-    forecast_datetime = _normalize_forecast_time(forecast_time)
-    
-    query = """
-    SELECT DISTINCT WIND_THRESHOLD 
-    FROM TC_ENVELOPES_COMBINED 
-    WHERE TRACK_ID = %s 
-    AND FORECAST_TIME = %s
-    ORDER BY WIND_THRESHOLD
-    """
-    
-    df = _execute_query(query, params=[storm, forecast_datetime])
-    
-    if not df.empty:
-        # Convert to list of strings and sort numerically
-        thresholds = [str(int(th)) for th in df['WIND_THRESHOLD'].tolist()]
-        thresholds.sort(key=int)
-        logger.info(f"Found {len(thresholds)} wind thresholds for {storm} at {forecast_datetime}: {thresholds}")
-        return thresholds
-    else:
-        logger.warning(f"No wind thresholds found for {storm} at {forecast_datetime}")
-        return []
-
-def get_latest_forecast_time_overall() -> Optional[datetime]:
-    """
-    Get the latest forecast issue time from Snowflake across all storms.
-    
-    Queries the TC_TRACKS table to find the most recent forecast time,
-    which indicates when the latest forecast was issued.
-    
-    Returns:
-        Optional[datetime]: Latest forecast issue time, or None if no data found or on error.
-    """
-    query = """
-    SELECT MAX(FORECAST_TIME) as MAX_FORECAST_TIME
-    FROM TC_TRACKS
-    """
-    
-    df = _execute_query(query)
-    
-    if not df.empty and pd.notna(df['MAX_FORECAST_TIME'].iloc[0]):
-        latest_time = df['MAX_FORECAST_TIME'].iloc[0]
-        logger.info(f"Latest forecast time found: {latest_time}")
-        return latest_time
-    else:
-        logger.warning("No forecast data found in Snowflake")
-        return None
-
-def get_envelope_data_snowflake(track_id: str, forecast_time: str) -> pd.DataFrame:
-    """
-    Get envelope data directly from Snowflake (alternative interface).
-    
-    This is a simplified version of get_envelopes_from_snowflake that returns
-    data with renamed columns for compatibility with some legacy code.
-    
-    Args:
-        track_id: Storm identifier (e.g., 'JERRY', 'FUNG-WONG')
-        forecast_time: Forecast time (e.g., '2025-10-10 00:00:00' or '20251010000000')
-    
-    Returns:
-        pd.DataFrame: Envelope data with columns:
-            - ENSEMBLE_MEMBER
-            - wind_threshold (renamed from WIND_THRESHOLD)
-            - geometry (renamed from ENVELOPE_REGION)
-        Returns empty DataFrame on error.
-    
-    Note:
-        Consider using get_envelopes_from_snowflake() for new code, as it provides
-        more complete data including FORECAST_TIME and TRACK_ID.
-    """
-    forecast_datetime = _normalize_forecast_time(forecast_time)
-    
-    query = '''
-    SELECT 
-        ENSEMBLE_MEMBER,
-        WIND_THRESHOLD,
-        ENVELOPE_REGION
-    FROM TC_ENVELOPES_COMBINED
-    WHERE TRACK_ID = %s AND FORECAST_TIME = %s
-    ORDER BY ENSEMBLE_MEMBER, WIND_THRESHOLD
-    '''
-    
-    df = _execute_query(query, params=[track_id, forecast_datetime])
-    
-    if not df.empty:
-        # Rename columns to match expected format
-        df = df.rename(columns={'ENVELOPE_REGION': 'geometry', 'WIND_THRESHOLD': 'wind_threshold'})
-    
-    return df
-
-def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 500_000) -> list:
+def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: int = 100_000) -> list:
     """
     Returns ISO codes of countries whose boundary is within buffer_m metres of the
     combined storm envelope for the given track_id and forecast_time.
@@ -830,7 +665,7 @@ def get_countries_in_range(cursor, track_id: str, forecast_time: str, buffer_m: 
     Raises on a genuine query failure (connection/permission/ST_DWITHIN error)
     instead of swallowing it: the caller (main_pipeline.py) distinguishes
     "confirmed empty result" from "query itself failed" specifically to decide
-    whether to fall back to the Python 500km-buffer check, silently returning
+    whether to fall back to the Python 100km-buffer check, silently returning
     [] here for BOTH cases would make that fallback dead code, since the
     caller's own except would never fire.
     """
@@ -864,7 +699,7 @@ def get_countries_with_null_boundary(cursor, countries: list) -> list:
     from "confirmed out of range", it never appears in that function's result
     either way. This lets the caller (main_pipeline.py) detect that ambiguity
     specifically for the countries it actually requested, and route only those
-    through the Python 500km-buffer fallback instead of trusting a NULL-boundary
+    through the Python 100km-buffer fallback instead of trusting a NULL-boundary
     country was correctly excluded.
 
     Args:
@@ -904,7 +739,7 @@ def get_snowflake_data() -> pd.DataFrame:
             - ENSEMBLE_COUNT: Number of ensemble members
         Returns an empty (but correctly-shaped) DataFrame when the query
         genuinely returns 0 rows. Raises on a genuine query failure (see
-        _execute_query()'s own docstring) -- callers must wrap their own
+        _execute_query()'s own docstring); callers must wrap their own
         call site in try/except.
     """
     query = '''

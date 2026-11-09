@@ -7,12 +7,14 @@ geopandas>=0.13.0
 shapely>=2.0.0
 pyproj>=3.4.0
 
-# Zarr array storage (precipitation/runoff raster reads
+# Zarr array reads (precipitation/runoff)
 zarr>=3.0.0
+
+# Raster reads (rasterize and transform helpers imported lazily in impact_analysis.py)
 rasterio>=1.3.0
 
 # Bbox-filtered Parquet reads (GloFAS river-flood extent files)
-duckdb>=1.2.0
+duckdb>=1.2.0,<3
 
 # For Snowflake
 snowflake-connector-python[pandas]>=3.0.0
@@ -21,7 +23,7 @@ snowflake-connector-python[pandas]>=3.0.0
 python-dotenv>=1.0.0
 
 # GigaSpatial platform integration
-giga-spatial[all]>=0.9.4
+giga-spatial[all]>=0.9.4,<0.10
 psutil>=5.9.0
 
 # Country name resolution from ISO3 codes

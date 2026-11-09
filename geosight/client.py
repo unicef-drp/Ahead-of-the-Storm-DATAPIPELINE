@@ -213,6 +213,3 @@ class GeoSightClient:
 
     def delete_related_table_row(self, table_id: int | str, row_id: int | str) -> None:
         self._request("DELETE", f"/related-tables/{table_id}/data/{row_id}/")
-
-    def delete_all_related_table_rows(self, table_id: int | str) -> None:
-        self._request("DELETE", f"/related-tables/{table_id}/data/")

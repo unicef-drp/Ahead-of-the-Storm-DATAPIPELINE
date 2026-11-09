@@ -1,5 +1,6 @@
 .venv/
 .env
+azure/
 __pycache__/
 .ipynb_checkpoints/
 
@@ -42,3 +43,9 @@ NASA-SEDAC-GRDI/
 
 vulnerability/
 metadata/
+backfill/
+
+databricks/deploy_main_pipeline.sh
+databricks/deploy.sh
+databricks/deploy_module.sh
+tests/

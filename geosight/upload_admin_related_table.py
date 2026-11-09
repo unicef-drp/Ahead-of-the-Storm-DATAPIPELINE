@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sync admin-level impact outputs to the GeoSight related table
-"Ahead of the Storm – Admin-level Impacts".
+"Ahead of the Storm - Admin-level Impacts".
 
 MODES
 -----

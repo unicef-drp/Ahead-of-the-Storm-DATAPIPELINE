@@ -92,7 +92,7 @@ facility types (`HC_FACILITY_TYPES`) happens at analysis time when generating im
 the same filter applies to both API-sourced and custom data.
 
 Filtering uses the **`amenity`** column, matching the HealthSites.io API documented values.
-Included by default: `hospital`, `clinic`, `doctors` (see `HC_FACILITY_TYPES` in `impact_analysis.py`).
+Included by default: `hospital`, `clinic`, `doctors` (see `HC_FACILITY_TYPES` in `facility_io.py`).
 
 | Column | Required | Type | Values / Notes |
 |--------|----------|------|---------------|
@@ -166,8 +166,8 @@ at the specified zoom level for the country boundary.
 | `tile_id` | Yes | string | Mercator quadkey at zoom level `<ZOOM>` (e.g. `31100123111112`) |
 | `population` | Yes | float | Total population (sum within tile) |
 | `school_age_population` | Yes | float | School-age population (sum within tile) |
-| `infant_population` | Yes | float | Infant population 0–4 years (sum within tile) |
-| `adolescent_population` | Yes | float | Adolescent population 15–19y (sum within tile) |
+| `infant_population` | Yes | float | Infant population 0-4 years (sum within tile) |
+| `adolescent_population` | Yes | float | Adolescent population 15-19y (sum within tile) |
 
 All four population columns are required together: they are hard requirements for the pipeline.
 Use `NaN` for tiles with no data (e.g. ocean tiles).

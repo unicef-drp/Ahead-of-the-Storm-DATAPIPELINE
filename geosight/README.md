@@ -1,13 +1,14 @@
 # GeoSight Integration
 
 Syncs the pipeline's admin-level impact outputs to the GeoSight related table
-**"Ahead of the Storm – Admin-level Impacts"**.
+**"Ahead of the Storm - Admin-level Impacts"**.
 
 ## What It Uploads
 
 The uploader reads admin impact CSV files from `geodb/aos_views/admin_views/`
-(local) or the `AOTS_ANALYSIS` Snowflake stage (production), supporting all
-admin levels 1–5:
+(local) or the configured data store (`get_data_store()`, e.g. Azure Blob or the
+Snowflake stage), supporting all
+admin levels 1-5:
 
 - `{COUNTRY}_{STORM}_{FORECAST}_{WIND}_admin{N}.csv`
 
@@ -21,7 +22,7 @@ threshold, with these base fields:
 |---|---|
 | `country_code` | ISO3 country code (e.g. `TWN`) |
 | `storm` | Storm name (e.g. `FUNG-WONG`) |
-| `admin_level` | Admin level (1–5) |
+| `admin_level` | Admin level (1-5) |
 | `forecast_time` | Forecast time in ISO 8601 (UTC) |
 | `wind_threshold` | Wind speed in knots |
 | `geom_id` | GeoRepo admin ucode (e.g. `TWN_0001_V2`) |
@@ -29,7 +30,7 @@ threshold, with these base fields:
 Plus a fixed allowlist of impact metric columns (`ALLOWED_METRIC_COLUMNS` in
 `admin_related_table.py`: `E_population`, `E_school_age_population`,
 `E_infant_population`, `E_adolescent_population`, `E_built_surface_m2`,
-`E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`, `probability`) --
+`E_num_schools`, `E_num_hcs`, `E_num_shelters`, `E_num_wash`, `probability`),
 not a denylist of everything except a few named columns, so a new metric column
 added to the CSV in the future needs to also be added to this allowlist to be
 uploaded, or it will be silently dropped. `E_rwi`/`E_smod_class`/`E_smod_class_l1`
@@ -68,7 +69,7 @@ python geosight/upload_admin_related_table.py
 
 Scans GeoSight for the latest `forecast_time` already present per
 `(country_code, storm)`, then downloads and uploads only files
-with a newer forecast time from the stage.
+with a newer forecast time from the data store.
 
 ### Backfill: upload everything without dedup
 
@@ -106,7 +107,7 @@ python geosight/upload_admin_related_table.py --replace --storm MELISSA
 ```
 
 Fetches all GeoSight rows matching the active filters, deletes them one by one,
-then uploads the fresh data from the stage. At least one filter is required to
+then uploads the fresh data from the data store. At least one filter is required to
 prevent accidentally wiping unrelated data.
 
 ```bash

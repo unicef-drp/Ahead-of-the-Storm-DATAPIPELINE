@@ -7,18 +7,16 @@
 # MAGIC computing anything, useful for inspecting what work is currently outstanding (for example,
 # MAGIC on-call backlog inspection) without triggering any real compute or signal.
 # MAGIC
-# MAGIC The wind/gust query (Section 3) matches `01_trigger_logic_test`'s query. The precip and river
+# MAGIC The wind/gust query (Section 3) matches `01_trigger_logic_test`'s query plus an exclusion of
+# MAGIC given-up cycles. The precip and river
 # MAGIC queries (Sections 4 and 5) add a missed-cycle catch-up window that the wind/gust query does
 # MAGIC not need: `run_precip_analysis()`/`run_river_flood_analysis()` in "latest" mode only ever fetch
 # MAGIC the single latest `MET_FORECASTS`/`RIVER_FORECASTS` row (`get_latest_met_forecast`/
-# MAGIC `get_latest_river_forecast`). If a scheduled poll is missed for more than one cycle (cluster
+# MAGIC `get_river_tier_pointers`). If a scheduled poll is missed for more than one cycle (cluster
 # MAGIC down, transient error), the skipped cycle(s) are gone forever, silently, since there is no
 # MAGIC equivalent of wind/gust's own `time_delta` lookback for the ambient path. The precip and river
 # MAGIC discovery queries close that gap by looking back `LOOKBACK_DAYS` and finding every real cycle
 # MAGIC not yet logged in `AMBIENT_HAZARD_RUN_LOG`, not just the latest one.
-# MAGIC
-# MAGIC This same discovery query logic (wind/gust, precip, and river) is the logic used inside the
-# MAGIC live production scheduler notebook, `04_production_scheduler.py`.
 # MAGIC
 # MAGIC Entirely read-only: this notebook only reports what work a real scheduled poll would find. It
 # MAGIC does not call any compute functions and does not write anything.
@@ -34,9 +32,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install pandas>=2.0.0 numpy>=1.24.0 geopandas>=0.13.0 shapely>=2.0.0 pyproj>=3.4.0 \
-# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0" "snowflake-connector-python[pandas]>=3.0.0" \
-# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4" "psutil>=5.9.0" "pycountry>=22.3.5" \
-# MAGIC     "quantulum3[classifier]>=0.1.0"
+# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0,<3" "snowflake-connector-python[pandas]>=3.0.0" \
+# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4,<0.10" "psutil>=5.9.0" "pycountry>=22.3.5" \
+# MAGIC     "quantulum3[classifier]>=0.1.0" "SQLAlchemy>=2.0,<2.1"
 
 # COMMAND ----------
 
@@ -68,7 +66,7 @@ try:
         text = text.replace(old4, new4)
         patch_results["list_quoting"] = "PATCHED"
     else:
-        patch_results["list_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["list_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     old5 = 'get_command = f"GET {stage_path} \'file://{temp_dir_normalized}\'"'
     new5 = "get_command = f\"GET '{stage_path}' 'file://{temp_dir_normalized}'\""
@@ -78,7 +76,7 @@ try:
         text = text.replace(old5, new5)
         patch_results["get_quoting"] = "PATCHED"
     else:
-        patch_results["get_quoting"] = "PATTERN NOT FOUND -- giga-spatial version drift, investigate before continuing"
+        patch_results["get_quoting"] = "PATTERN NOT FOUND: giga-spatial version drift, investigate before continuing"
 
     p.write_text(text)
 except Exception as e:
@@ -133,13 +131,21 @@ from snowflake_utils import get_snowflake_connection
 
 conn = get_snowflake_connection()
 cur = conn.cursor()
+# Must exist before this query's own NOT EXISTS check against it below:
+# see pipeline_runlog.py's ensure_windgust_giveup_table() docstring.
+from main_pipeline import ensure_windgust_giveup_table
+ensure_windgust_giveup_table(conn)
 cur.execute("""
     SELECT DISTINCT te.TRACK_ID, te.FORECAST_TIME
     FROM   TC_ENVELOPES_COMBINED te
     JOIN   PIPELINE_COUNTRIES pc
            ON ST_DWITHIN(pc.COUNTRY_BOUNDARY, te.ENVELOPE_REGION, 1500000)
     WHERE  pc.ACTIVE = TRUE
-      AND  te.FORECAST_TIME >= DATEADD('day', -2, CURRENT_TIMESTAMP())
+      -- SYSDATE(), not CURRENT_TIMESTAMP(): te.FORECAST_TIME is genuinely
+      -- TIMESTAMP_NTZ, so this window compares against a real-UTC naive
+      -- current time: see 04_scheduler_windgust.py's own comment for the full
+      -- reasoning (identical column type here).
+      AND  te.FORECAST_TIME >= DATEADD('day', -2, SYSDATE())
       AND  NOT EXISTS (
                SELECT 1
                FROM   TC_PIPELINE_RUN_LOG rl
@@ -147,9 +153,26 @@ cur.execute("""
                  AND  rl.FORECAST_TIME = te.FORECAST_TIME
                  AND  (
                        rl.STATUS = 'SUCCESS'
+                       -- CURRENT_TIMESTAMP(), not SYSDATE(): rl.STARTED_AT is genuinely
+                       -- TIMESTAMP_TZ, a true absolute instant: CURRENT_TIMESTAMP()
+                       -- (TIMESTAMP_LTZ) compares against it correctly regardless of
+                       -- session timezone. rl.STARTED_AT's own value is written as a
+                       -- genuine, timezone-aware UTC instant by pipeline_runlog.py's
+                       -- log_run_start()/log_run_complete() (see their own comments),
+                       -- so this comparison holds correctly on both sides.
                        OR (rl.STATUS IN ('IN_PROGRESS', 'TRIGGERED')
                            AND rl.STARTED_AT > DATEADD('hour', -6, CURRENT_TIMESTAMP()))
                       )
+           )
+      -- Given-up cycles (see pipeline_runlog.py's "GIVE-UP GATE") aren't
+      -- real backlog either: exclude them so this diagnostic count stays
+      -- meaningful instead of accumulating cycles the scheduler itself
+      -- will never touch again.
+      AND  NOT EXISTS (
+               SELECT 1
+               FROM   TC_PIPELINE_GAVE_UP_LOG gul
+               WHERE  gul.STORM_ID      = te.TRACK_ID
+                 AND  gul.FORECAST_TIME = te.FORECAST_TIME
            )
     ORDER BY te.FORECAST_TIME DESC
 """)
@@ -185,7 +208,7 @@ cur.execute(f"""
     SELECT DISTINCT mf.FORECAST_TIME
     FROM   MET_FORECASTS mf
     WHERE  mf.PARAM = 'tp'
-      AND  mf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, CURRENT_TIMESTAMP())
+      AND  mf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, SYSDATE())
       AND  NOT EXISTS (
                SELECT 1 FROM AMBIENT_HAZARD_RUN_LOG ahr
                WHERE  ahr.SOURCE = 'precip'
@@ -207,8 +230,8 @@ for ft in precip_work:
 # MAGIC %md
 # MAGIC ## 5. River: unprocessed cycles per RP tier within the same lookback window
 # MAGIC
-# MAGIC Same reasoning as precip. `RIVER_RP_TIERS`, the `extent_{rp}_bymember` PARAM naming
-# MAGIC convention, and the `AMBIENT_HAZARD_RUN_LOG` bare-tier-name convention (`'rp2'`, not
+# MAGIC Same reasoning as precip. `RIVER_RP_TIERS`, the `extent_{rp}_bymember` and `extent_bymask_{rp}`
+# MAGIC PARAM naming conventions (a cycle counts when either exists), and the `AMBIENT_HAZARD_RUN_LOG` bare-tier-name convention (`'rp2'`, not
 # MAGIC `'extent_rp2_bymember'`) all match `main_pipeline.py`'s production code exactly
 # MAGIC (`RIVER_RP_TIERS`, `run_river_flood_analysis()`'s own `is_ambient_forecast_processed(
 # MAGIC ambient_conn, 'river', rp, forecast_time)` call).
@@ -221,12 +244,12 @@ conn = get_snowflake_connection()
 cur = conn.cursor()
 river_work = {}
 for rp in RIVER_RP_TIERS:
-    param = f"extent_{rp}_bymember"
+    params = (f"extent_{rp}_bymember", f"extent_bymask_{rp}")
     cur.execute(f"""
         SELECT DISTINCT rf.FORECAST_TIME
         FROM   RIVER_FORECASTS rf
-        WHERE  rf.PARAM = %s
-          AND  rf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, CURRENT_TIMESTAMP())
+        WHERE  rf.PARAM IN (%s, %s)
+          AND  rf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, SYSDATE())
           AND  NOT EXISTS (
                    SELECT 1 FROM AMBIENT_HAZARD_RUN_LOG ahr
                    WHERE  ahr.SOURCE = 'river'
@@ -234,7 +257,7 @@ for rp in RIVER_RP_TIERS:
                      AND  ahr.FORECAST_TIME = rf.FORECAST_TIME
                )
         ORDER BY rf.FORECAST_TIME ASC
-    """, (param, rp))
+    """, (*params, rp))
     river_work[rp] = [r[0] for r in cur.fetchall()]
 cur.close()
 conn.close()

@@ -46,17 +46,25 @@ class Config:
     # Azure Blob Storage Configuration
     ACCOUNT_URL = os.getenv('ACCOUNT_URL')
     SAS_TOKEN = os.getenv('SAS_TOKEN')
+    # CONTAINER_NAME must be set explicitly and passed to ADLSDataStore rather than
+    # left to its own container=config.ADLS_CONTAINER_NAME default: that default reads
+    # the generic ADLS_CONTAINER_NAME env var, the same one any other bare
+    # ADLSDataStore() construction elsewhere in this repo relies on for an
+    # unrelated shared storage account. Leaving
+    # this repo's own output store to that same default risks silently writing to
+    # whatever container ADLS_CONTAINER_NAME happens to point at for that other purpose.
+    CONTAINER_NAME = os.getenv('CONTAINER_NAME')
     DATA_PIPELINE_DB = os.getenv('DATA_PIPELINE_DB', 'LOCAL').strip().upper()
 
     # Hazard source data (wind/gust envelopes, tracks, precip/runoff) read mode.
     # Independent of DATA_PIPELINE_DB, which only governs this repo's OWN
-    # output/cache. SNOWFLAKE (default) reads TC_ENVELOPES_COMBINED/
-    # TC_GUST_ENVELOPES_COMBINED/TC_TRACKS/MET_FORECASTS directly, same as
-    # today. LOCAL/BLOB read the same data from TC-ECMWF-Forecast-Pipeline's
-    # own local-disk or Blob output instead, mainly for local end-to-end
-    # testing without a live Snowflake connection populated with real
-    # hurricane data.
-    HAZARD_DATA_SOURCE = os.getenv('HAZARD_DATA_SOURCE', 'SNOWFLAKE').strip().upper()
+    # output/cache. BLOB (default) reads the data from the Azure Blob
+    # container written by TC-ECMWF-Forecast-Pipeline (HAZARD_BLOB_* vars
+    # required). LOCAL reads TC-ECMWF-Forecast-Pipeline's local-disk output,
+    # mainly for local end-to-end runs. SNOWFLAKE reads
+    # TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_COMBINED/TC_TRACKS/MET_FORECASTS
+    # directly.
+    HAZARD_DATA_SOURCE = os.getenv('HAZARD_DATA_SOURCE', 'BLOB').strip().upper()
 
     # HAZARD_DATA_SOURCE=LOCAL: directories matching TC-ECMWF-Forecast-Pipeline's
     # own output locations (WIND_EXTRACTED_DIR/TRANSFORMED_DATA_DIR/MET_DATA_DIR
@@ -81,11 +89,7 @@ class Config:
     STORMS_FILE = os.getenv('STORMS_FILE', 'storms.json')
     VIEWS_DIR = os.getenv('VIEWS_DIR', 'aos_views')
     ROOT_DATA_DIR = os.getenv('ROOT_DATA_DIR', 'geodb')
-    
-    # Report Configuration (optional)
-    REPORTS_JSON_DIR = os.getenv('REPORTS_JSON_DIR', 'jsons')  # Subdirectory for JSON reports under RESULTS_DIR
-    REPORT_TEMPLATE_PATH = os.getenv('REPORT_TEMPLATE_PATH', 'impact-report-template.html')  # HTML template path
-    
+
     @classmethod
     def validate_snowflake_config(cls):
         """Validate that all required Snowflake configuration is present"""
@@ -130,32 +134,17 @@ class Config:
     def validate_azure_config(cls):
         """Validate that all required Azure configuration is present"""
         if cls.DATA_PIPELINE_DB == 'BLOB':
-            required_vars = ['ACCOUNT_URL', 'SAS_TOKEN']
+            required_vars = ['ACCOUNT_URL', 'SAS_TOKEN', 'CONTAINER_NAME']
             missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
             if missing:
                 raise ValueError(f"Missing Azure environment variables: {', '.join(missing)}")
     
     @classmethod
-    def validate_storage_config(cls):
-        """Validate storage configuration based on DATA_PIPELINE_DB setting"""
-        if cls.DATA_PIPELINE_DB == 'BLOB':
-            cls.validate_azure_config()
-        elif cls.DATA_PIPELINE_DB == 'SNOWFLAKE':
-            cls.validate_snowflake_storage_config()
-        elif cls.DATA_PIPELINE_DB != 'LOCAL':
-            raise ValueError(
-                f"Unrecognized DATA_PIPELINE_DB value: '{cls.DATA_PIPELINE_DB}' "
-                f"(expected LOCAL, BLOB, or SNOWFLAKE)"
-            )
-
-    @classmethod
     def validate_hazard_data_source_config(cls):
-        """Validate configuration for HAZARD_DATA_SOURCE (upstream hazard
-        source data read mode), independent of validate_storage_config(),
-        which is about this repo's own output/cache instead. Only ever
-        called for LOCAL/BLOB (via get_hazard_data_store()); the SNOWFLAKE
-        case needs no extra validation beyond the existing Snowflake
-        credential checks already performed elsewhere."""
+        """Validate configuration for HAZARD_DATA_SOURCE LOCAL or BLOB (upstream
+        hazard source data read mode), independent of DATA_PIPELINE_DB, which is
+        about this repo's own output/cache instead. HAZARD_DATA_SOURCE=SNOWFLAKE
+        reads through direct queries and has no data store to validate."""
         if cls.HAZARD_DATA_SOURCE == 'LOCAL':
             required_vars = ['HAZARD_LOCAL_WIND_DIR', 'HAZARD_LOCAL_TRACKS_DIR', 'HAZARD_LOCAL_MET_DIR']
             missing = [var for var in required_vars if _is_missing(getattr(cls, var))]
@@ -168,8 +157,8 @@ class Config:
                 raise ValueError(f"Missing HAZARD_DATA_SOURCE=BLOB environment variables: {', '.join(missing)}")
         else:
             raise ValueError(
-                f"Unrecognized HAZARD_DATA_SOURCE value: '{cls.HAZARD_DATA_SOURCE}' "
-                f"(expected SNOWFLAKE, LOCAL, or BLOB)"
+                f"HAZARD_DATA_SOURCE '{cls.HAZARD_DATA_SOURCE}' has no data store "
+                f"(expected LOCAL or BLOB)"
             )
 
 # Create a global config instance
