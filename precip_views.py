@@ -9,12 +9,11 @@ save_precip_ratio_* function.
 
 Storm-independent: called from run_precip_analysis() once per --type update
 run, not once per storm. See this module's own "PRECIPITATION/RUNOFF VIEWS"
-section below for why precip uses centroid-based raster sampling
-(TifProcessor.sample_by_coordinates()) rather than the polygon sjoin wind/gust
-use or map_rasters()'s polygon-based zonal stats.
+section below for why precip uses centroid-based grid sampling rather than
+the polygon sjoin wind/gust use or map_rasters()'s polygon-based zonal stats.
 
 Module structure:
-    grid_to_geotiff_to_tifprocessor, _precip_grid_row_col
+    _precip_grid_row_col
     create_precip_tile_view, calculate_precip_tile_member_bitmask,
         create_precip_admin_view
     create_precip_facility_view
@@ -26,16 +25,12 @@ Module structure:
 
 import logging
 import os
-import tempfile
-import contextlib
 import warnings
 import numpy as np
 import pandas as pd
 
 from gigaspatial.generators import GeometryBasedZonalViewGenerator
 from gigaspatial.core.io.writers import write_dataset
-from gigaspatial.processing.tif_processor import TifProcessor
-from gigaspatial.core.io.local_data_store import LocalDataStore
 
 # Shared state/helpers with no dependency of their own on this module or its
 # siblings - see pipeline_shared.py's own docstring for why this exists.
@@ -49,72 +44,76 @@ from pipeline_shared import (
     _OPTIONAL_SUM_COLS,
     _optional_sum,
 )
+from sparse_output import (
+    describe_reduction,
+    sparsify_facility_frame,
+    sparsify_tile_frame,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _tile_view_for_write(df, family, file_name):
+    """
+    Frame handed to a tile view writer: a thin copy (nonzero rows plus one
+    marker row). Any failure falls back to the dense frame so the file is
+    still written.
+    """
+    try:
+        # Contiguous index, so the CSV index column matches the thin frame.
+        frame = sparsify_tile_frame(df).reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"    Sparse {family} tile view {file_name} not applied, writing the dense file: {e}")
+        return df
+    logger.info(f"    Sparse {family} tile view {file_name}: {describe_reduction(df, frame)}")
+    return frame
+
+
+def _facility_view_for_write(gdf, family, file_name):
+    """
+    Frame handed to a facility view writer: zero-probability rows are dropped
+    from a copy. The result may be empty; the file is still written so
+    existence checks see it.
+    """
+    try:
+        # Contiguous index, so the parquet file carries no extra index column.
+        frame = sparsify_facility_frame(gdf).reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"    Sparse {family} facility view {file_name} not applied, writing the dense file: {e}")
+        return gdf
+    logger.debug(f"    Sparse {family} facility view {file_name}: {describe_reduction(gdf, frame)}")
+    return frame
+
 
 # =============================================================================
 # PRECIPITATION/RUNOFF VIEWS
 # Storm-independent: tp exceedance-probability tiers and the ro/tp ratio's own
-# exceedance-probability tiers, both raster-sampled per tile via centroid-
-# based point sampling (TifProcessor.sample_by_coordinates()) rather than the
-# polygon sjoin wind/gust use or map_rasters()'s polygon-based zonal stats
+# exceedance-probability tiers, both grid-sampled per tile via centroid-
+# based point sampling rather than the polygon sjoin wind/gust use or
+# map_rasters()'s polygon-based zonal stats
 # Called from run_precip_analysis() once per --type update run, not once per storm.
 # =============================================================================
-
-@contextlib.contextmanager
-def grid_to_geotiff_to_tifprocessor(grid_2d, lat_min, lat_max, lon_min, lon_max):
-    """
-    Materialize a probability grid as a temp GeoTIFF and wrap it in a
-    TifProcessor, ready for centroid-based sampling via
-    create_precip_tile_view(). Written to a local temp file regardless of
-    DATA_PIPELINE_DB (ephemeral intermediate, never needs to persist). A
-    context manager, not a plain function: TifProcessor reads the underlying
-    file lazily on each call (rasterio.open() inside
-    sample_by_coordinates()), not eagerly at construction, so the temp file
-    must stay alive for the `with` block's duration and is only deleted on
-    exit, not immediately after construction.
-
-    Usage:
-        with grid_to_geotiff_to_tifprocessor(grid, *bounds) as tif:
-            view = create_precip_tile_view(gdf_tiles, tif)
-    """
-    from precip_utils import grid_to_geotiff  # local import: avoids a module-load-order
-                                               # dependency between precip_utils and impact_analysis
-    tmp_path = tempfile.NamedTemporaryFile(suffix='.tif', delete=False).name
-    try:
-        grid_to_geotiff(grid_2d, lat_min, lat_max, lon_min, lon_max, tmp_path)
-        yield TifProcessor(dataset_path=tmp_path, data_store=LocalDataStore())
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
 
 def _precip_grid_row_col(cx, cy, lat_min, lat_max, lon_min, lon_max, n_lat, n_lon):
     """
     Vectorized centroid -> native precip-grid row/col lookup. The single
-    shared implementation of this math: both create_precip_tile_view()'s
-    grid_2d fast path and calculate_precip_tile_member_bitmask() call this,
-    rather than each deriving their own formula, so both stay consistent
+    shared implementation of this math: both create_precip_tile_view() and
+    calculate_precip_tile_member_bitmask() call this, rather than each
+    deriving their own formula, so both stay consistent
     with dividing by n-1 (not n) and the half-cell expansion described below.
 
-    MUST stay byte-for-byte consistent with precip_utils.grid_to_geotiff()'s
-    own real bounds/transform convention, since that's what a
-    tif_processor-based caller (create_precip_tile_view()'s fallback path)
-    actually samples against: lat_min/lat_max/lon_min/lon_max are the grid's
-    OUTERMOST GRID POINT (pixel-center) coordinates, NOT already the
-    raster's own edge bounds. grid_to_geotiff() divides by (n-1) intervals
-    between points (not n), then expands the sampled bounds by half a cell
-    on every side before calling rasterio.transform.from_bounds(), so the
-    raster's own actual pixel edges are systematically half a cell wider
-    than the raw min/max on each side. Row 0 = lat_max (north-at-row-0,
-    matching read_precip_window()'s own convention).
+    lat_min/lat_max/lon_min/lon_max are the grid's OUTERMOST GRID POINT
+    (pixel-center) coordinates, NOT already the grid's own edge bounds. The
+    cell size divides by (n-1) intervals between points (not n), and the
+    sampled bounds expand by half a cell on every side, so the grid's actual
+    pixel edges are half a cell wider than the raw min/max on each side.
+    Row 0 = lat_max (north-at-row-0, matching read_precip_windows()'s
+    convention).
 
     Args:
         cx, cy: 1D numpy arrays of centroid longitude/latitude, same length.
         lat_min, lat_max, lon_min, lon_max: grid's own outermost grid-point
-            bounds (the same 4 values read_precip_window() returns
+            bounds (the same 4 values read_precip_windows() returns
             alongside the raw grid).
         n_lat, n_lon: grid shape (rows, cols).
 
@@ -128,9 +127,8 @@ def _precip_grid_row_col(cx, cy, lat_min, lat_max, lon_min, lon_max, n_lat, n_lo
     dlon = (lon_max - lon_min) / (n_lon - 1) if n_lon > 1 else 0.0
     top = lat_max + dlat / 2
     left = lon_min - dlon / 2
-    # dlat/dlon == 0 only in the degenerate n_lat==1/n_lon==1 case
-    # (grid_to_geotiff()'s own same guard); every centroid maps to the
-    # single row/col in that case.
+    # dlat/dlon == 0 only in the degenerate n_lat==1/n_lon==1 case; every
+    # centroid maps to the single row/col in that case.
     rows = (np.clip(((top - cy) / dlat).astype(np.int64), 0, n_lat - 1)
             if dlat else np.zeros(len(cy), dtype=np.int64))
     cols = (np.clip(((cx - left) / dlon).astype(np.int64), 0, n_lon - 1)
@@ -138,7 +136,7 @@ def _precip_grid_row_col(cx, cy, lat_min, lat_max, lon_min, lon_max, n_lat, n_lo
     return rows, cols
 
 
-def create_precip_tile_view(gdf_tiles, tif_processor=None, grid_2d=None, bounds=None, tiles_viewer=None):
+def create_precip_tile_view(gdf_tiles, grid_2d, bounds, tiles_viewer=None):
     """
     Sample a precip/ratio probability raster onto mercator tiles.
 
@@ -150,45 +148,27 @@ def create_precip_tile_view(gdf_tiles, tif_processor=None, grid_2d=None, bounds=
     all_touched=False, and no all_touched override exposed) requires to
     count any pixel as "inside" the polygon.
 
-    Two ways to provide the probability raster, mutually exclusive:
-
-    - grid_2d + bounds (preferred): the raw (n_lat, n_lon) probability array
-      plus its own real (lat_min, lat_max, lon_min, lon_max) bounds, sampled
-      via the exact same vectorized centroid->native-cell math
-      calculate_precip_tile_member_bitmask() already uses (see
-      _precip_grid_row_col()). No temp GeoTIFF write, no rasterio.open(),
-      no per-point Python-level sampling loop: a single vectorized
-      fancy-index lookup for every tile at once. Provably identical math to
-      the tif_processor path below (both trace back to precip_utils.
-      grid_to_geotiff()'s own bounds/transform convention).
-    - tif_processor (fallback, for a caller that already has a TifProcessor
-      and not the raw grid/bounds): a TifProcessor wrapping a GeoTIFF
-      probability grid (from precip_utils.grid_to_geotiff(), typically via
-      grid_to_geotiff_to_tifprocessor()), sampled via
-      TifProcessor.sample_by_coordinates() -> rasterio's own per-point
-      `src.sample()` generator, plus a second temp-file write/reopen round
-      trip for the source grid. This scales with tile count, which is why
-      the grid_2d path above is preferred for main_pipeline.py's own hot
-      call sites.
+    The raw (n_lat, n_lon) probability array plus its own real (lat_min,
+    lat_max, lon_min, lon_max) bounds are sampled via the same vectorized
+    centroid->native-cell math calculate_precip_tile_member_bitmask() uses
+    (see _precip_grid_row_col()): a single vectorized fancy-index lookup for
+    every tile at once, no per-point Python-level sampling loop.
 
     Args:
         gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()).
-        tif_processor: TifProcessor wrapping a GeoTIFF probability grid
-            (from precip_utils.grid_to_geotiff()). Ignored when grid_2d is
-            given.
-        grid_2d: Optional (n_lat, n_lon) raw probability array. When given
-            (together with bounds), takes precedence over tif_processor.
+        grid_2d: (n_lat, n_lon) raw probability array.
         bounds: (lat_min, lat_max, lon_min, lon_max) tuple, grid_2d's own
-            real geo bounds. Required when grid_2d is given.
+            real geo bounds. A missing or invalid grid or bounds does not
+            raise: probabilities default to 0 and a WARNING is logged.
         tiles_viewer: Optional, an already-constructed
             GeometryBasedZonalViewGenerator(zone_data=gdf_tiles,
             zone_id_column='tile_id') for this same gdf_tiles, reused
             (resetting `_view` to None first) instead of building a fresh
-            one: main_pipeline.py's own per-country precip loop calls this
-            function once per (window_h, threshold_mm) and once per
-            (window_h, ratio_threshold) combination (up to ~20 calls for a
-            country with every window/threshold populated) against the exact
-            same gdf_tiles every time, and GeometryBasedZonalViewGenerator.
+            one: the dense fallback of main_pipeline.py's per-country precip
+            loop calls this function once per (window_h, threshold_mm) and
+            once per (window_h, ratio_threshold) combination (up to ~20
+            calls for a country with every window/threshold populated)
+            against the exact same gdf_tiles every time, and GeometryBasedZonalViewGenerator.
             __init__ renames+copies every column of gdf_tiles and rebuilds
             its zone_id->geometry dict from scratch on each construction.
             When None (default, e.g. this function's own internal call from
@@ -229,42 +209,17 @@ def create_precip_tile_view(gdf_tiles, tif_processor=None, grid_2d=None, bounds=
             centroids = gdf_tiles.geometry.centroid
         tile_ids = gdf_tiles['tile_id'].to_numpy()
 
-        if grid_2d is not None:
-            if bounds is None:
-                raise ValueError("create_precip_tile_view: bounds is required when grid_2d is given")
-            lat_min, lat_max, lon_min, lon_max = bounds
-            n_lat, n_lon = grid_2d.shape
-            cy, cx = centroids.y.to_numpy(), centroids.x.to_numpy()
-            rows, cols = _precip_grid_row_col(cx, cy, lat_min, lat_max, lon_min, lon_max, n_lat, n_lon)
-            # Cast to float32 here, matching the precision the tif_processor
-            # path would produce: grid_to_geotiff() writes grid_2d.astype
-            # ('float32') and TifProcessor reads it back as a float32 band,
-            # so sampling the raw float64 grid_2d directly without this cast
-            # would be a strictly MORE precise value than the tif_processor
-            # path ever produces for the same input, not an equivalent one.
-            values = grid_2d[rows, cols].astype(np.float32)
-            probs = dict(zip(tile_ids, values))
-            native_rows = dict(zip(tile_ids, rows))
-            native_cols = dict(zip(tile_ids, cols))
-        else:
-            coords = list(zip(centroids.x, centroids.y))
-            values = tif_processor.sample_by_coordinates(coords)
-            probs = dict(zip(gdf_tiles['tile_id'], values))
-
-            # Native grid cell each tile's centroid falls in
-            # against the GeoTIFF's own already-correct (half-cell-expanded)
-            # bounds, not a second raster read.
-            tp_bounds = tif_processor.bounds
-            dlon = (tp_bounds.right - tp_bounds.left) / tif_processor.width
-            dlat = (tp_bounds.top - tp_bounds.bottom) / tif_processor.height
-            # Clamped to the valid pixel range: a tile centroid sitting exactly on
-            # (or within floating-point epsilon of) the raster's outer edge would
-            # otherwise produce an out-of-range index (e.g. col == width at the
-            # right edge, valid columns are 0..width-1).
-            native_rows = {tid: min(int((tp_bounds.top - y) / dlat), tif_processor.height - 1)
-                           for tid, y in zip(gdf_tiles['tile_id'], centroids.y)}
-            native_cols = {tid: min(int((x - tp_bounds.left) / dlon), tif_processor.width - 1)
-                           for tid, x in zip(gdf_tiles['tile_id'], centroids.x)}
+        if bounds is None:
+            raise ValueError("create_precip_tile_view: bounds is required")
+        lat_min, lat_max, lon_min, lon_max = bounds
+        n_lat, n_lon = grid_2d.shape
+        cy, cx = centroids.y.to_numpy(), centroids.x.to_numpy()
+        rows, cols = _precip_grid_row_col(cx, cy, lat_min, lat_max, lon_min, lon_max, n_lat, n_lon)
+        # Cast to float32: probabilities are stored at float32 precision.
+        values = grid_2d[rows, cols].astype(np.float32)
+        probs = dict(zip(tile_ids, values))
+        native_rows = dict(zip(tile_ids, rows))
+        native_cols = dict(zip(tile_ids, cols))
     except Exception as e:
         logger.warning(f"precip tile view sampling failed, defaulting probabilities to 0: {e}")
         probs = {k: 0.0 for k in tiles_viewer.view['zone_id'].unique()}
@@ -318,9 +273,8 @@ def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_m
     (threshold_mm, window_h) combination of rainfall exceedance (bit `m-1`
     set <=> member `m`'s accumulated rainfall exceeds threshold_mm at that
     tile's own native precip-grid cell). Same shape/purpose as Wind's own
-    calculate_tile_member_bitmask() and River's own
-    calculate_river_tile_member_bitmask() (see those functions' own
-    docstrings), persisted as a real pipeline output.
+    calculate_tile_member_bitmask() (see its docstring), persisted as a real
+    pipeline output.
 
     Unlike River (a genuine point-in-polygon sjoin against real flooded
     pixels) rain's own precip grid (~0.25 degrees) is far coarser than a
@@ -337,9 +291,9 @@ def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_m
         bitmask_grid: (n_lat, n_lon) uint64 array from precip_utils.
             exceedance_bitmask(), same shape/orientation as the raw
             period_grid it was derived from (row 0 = lat_max, matching
-            read_precip_window()'s own north-at-row-0 convention).
+            read_precip_windows()'s own north-at-row-0 convention).
         lat_min, lat_max, lon_min, lon_max: bitmask_grid's own real geo
-            bounds, the same 4 values read_precip_window() returns
+            bounds, the same 4 values read_precip_windows() returns
             alongside period_grid itself.
 
     Returns:
@@ -351,16 +305,10 @@ def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_m
         mirrors an all-below-threshold cycle, not an error).
     """
     n_lat, n_lon = bitmask_grid.shape
-    # Uses the exact same dlat/dlon + half-cell bounds expansion grid_to_geotiff()
-    # uses to build the GeoTIFF create_precip_tile_view()'s tif_processor path
-    # samples from. lat_min/lat_max/lon_min/lon_max are OUTERMOST GRID POINT
-    # (pixel-center) coordinates, not the raster's edge bounds: grid_to_geotiff()
-    # divides by (n-1) intervals (not n), then expands by half a cell on every
-    # side before rasterio.transform.from_bounds(), so tif_processor.bounds is
-    # systematically half a cell wider than the raw min/max. Must stay
-    # byte-for-byte consistent with that function, not an independent
-    # approximation. _precip_grid_row_col() is the single shared implementation
-    # of this math (also used by create_precip_tile_view()'s grid_2d fast path).
+    # lat_min/lat_max/lon_min/lon_max are OUTERMOST GRID POINT (pixel-center)
+    # coordinates, not the grid's edge bounds. _precip_grid_row_col() is the
+    # single shared implementation of the centroid->cell math (also used by
+    # create_precip_tile_view()).
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='Geometry is in a geographic CRS')
         centroids = gdf_tiles.geometry.centroid
@@ -378,7 +326,7 @@ def calculate_precip_tile_member_bitmask(gdf_tiles, bitmask_grid, lat_min, lat_m
     })
 
 
-def create_precip_admin_view(gdf_admin, gdf_tiles, tif_processor=None, precomputed_tile_view=None,
+def create_precip_admin_view(gdf_admin, gdf_tiles, precomputed_tile_view=None,
                               grid_2d=None, bounds=None, tiles_viewer=None):
     """
     Admin-level equivalent of create_precip_tile_view(): tile-level probability
@@ -396,9 +344,6 @@ def create_precip_admin_view(gdf_admin, gdf_tiles, tif_processor=None, precomput
         gdf_admin: GeoDataFrame of admin regions with 'tile_id'/'name' columns.
         gdf_tiles: GeoDataFrame of mercator tiles, must carry an admin 'id' column.
             Ignored (beyond the 'id' mapping below) when precomputed_tile_view is given.
-        tif_processor: TifProcessor wrapping a GeoTIFF probability grid. Ignored when
-            grid_2d is given, or when precomputed_tile_view is given (no raster access
-            happens at all in that case).
         precomputed_tile_view: Optional tile-level view (create_precip_tile_view()'s own
             return shape) to reuse instead of resampling the raster again. Admin level 1's
             own gdf_tiles is always the exact same object as the caller's whole-country
@@ -408,13 +353,14 @@ def create_precip_admin_view(gdf_admin, gdf_tiles, tif_processor=None, precomput
             instead of resampling the raster again. A copy is taken, never the caller's
             own object, since this function adds an 'id' column below and callers (e.g.
             facility views) still read the original afterward. Takes priority over
-            grid_2d/tif_processor when given.
+            grid_2d when given.
         grid_2d: Optional (n_lat, n_lon) raw probability array, forwarded to
-            create_precip_tile_view()'s own grid_2d fast path when precomputed_tile_view
+            create_precip_tile_view() when precomputed_tile_view
             is not given (e.g. an admin_level > 1 call, whose own admin_tiles differs
             from the whole-country gdf_tiles, so a fresh raster sample is required).
         bounds: (lat_min, lat_max, lon_min, lon_max) tuple, grid_2d's own real geo
-            bounds. Required when grid_2d is given.
+            bounds. Used with grid_2d; a missing grid or bounds defaults
+            probabilities to 0 with a WARNING (see create_precip_tile_view()).
         tiles_viewer: Optional, forwarded as-is to create_precip_tile_view()'s own
             `tiles_viewer` param when precomputed_tile_view is not given: must be a
             GeometryBasedZonalViewGenerator already built for THIS gdf_tiles (i.e. this
@@ -434,7 +380,7 @@ def create_precip_admin_view(gdf_admin, gdf_tiles, tif_processor=None, precomput
 
     df_view = (
         precomputed_tile_view.copy() if precomputed_tile_view is not None
-        else create_precip_tile_view(gdf_tiles, tif_processor=tif_processor, grid_2d=grid_2d, bounds=bounds,
+        else create_precip_tile_view(gdf_tiles, grid_2d=grid_2d, bounds=bounds,
                                       tiles_viewer=tiles_viewer)
     )
 
@@ -512,7 +458,7 @@ def create_precip_facility_view(gdf_facilities, facility_tile_map, tile_view_df,
 def save_precip_tile_view(df, country, forecast_time, threshold_mm, window_h):
     """Save a tp exceedance-probability tile view: mercator_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv"""
     file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precip', file_name))
+    write_dataset(_tile_view_for_write(df, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precip', file_name))
 
 
 def save_precip_tile_bitmask_view(df, country, forecast_time, threshold_mm, window_h):
@@ -544,7 +490,7 @@ def save_precip_ratio_view(df, country, forecast_time, ratio_threshold, window_h
     """
     g_token = int(round(ratio_threshold * 100))
     file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precipratio', file_name))
+    write_dataset(_tile_view_for_write(df, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_precipratio', file_name))
 
 
 def save_precip_ratio_admin_view(df, country, forecast_time, ratio_threshold, window_h, admin_level=1):
@@ -565,50 +511,50 @@ def save_precip_ratio_admin_view(df, country, forecast_time, ratio_threshold, wi
 def save_precip_school_view(gdf, country, forecast_time, threshold_mm, window_h):
     """school_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precip', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precip', file_name))
 
 
 def save_precip_ratio_school_view(gdf, country, forecast_time, ratio_threshold, window_h):
     """school_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
     g_token = int(round(ratio_threshold * 100))
     file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precipratio', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_precipratio', file_name))
 
 
 def save_precip_hc_view(gdf, country, forecast_time, threshold_mm, window_h):
     """hc_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precip', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precip', file_name))
 
 
 def save_precip_ratio_hc_view(gdf, country, forecast_time, ratio_threshold, window_h):
     """hc_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
     g_token = int(round(ratio_threshold * 100))
     file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precipratio', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_precipratio', file_name))
 
 
 def save_precip_shelter_view(gdf, country, forecast_time, threshold_mm, window_h):
     """shelter_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precip', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precip', file_name))
 
 
 def save_precip_ratio_shelter_view(gdf, country, forecast_time, ratio_threshold, window_h):
     """shelter_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
     g_token = int(round(ratio_threshold * 100))
     file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precipratio', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_precipratio', file_name))
 
 
 def save_precip_wash_view(gdf, country, forecast_time, threshold_mm, window_h):
     """wash_views_precip/{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_p{threshold_mm}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precip', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precip', file_name))
 
 
 def save_precip_ratio_wash_view(gdf, country, forecast_time, ratio_threshold, window_h):
     """wash_views_precipratio/{country}_{forecast_time}_g{ratio*100}_{window_h}h.parquet"""
     g_token = int(round(ratio_threshold * 100))
     file_name = f"{country}_{forecast_time}_g{g_token}_{window_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precipratio', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'precip', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_precipratio', file_name))

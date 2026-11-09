@@ -185,8 +185,7 @@ View Zoom: 8
 1. Gets list of countries (from input or Snowflake table)
 2. For each date in the range:
    - Runs pipeline with `--date` parameter
-   - Processes all storms for that date (or specific storm if provided)
-   - Creates impact views and reports
+   - Runs wind, gust, precip and river-flood views for that date (precip and river ignore the storm filter)
 
 **Example:**
 ```
@@ -222,9 +221,9 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | Column | Source |
 |--------|--------|
 | `population` | WorldPop (total, 1km) |
-| `school_age_population` | WorldPop GR2/2025 (ages 5–14, 100m) |
-| `infant_population` | WorldPop (ages 0–4, 100m) |
-| `adolescent_population` | WorldPop GR2/2025 (ages 15–19y, 100m) |
+| `school_age_population` | WorldPop GR2/2025 (ages 5-14, 100m) |
+| `infant_population` | WorldPop (ages 0-4, 100m) |
+| `adolescent_population` | WorldPop GR2/2025 (ages 15-19y, 100m) |
 | `built_surface_m2` | GHSL built surface |
 | `smod_class` | GHSL SMOD L2 settlement class |
 | `smod_class_l1` | Derived from `smod_class` (always updated together) |
@@ -233,7 +232,7 @@ This will process all storms from November 1-10, 2025 for Taiwan and Dominican R
 | `hcs` | HealthSites API → updates `num_hcs` column |
 | `shelters` | OSM Overpass / custom CSV → updates `num_shelters` column |
 | `wash` | OSM Overpass / custom CSV → updates `num_wash` column |
-| `vulnerability` | `geodb/vulnerability/` → updates `moderate_poverty_prob` + `severe_poverty_prob` (run `vulnerability/fetch_vulnerability_probs.py` first) |
+| `vulnerability` | `geodb/vulnerability/` → updates `moderate_poverty_prob` + `severe_poverty_prob` (produce that data first with a local fetch script, not tracked in this repo) |
 | `admin<N>` (e.g. `admin2`) | Adds a new admin level base parquet without re-initializing |
 
 **Notes:**

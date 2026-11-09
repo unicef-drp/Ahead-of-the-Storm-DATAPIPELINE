@@ -3,7 +3,7 @@
 # MAGIC # DATAPIPELINE Environment Health Check
 # MAGIC
 # MAGIC Verifies this cluster can run the real DATAPIPELINE pipeline code: system libraries, Python
-# MAGIC dependencies, the giga-spatial patches this repo still needs, and Snowflake connectivity.
+# MAGIC dependencies, the giga-spatial patches checked below, and Snowflake connectivity.
 # MAGIC
 # MAGIC Re-run whenever the cluster/runtime, `requirements.txt`, or the installed giga-spatial version
 # MAGIC changes. Each section prints a clear pass/fail. Nothing here writes to Snowflake; the
@@ -31,9 +31,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install pandas>=2.0.0 numpy>=1.24.0 geopandas>=0.13.0 shapely>=2.0.0 pyproj>=3.4.0 \
-# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0" "snowflake-connector-python[pandas]>=3.0.0" \
-# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4" "psutil>=5.9.0" "pycountry>=22.3.5" \
-# MAGIC     "quantulum3[classifier]>=0.1.0"
+# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0,<3" "snowflake-connector-python[pandas]>=3.0.0" \
+# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4,<0.10" "psutil>=5.9.0" "pycountry>=22.3.5" \
+# MAGIC     "quantulum3[classifier]>=0.1.0" "SQLAlchemy>=2.0,<2.1"
 
 # COMMAND ----------
 
@@ -69,8 +69,11 @@ print("ALL IMPORTS OK" if not failed else f"FAILED: {failed}")
 # MAGIC
 # MAGIC `snowflake/Dockerfile` carries 5 patches against giga-spatial 0.9.3/0.9.4. Patches 1
 # MAGIC (mercator_tiles classmethod) and 3 (OSM User-Agent) are fixed upstream in giga-spatial 0.9.8 and
-# MAGIC are not applied here. Only patches 2, 4, and 5 are checked and applied below, path-agnostic
-# MAGIC (uses `importlib` to find the real installed location on this cluster).
+# MAGIC are not applied here. This notebook checks and applies patches 2 (HealthSites Overpass bypass),
+# MAGIC 4 (`list_quoting`) and 5 (`get_quoting`) below, path-agnostic (uses `importlib` to find the real
+# MAGIC installed location on this cluster). The scheduler notebooks (04 to 07 and 99) are
+# MAGIC self-contained and apply those two plus `download_race` and `download_cleanup`; they do not
+# MAGIC apply the HealthSites bypass.
 
 # COMMAND ----------
 

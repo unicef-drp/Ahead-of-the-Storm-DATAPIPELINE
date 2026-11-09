@@ -54,8 +54,11 @@ _BLOB_OP_TIMEOUT_SECONDS = 120  # well above typical operation time, well below 
 
 
 def _with_hard_timeout(func, timeout=_BLOB_OP_TIMEOUT_SECONDS):
+    # `timeout` may be a number, or a callable taking the wrapped call's own
+    # (*args, **kwargs) and returning seconds (used to scale with payload size).
     def wrapper(*args, **kwargs):
         result_q = queue.Queue(maxsize=1)
+        timeout_s = timeout(*args, **kwargs) if callable(timeout) else timeout
 
         def _run():
             try:
@@ -66,22 +69,22 @@ def _with_hard_timeout(func, timeout=_BLOB_OP_TIMEOUT_SECONDS):
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         try:
-            status, value = result_q.get(timeout=timeout)
+            status, value = result_q.get(timeout=timeout_s)
         except queue.Empty:
             logger.error(
-                f"{func.__qualname__} exceeded {timeout}s, likely a stuck Azure Blob "
+                f"{func.__qualname__} exceeded {timeout_s}s, likely a stuck Azure Blob "
                 f"connection (see this module's own header comment), aborting this "
                 f"operation rather than hanging indefinitely"
             )
-            raise TimeoutError(f"{func.__qualname__} exceeded {timeout}s (stuck Blob connection)")
+            raise TimeoutError(f"{func.__qualname__} exceeded {timeout_s}s (stuck Blob connection)")
         if status == 'error':
             raise value
         return value
     return wrapper
 
 
-# Six ADLSDataStore methods carry the same stuck-connection risk: read_file,
-# list_files, file_exists, remove, exists (used by the stale-file retry path in
+# Five ADLSDataStore methods carry the same stuck-connection risk: list_files,
+# file_exists, remove, exists (used by the stale-file retry path in
 # create_views_from_envelopes_in_country()), and is_dir (called by gigaspatial's
 # WorldPopConfig.get_data_unit_paths() under DATA_PIPELINE_DB=BLOB; safe to wrap
 # directly since it returns a plain bool after fully consuming its own generator).
@@ -89,10 +92,37 @@ def _with_hard_timeout(func, timeout=_BLOB_OP_TIMEOUT_SECONDS):
 # creation wouldn't guard the real I/O that happens later, item by item, during
 # iteration.
 #
-# write_file is wrapped separately below, around a faster replacement
-# implementation rather than the original gigaspatial method.
-for _method_name in ('read_file', 'list_files', 'file_exists', 'remove', 'exists', 'is_dir'):
+# read_file and write_file are wrapped separately below, around faster replacement
+# implementations of the gigaspatial methods.
+for _method_name in ('list_files', 'file_exists', 'remove', 'exists', 'is_dir'):
     setattr(ADLSDataStore, _method_name, _with_hard_timeout(getattr(ADLSDataStore, _method_name)))
+
+
+# gigaspatial's ADLSDataStore.read_file() downloads with no max_concurrency
+# (blob_client.download_blob().readall()), so every download is single-connection,
+# sequential chunk-by-chunk. Fine for small files, but MET_FORECASTS tp/ro Zarr files are
+# genuinely ~1.3GB/~266MB (see precip_utils.py's own docstring), and this sequential path
+# can exceed _BLOB_OP_TIMEOUT_SECONDS (120s) for the 1.3GB file, which the hard-timeout
+# wrapper then misclassifies as "stuck", while the same blob downloaded with
+# max_concurrency=4 completes in about 63s. This mirrors
+# _write_file_with_concurrency's own already-established fix for the identical class of
+# gigaspatial gap on the upload side.
+_READ_MAX_CONCURRENCY = 4
+
+
+def _read_file_with_concurrency(self, path, encoding=None):
+    try:
+        blob_key = self._to_blob_key(path)
+        blob_client = self.container_client.get_blob_client(blob_key)
+        blob_data = blob_client.download_blob(max_concurrency=_READ_MAX_CONCURRENCY).readall()
+        if encoding is None:
+            return blob_data
+        return blob_data.decode(encoding)
+    except Exception as e:
+        raise IOError(f"Error reading file {path}: {e}")
+
+
+ADLSDataStore.read_file = _with_hard_timeout(_read_file_with_concurrency)
 
 
 # gigaspatial's ADLSDataStore.write_file() uploads with no max_concurrency, so every
@@ -104,14 +134,15 @@ for _method_name in ('read_file', 'list_files', 'file_exists', 'remove', 'exists
 # _config once per call (a private-by-convention attribute, but the only reachable one;
 # idempotent, so concurrent write_file calls racing on it is harmless) before uploading
 # with max_concurrency. 4MB matches azure-storage-blob's own default block size
-# (guarantees chunking for any file above a few MB, not just today's ~25MB); concurrency
+# (guarantees chunking for any file above a few MB); concurrency
 # 4 matches TC-ECMWF-Forecast-Pipeline's own upload_to_blob() and gives real parallelism
-# for a ~25MB/4MB-block file without over-provisioning idle workers. _BLOB_OP_TIMEOUT_
-# SECONDS is left unchanged here - it exists to catch a genuinely stuck connection, not
-# to bound expected-case duration, and a real (not stuck) network can legitimately take
-# tens of seconds to push ~25MB even chunked.
+# for a ~25-70MB/4MB-block file without over-provisioning idle workers. _BLOB_OP_TIMEOUT_
+# SECONDS stays the floor for writes, but the write watchdog scales with payload size
+# (_write_timeout below): WorldPop age/sex .tif files are ~70MB and gigaspatial uploads
+# many of them in parallel over one uplink, so a fixed 120s would cut off slow-but-healthy
+# uploads and misclassify them as stuck connections.
 #
-# Known, reviewed side effect: a parallel upload drops conditional-access kwargs
+# Side effect: a parallel upload drops conditional-access kwargs
 # (etag/if-match), irrelevant today since this call always passes overwrite=True with no
 # conditional kwargs. A mid-upload chunk failure still leaves the target blob untouched
 # either way, since commit_block_list() only runs after every chunk succeeds. This is a
@@ -142,7 +173,14 @@ def _write_file_with_concurrency(self, path, data) -> None:
     blob_client.upload_blob(binary_data, overwrite=True, max_concurrency=_WRITE_MAX_CONCURRENCY)
 
 
-ADLSDataStore.write_file = _with_hard_timeout(_write_file_with_concurrency)
+_WRITE_TIMEOUT_SECONDS_PER_MB = 5  # ~0.2MB/s floor per upload, tolerates many concurrent uploads sharing one uplink
+
+
+def _write_timeout(self, path, data) -> float:
+    return max(_BLOB_OP_TIMEOUT_SECONDS, len(data) / (1024 * 1024) * _WRITE_TIMEOUT_SECONDS_PER_MB)
+
+
+ADLSDataStore.write_file = _with_hard_timeout(_write_file_with_concurrency, timeout=_write_timeout)
 
 
 def get_snowflake_auth_kwargs() -> dict:

@@ -4,11 +4,11 @@ This guide explains how to deploy the Hurricane Impact Analysis Pipeline to Snow
 
 ## Overview
 
-The Impact Analysis Pipeline processes hurricane forecast data from Snowflake tables and generates impact views and reports. When deployed to SPCS, it:
+The Impact Analysis Pipeline processes hurricane forecast data from Snowflake tables and generates impact views. When deployed to SPCS, it:
 
 - Reads hurricane track and envelope data from Snowflake tables (`TC_TRACKS`, `TC_ENVELOPES_COMBINED`)
 - Processes geospatial impact analysis (schools, health centers, shelters, WASH, population)
-- Generates impact views and reports
+- Generates impact views
 - Writes results to Snowflake internal stage
 
 ## Prerequisites
@@ -75,17 +75,19 @@ The Impact Analysis Pipeline processes hurricane forecast data from Snowflake ta
 
 `TC_PIPELINE_COMPLETE_LOG` is the handshake between DATAPIPELINE and the `*_MAT` table refresh.
 
-**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the `AOTS_ANALYSIS` stage, something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready: it can only poll on a fixed cron.
+**The problem it solves:** after DATAPIPELINE finishes writing new Parquet files to the data store (the `AOTS_ANALYSIS` stage, or the Azure Blob container in `DATA_PIPELINE_DB=BLOB` mode, which the production Databricks schedulers use), something needs to tell Snowflake "now is the time to reload `SCHOOL_IMPACT_MAT`, `MERCATOR_TILE_IMPACT_MAT`, etc." Without a signal, Snowflake has no way to know the files are ready: it can only poll on a fixed cron.
 
 **The chain:**
 ```
-DATAPIPELINE finishes writing Parquet to stage
+DATAPIPELINE finishes writing Parquet to the stage / Blob container
     → INSERT into TC_PIPELINE_COMPLETE_LOG   (signal_pipeline_complete())
     → TC_PIPELINE_COMPLETE_STREAM detects the new row
     → TRIGGER_REFRESH_TASK fires within 5 min
     → CALL REFRESH_MATERIALIZED_VIEWS()      (reloads all *_MAT tables from stage)
     → Dash app and AI agent see fresh data
 ```
+
+In `BLOB` mode, `signal_pipeline_complete()` refreshes the `AOTS_ANALYSIS_BLOB` stage instead of `AOTS_ANALYSIS`, limited to the directories of the families in `refresh_families` (the whole stage if none), and the schedulers call `trigger_mat_refresh_if_due()` directly after signalling.
 
 Without it, the only alternative is `TRIGGER_REFRESH_INTERIM`, a 2-hour cron that runs regardless of whether DATAPIPELINE actually produced anything. The log table makes the refresh event-driven instead of time-driven.
 
@@ -103,7 +105,7 @@ CREATE TABLE IF NOT EXISTS TC_PIPELINE_COMPLETE_LOG (
 );
 ```
 
-`RUNTIME_SECONDS` is populated by `signal_pipeline_complete()` in `main_pipeline.py`.
+`RUNTIME_SECONDS` is populated by `signal_pipeline_complete()` in `pipeline_runlog.py`.
 
 8. **Snowflake Stage** must exist (if using `DATA_PIPELINE_DB=SNOWFLAKE`):
    
@@ -132,7 +134,7 @@ docker build -f snowflake/Dockerfile -t impact-analysis-pipeline:latest . --plat
 This will:
 - Install all system dependencies (geospatial libraries, GDAL, PROJ, GEOS)
 - Install Python dependencies from `requirements.txt`
-- Copy all pipeline modules
+- Copy only the pipeline modules listed in `snowflake/Dockerfile`, which does not include every module `main_pipeline.py` imports (`pipeline_shared`, `facility_io`, `country_boundaries`, `precip_views`, `river_views`, `pipeline_runlog`, `sparse_build`, `sparse_output`, `river_tile_source`); extend the Dockerfile before building the image
 - Set up the container entrypoint
 
 ## Tagging the Image for Snowflake Registry
@@ -186,9 +188,9 @@ docker push orgname-account.registry.snowflakecomputing.com/mydatabase/myschema/
 
 ## Running the Pipeline
 
-### Option 1: Running Locally (for Testing)
+### Option 1: Running Locally
 
-Test the container locally with Snowflake stage before deploying to SPCS:
+Run the container locally against a Snowflake stage before deploying to SPCS:
 
 ```bash
 docker run --rm \
@@ -204,9 +206,9 @@ docker run --rm \
   --type initialize --countries TWN --zoom 14 --admin 1
 ```
 
-**Note:** This uses password authentication to connect to Snowflake. The container runs locally but writes to Snowflake stage, allowing testing of the full pipeline before deploying to SPCS.
+**Note:** This uses password authentication to connect to Snowflake. The container runs locally but writes to Snowflake stage, allowing the full pipeline to run before deploying to SPCS.
 
-### Option 2: Running in SPCS (Production)
+### Option 2: Running in SPCS
 
 Execute the pipeline as a SPCS job using `EXECUTE JOB SERVICE`:
 
@@ -361,7 +363,7 @@ The pipeline accepts command-line arguments:
 - `--storm`: Process only a specific storm (e.g., `FUNG-WONG`)
 - `--columns`: Columns to backfill (only with `--type patch`, e.g., `built_surface_m2 rwi`; use `admin2` to add a new admin level base parquet, or `vulnerability` to patch poverty probabilities)
 - `--hazard`: Hazard type to process (currently only `hurricane` is supported)
-- `--skip-analysis`: Skip the analysis step (for testing pipeline structure without processing data)
+- `--skip-analysis`: Skip the analysis step (no impact computation)
 - `--skip-gust`: Skip gust envelope processing even if gust data is available (wind processing is unaffected)
 - `--skip-precip`: Skip precipitation/runoff analysis even if `MET_FORECASTS` data is available (storm processing is unaffected)
 - `--skip-river-flood`: Skip GloFAS river-flood analysis even if `RIVER_FORECASTS` data is available
@@ -460,7 +462,7 @@ EXECUTE JOB SERVICE
 - The OAuth token is automatically provided by SPCS at `/snowflake/session/token`
 - Verify the token file exists: check that `/snowflake/session/token` is accessible
 - If using SPCS internal network, ensure `SNOWFLAKE_HOST` and `SNOWFLAKE_PORT` are set (if required by the SPCS setup)
-- For local testing, use `SNOWFLAKE_USER` and `SNOWFLAKE_PASSWORD`
+- For local runs, use `SNOWFLAKE_USER` and `SNOWFLAKE_PASSWORD`
 - If experiencing SSL/certificate errors, try setting `SNOWFLAKE_INSECURE_MODE=true` (use with caution)
 
 ### Missing Data

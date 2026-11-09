@@ -6,21 +6,24 @@ Reads ambient global GloFAS x JRC flood-extent forecasts, produced daily by
 TC-ECMWF-Forecast-Pipeline regardless of whether any named storm is active
 (RIVER_FORECASTS' own refresh cadence, same relationship this repo already
 has with MET_FORECASTS for tp/ro). Each RP tier is a sparse, true-only
-Parquet file (one row per flooded (pixel, member, step) combination) on
-Snowflake's internal stage, referenced via a RIVER_FORECASTS pointer row
-(same pointer-table pattern as MET_FORECASTS).
+Parquet file on Snowflake's internal stage, referenced via a RIVER_FORECASTS
+pointer row (same pointer-table pattern as MET_FORECASTS). The file is either
+the extent_rpN_bymember layout (one row per flooded (pixel, member, step)
+combination) or the compact extent_bymask_rpN layout (one row per flooded
+pixel with a uint64 member mask per step).
 
 Unlike precip's ~0.25 degree continuous raster, GloFAS/JRC pixels are
 ~150m, comparable to a zoom-14 mercator tile or a buffered facility
 footprint, not much coarser. A single RP tier's global file is 70M+ rows for
 one date, so this module downloads each tier's file ONCE per (tier, date)
-and lets callers query it per-country via DuckDB's bbox-filtered
-read_parquet(), rather than loading the whole file into pandas.
+and lets callers aggregate it per-country inside DuckDB with a bbox-filtered
+read_parquet() (see river_tile_source.py), rather than loading the whole file
+into pandas.
 
 The RIVER_FORECASTS pointer-table lookup (forecast_time/stage_path per RP
 tier) always queries Snowflake directly, regardless of config.HAZARD_DATA_SOURCE:
-get_latest_river_forecast()/get_river_forecast_for_date() below are
-unconditional Snowflake SELECTs. precip_utils.get_latest_met_forecast()/
+get_river_tier_pointers()/get_latest_river_forecasts_bulk()/
+get_river_forecast_for_date() below are unconditional Snowflake SELECTs. precip_utils.get_latest_met_forecast()/
 get_met_forecast_for_date() follow this same always-Snowflake pattern; only
 wind/tracks' own discovery (snowflake_utils.get_storms_local(), a deliberate
 exception, see that function's own docstring for why) bypasses its
@@ -42,19 +45,17 @@ equivalent config exists yet); only SNOWFLAKE and BLOB are supported for the fil
 read.
 
 Usage:
-    from glofas_utils import get_latest_river_forecast, \
-        download_river_forecast_parquet, query_country_flooded_pixels, \
-        get_river_forecasts_data_store
-    row = get_latest_river_forecast('extent_rp10_bymember')
+    from glofas_utils import get_river_tier_pointers, \
+        download_river_forecast_parquet, get_river_forecasts_data_store
+    tier_rows, bymask_candidates = get_river_tier_pointers(['rp10'])
+    row = tier_rows['rp10']
     local_path = download_river_forecast_parquet(row['stage_path'], get_river_forecasts_data_store(), tmp_dir)
-    df_pixels = query_country_flooded_pixels(local_path, gdf_tiles.total_bounds)
 """
 
 import os
 import logging
 from typing import Optional
 
-import duckdb
 import pandas as pd
 
 from snowflake_utils import _execute_query
@@ -80,14 +81,14 @@ def get_river_forecasts_data_store():
     """
     A data store for reading the actual RP-tier Parquet file a RIVER_FORECASTS
     row's STAGE_PATH points at, governed by config.HAZARD_DATA_SOURCE: SNOWFLAKE
-    (default) reads from Snowflake's internal stage; BLOB reads from the shared
+    reads from Snowflake's internal stage; BLOB (default) reads from the shared
     Blob container instead, via get_hazard_data_store() (the same function
     precip/wind's own LOCAL/BLOB file reads already use). LOCAL is not
     implemented (no HAZARD_LOCAL_RIVER_DIR-equivalent config exists yet).
 
     This is independent of the RIVER_FORECASTS pointer-table SELECT itself
-    (get_latest_river_forecast()/get_river_forecast_for_date() below), which
-    always queries Snowflake regardless of this setting; see this module's
+    (get_river_tier_pointers()/get_latest_river_forecasts_bulk()/
+    get_river_forecast_for_date() below), which always queries Snowflake regardless of this setting; see this module's
     own docstring for why that part is a deliberate, documented exception,
     unlike wind/tracks' own LOCAL/BLOB path, which bypasses the pointer
     table entirely. Precip's own pointer lookup (get_latest_met_forecast()
@@ -116,43 +117,13 @@ def get_river_forecasts_data_store():
     )
 
 
-def get_latest_river_forecast(param: str) -> Optional[dict]:
-    """
-    Latest RIVER_FORECASTS row for one extent PARAM (e.g. 'extent_rp10_bymember').
-
-    Args:
-        param: one of 'extent_rp2_bymember', 'extent_rp5_bymember',
-            'extent_rp10_bymember', 'extent_rp20_bymember',
-            'extent_rp50_bymember', 'extent_rp100_bymember'.
-
-    Returns:
-        {'forecast_time', 'stage_path', 'is_standin'} or None if no rows
-        exist for this param yet (an expected, normal outcome, not an error,
-        mirroring get_latest_met_forecast_snowflake()'s own precedent).
-    """
-    query = (
-        "SELECT FORECAST_TIME, STAGE_PATH, IS_STANDIN FROM RIVER_FORECASTS "
-        "WHERE PARAM = %s ORDER BY FORECAST_TIME DESC LIMIT 1"
-    )
-    df = _execute_query(query, params=[param])
-    if df.empty:
-        logger.info(f"No RIVER_FORECASTS rows found for param='{param}'")
-        return None
-    row = df.iloc[0]
-    return {
-        'forecast_time': row['FORECAST_TIME'],
-        'stage_path': row['STAGE_PATH'],
-        'is_standin': bool(row['IS_STANDIN']) if pd.notna(row['IS_STANDIN']) else None,
-    }
-
-
 def get_latest_river_forecasts_bulk(params) -> dict:
     """
     Latest RIVER_FORECASTS row for EVERY param in `params` at once, via a
     single Snowflake round-trip (one window-function query), instead of
-    one get_latest_river_forecast() call per param. 6 sequential per-param
-    calls cost ~2s each in Snowflake round-trip latency, ~12s total;
-    collapsed into one round-trip via a single window-function query. Only
+    one query per param. 6 sequential per-param queries cost ~2s each in
+    Snowflake round-trip latency, ~12s total; collapsed into one round-trip
+    via a single window-function query. Only
     "latest" mode (no target_date) has this bulk equivalent: a historical
     backfill (get_river_forecast_for_date(), target_date given) is a cold,
     infrequent path where 6 separate calls are not a meaningful cost driver.
@@ -162,9 +133,8 @@ def get_latest_river_forecasts_bulk(params) -> dict:
 
     Returns:
         {param: {'forecast_time', 'stage_path', 'is_standin'} or None}, one
-        entry per param in `params`, same per-entry shape
-        get_latest_river_forecast() returns for that param. A param with no
-        rows yet maps to None, same expected-normal-outcome semantics.
+        entry per param in `params`. A param with no rows yet maps to None,
+        an expected, normal outcome rather than an error.
     """
     params = list(params)
     result = {p: None for p in params}
@@ -200,7 +170,7 @@ def get_river_forecast_for_date(param: str, target_date) -> Optional[dict]:
     multiple cycles exist for that date.
 
     Args:
-        param: see get_latest_river_forecast().
+        param: a RIVER_FORECASTS PARAM value (e.g. 'extent_rp10_bymember').
         target_date: date-like value (datetime.date, or a 'YYYY-MM-DD' string).
 
     Returns:
@@ -225,15 +195,78 @@ def get_river_forecast_for_date(param: str, target_date) -> Optional[dict]:
     }
 
 
+def get_river_tier_pointers(tiers, target_date=None):
+    """
+    Pointer rows of every tier in `tiers` (e.g. ['rp2', ...]) from ONE
+    Snowflake round-trip covering both PARAM families of a tier: the
+    per-member file (extent_<rp>_bymember) and the compact mask file
+    (extent_bymask_<rp>). The latest row per PARAM is read, or, when
+    `target_date` is given, the latest row of that calendar date.
+
+    Returns:
+        (tier_rows, bymask_rows). tier_rows[rp] is the pointer row the tier is
+        processed from, {'forecast_time', 'stage_path', 'is_standin', 'kind'},
+        or None when neither family has a row. kind is 'bymember' when the
+        per-member row exists and is at least as recent as the mask row, and
+        'bymask' when only the mask row exists or it is the more recent cycle
+        (such a tier has no per-member file to read). bymask_rows[rp] is the
+        mask row of the tier (kind 'bymask') or None.
+    """
+    tiers = list(tiers)
+    members = {rp: f"extent_{rp}_bymember" for rp in tiers}
+    masks = {rp: f"extent_bymask_{rp}" for rp in tiers}
+    params = list(members.values()) + list(masks.values())
+    placeholders = ", ".join(["%s"] * len(params))
+    date_filter = ""
+    query_params = list(params)
+    if target_date is not None:
+        date_filter = "AND TO_DATE(FORECAST_TIME) = %s"
+        query_params.append(str(target_date))
+    query = f"""
+        SELECT PARAM, FORECAST_TIME, STAGE_PATH, IS_STANDIN FROM (
+            SELECT PARAM, FORECAST_TIME, STAGE_PATH, IS_STANDIN,
+                   ROW_NUMBER() OVER (PARTITION BY PARAM ORDER BY FORECAST_TIME DESC) AS rn
+            FROM RIVER_FORECASTS
+            WHERE PARAM IN ({placeholders}) {date_filter}
+        ) WHERE rn = 1
+    """
+    df = _execute_query(query, params=query_params)
+    by_param = {}
+    for _, row in df.iterrows():
+        by_param[row['PARAM']] = {
+            'forecast_time': row['FORECAST_TIME'],
+            'stage_path': row['STAGE_PATH'],
+            'is_standin': bool(row['IS_STANDIN']) if pd.notna(row['IS_STANDIN']) else None,
+        }
+    tier_rows = {}
+    bymask_rows = {}
+    for rp in tiers:
+        member = by_param.get(members[rp])
+        mask = by_param.get(masks[rp])
+        if member is not None:
+            member['kind'] = 'bymember'
+        if mask is not None:
+            mask['kind'] = 'bymask'
+        bymask_rows[rp] = mask
+        if mask is not None and (member is None or pd.Timestamp(mask['forecast_time']) > pd.Timestamp(member['forecast_time'])):
+            tier_rows[rp] = mask
+        else:
+            tier_rows[rp] = member
+    missing = [rp for rp, v in tier_rows.items() if v is None]
+    if missing:
+        logger.info(f"No RIVER_FORECASTS rows found for tier(s)={missing}")
+    return tier_rows, bymask_rows
+
+
 # =============================================================================
-# DOWNLOAD + PER-COUNTRY BBOX FILTER
+# DOWNLOAD
 # =============================================================================
 
 def download_river_forecast_parquet(stage_path: str, data_store, local_dir: str) -> str:
     """
     Download ONE RP tier's global Parquet file to a local directory, ONCE per
-    (RP tier, forecast date), never per country. Mirrors
-    read_precip_window()'s data_store.read_file(stage_path) download, but
+    (RP tier, forecast date), never per country. Downloads via
+    data_store.read_file(stage_path) like the precip Zarr read, but
     persists bytes to a real file (not an in-memory array) because DuckDB's
     read_parquet() needs a real path to query repeatedly (once per country)
     without re-downloading.
@@ -259,47 +292,3 @@ def download_river_forecast_parquet(stage_path: str, data_store, local_dir: str)
     with open(local_path, 'wb') as f:
         f.write(raw_bytes)
     return local_path
-
-
-def query_country_flooded_pixels(local_parquet_path: str, bounds) -> pd.DataFrame:
-    """
-    One DuckDB bbox-filtered query against an already-downloaded RP-tier
-    Parquet file, run ONCE per (country, tier), NOT once per
-    (country, tier, step_h): step_h filtering happens afterwards, cheaply,
-    in memory, against this already country-scoped result.
-
-    Args:
-        local_parquet_path: from download_river_forecast_parquet(). Always a
-            path this process itself created (a tempfile basename derived
-            from a Snowflake-controlled stage path), never raw user input,
-            safe to interpolate directly into the SQL string below.
-        bounds: (xmin, ymin, xmax, ymax), e.g. from gdf_tiles.total_bounds.
-
-    Returns:
-        DataFrame with columns: pixel_lat, pixel_lon, member, step_h,
-        below_min_basin. Empty DataFrame if no flooded pixels fall in this
-        country's bounding box at this tier (a common, normal outcome).
-    """
-    xmin, ymin, xmax, ymax = bounds
-    con = duckdb.connect()
-    try:
-        # DuckDB manages its own C++ memory pool entirely outside Python's;
-        # gc.collect()/malloc_trim() (see main_pipeline.py's _release_memory())
-        # have no visibility into it, and DuckDB's own default (up to 80% of
-        # system RAM) assumes it owns the whole machine, not a fraction of a
-        # fixed node shared with a real, memory-heavy Python process doing its
-        # own geopandas/pandas work. Explicitly bounding this connection's own
-        # memory forces it to spill to disk rather than compete for RAM this
-        # process needs elsewhere. A fresh connection is opened and closed
-        # per call already (once per country per tier), so this limit applies
-        # per-query, not cumulatively across the whole run.
-        con.execute("PRAGMA memory_limit='2GB'")
-        query = f"""
-            SELECT pixel_lat, pixel_lon, member, step_h, below_min_basin
-            FROM read_parquet('{local_parquet_path}')
-            WHERE pixel_lon BETWEEN {xmin} AND {xmax}
-              AND pixel_lat BETWEEN {ymin} AND {ymax}
-        """
-        return con.execute(query).df()
-    finally:
-        con.close()

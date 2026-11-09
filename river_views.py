@@ -3,20 +3,27 @@
 River Flood Views Module
 
 All river-flood-specific (GloFAS x JRC) view creation and persistence:
-tile/admin/facility impact views, per-tile-per-member coverage bitmasks, the
+tile/admin/facility impact views, the per-tile-per-member coverage bitmask
+writer (save_river_tile_bitmask_view, fed by river_tile_source output), the
 per-(country, rp_tier) idempotency check, and every save_river_* function.
+
+The primary tile probability path is river_tile_source.load_river_tile_bits()
+(DuckDB aggregation into a per-tile member bitmask, probability =
+popcount(bits) / 51), assembled by create_river_tile_view_from_counts() or
+sparse_build.RiverStep. create_river_tile_view() is the dense fallback,
+including the fallback for the zero-probability marker frames.
 
 GloFAS/JRC pixels are ~150m resolution, comparable to a zoom-14 mercator tile
 or a buffered facility footprint, not coarse the way precip's ~0.25 degree
 grid is. So unlike precip_views.create_precip_tile_view() (which must
 centroid-sample a continuous raster), river-flood views reuse the wind/gust
 "count(members)/FULL_ENSEMBLE_SIZE" convention: a member "hits" a zone if at
-least one flooded pixel falls within it, same idiom
-impact_analysis.create_mercator_view_from_envelopes() uses (manual gpd.sjoin +
-groupby), just points-in-polygon ('within') instead of polygon-in-polygon
-('intersects'), and .nunique('member') instead of .size() since a single
-member can contribute several flooded pixels to the same zone at this
-resolution.
+least one flooded pixel falls within it. The dense fallback path uses the same
+idiom as impact_analysis.create_mercator_view_from_envelopes() (manual
+gpd.sjoin + groupby), just points-in-polygon ('within') instead of
+polygon-in-polygon ('intersects'), and .nunique('member') instead of .size()
+since a single member can contribute several flooded pixels to the same zone
+at this resolution.
 
 below_min_basin is a per-pixel QC flag (this cell's upstream drainage area is
 below GloFAS's 500km^2 minimum-catchment cutoff for JRC-extent-map
@@ -27,7 +34,7 @@ secondary attribute, not a pre-filter"), it is never used to exclude a
 pixel/zone here, only surfaced as a per-zone .any() boolean.
 
 Module structure:
-    create_river_tile_view, calculate_river_tile_member_bitmask,
+    create_river_tile_view, create_river_tile_view_from_counts,
         create_river_admin_view
     create_river_facility_view
     save_river_tile_view, river_country_tier_already_processed,
@@ -59,8 +66,46 @@ from pipeline_shared import (
     _optional_sum,
     FULL_ENSEMBLE_SIZE,
 )
+from sparse_output import (
+    describe_reduction,
+    sparsify_facility_frame,
+    sparsify_tile_frame,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _tile_view_for_write(df, family, file_name):
+    """
+    Frame handed to a tile view writer: a thin copy (nonzero rows plus one
+    marker row). Any failure falls back to the dense frame so the file is
+    still written.
+    """
+    try:
+        # Contiguous index, so the CSV index column matches the thin frame.
+        frame = sparsify_tile_frame(df).reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"    Sparse {family} tile view {file_name} not applied, writing the dense file: {e}")
+        return df
+    logger.info(f"    Sparse {family} tile view {file_name}: {describe_reduction(df, frame)}")
+    return frame
+
+
+def _facility_view_for_write(gdf, family, file_name):
+    """
+    Frame handed to a facility view writer: zero-probability rows are dropped
+    from a copy. The result may be empty; the file is still written so
+    existence checks see it.
+    """
+    try:
+        # Contiguous index, so the parquet file carries no extra index column.
+        frame = sparsify_facility_frame(gdf).reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"    Sparse {family} facility view {file_name} not applied, writing the dense file: {e}")
+        return gdf
+    logger.debug(f"    Sparse {family} facility view {file_name}: {describe_reduction(gdf, frame)}")
+    return frame
+
 
 # =============================================================================
 # RIVER FLOOD (GloFAS x JRC) VIEWS
@@ -71,8 +116,10 @@ logger = logging.getLogger(__name__)
 # continuous raster since a tile's tiny polygon usually misses the enclosing
 # coarse cell's pixel-center), river-flood views reuse the wind/gust
 # "count(members)/FULL_ENSEMBLE_SIZE" convention: a member "hits" a zone if at
-# least one flooded pixel falls within it, same idiom
-# create_mercator_view_from_envelopes() uses (manual gpd.sjoin + groupby), just
+# least one flooded pixel falls within it. The primary path is
+# river_tile_source.load_river_tile_bits(); create_river_tile_view() is the
+# dense fallback, which uses the same idiom as
+# create_mercator_view_from_envelopes() (manual gpd.sjoin + groupby), just
 # points-in-polygon ('within') instead of polygon-in-polygon ('intersects'),
 # and .nunique('member') instead of .size() since a single member can
 # contribute several flooded pixels to the same zone at this resolution.
@@ -84,14 +131,25 @@ logger = logging.getLogger(__name__)
 # design principle ("gate on RP tier for relevance, attach channel scale as a
 # secondary attribute, not a pre-filter"), it is never used to exclude a
 # pixel/zone here, only surfaced as a per-zone .any() boolean.
+def _require_population_cols(gdf_tiles):
+    """Hard-fail guard shared by every river tile view builder (see create_river_tile_view's Raises)."""
+    _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
+    if _missing_pop_cols:
+        raise ValueError(
+            f"gdf_tiles is missing {_missing_pop_cols}, run "
+            f"'--type patch --columns {' '.join(_missing_pop_cols)}' for this country "
+            f"before river-flood tile impact views can be computed."
+        )
+
+
 def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
                             num_ensembles=FULL_ENSEMBLE_SIZE, tiles_viewer=None):
     """
     Per-tile flood-extent probability for one RP tier + lead-time WINDOW:
     fraction of ensemble members with >=1 flooded JRC pixel inside the tile
     at ANY real day within that window (real union across days, not a
-    single-day snapshot: see RIVER_LEADTIME_STEPS_H's own "ACCUMULATION"
-    comment in main_pipeline.py for the full rationale).
+    single-day snapshot: see the comment above RIVER_LEADTIME_STEPS_H in
+    main_pipeline.py for the full rationale).
 
     Args:
         gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()).
@@ -105,7 +163,7 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
             below_min_basin, geometry (Point, EPSG:4326). May be empty (a
             normal, common outcome: no flooding within this window).
         rp_tier: label for logging only (e.g. 'rp10').
-        is_standin: bool, from the real RIVER_FORECASTS.IS_STANDIN column --
+        is_standin: bool, from the real RIVER_FORECASTS.IS_STANDIN column:
             True for rp2/rp5 (JRC has no native map, they reuse rp10's own
             extent as a labelled upper-bound approximation), False for
             rp10/rp20/rp50/rp100 (native JRC tier match). Passed through
@@ -117,11 +175,14 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
             zone_id_column='tile_id') for this same gdf_tiles, reused with
             `_view` reset to None first (only the expensive rename+copy+
             zone_dict setup is skipped, result unaffected) instead of
-            building a fresh one: main_pipeline.py's own per-country river
-            loop calls this function once per (rp_tier, step_h) combination
-            (up to 6 tiers x 4 windows = 24 calls for a country) against the
-            exact same gdf_tiles every time, the same redundancy
-            create_precip_tile_view()'s own `tiles_viewer` param eliminates.
+            building a fresh one: on the dense path of main_pipeline.py's
+            per-country river loop the marker-only tile frames are built with
+            this function and the other steps with
+            create_river_tile_view_from_counts(), once
+            per (rp_tier, step_h) combination (up to 6 tiers x 4 windows = 24
+            calls for a country) against the exact same gdf_tiles every time,
+            the same redundancy create_precip_tile_view()'s own
+            `tiles_viewer` param eliminates.
             When None (default), built fresh.
 
     Returns:
@@ -148,13 +209,7 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
             all-NaN) would then turn that into a fabricated 0.0 at admin
             level, indistinguishable from a genuine zero-exposure result.
     """
-    _missing_pop_cols = [c for c in POPULATION_COLS if c not in gdf_tiles.columns]
-    if _missing_pop_cols:
-        raise ValueError(
-            f"gdf_tiles is missing {_missing_pop_cols}, run "
-            f"'--type patch --columns {' '.join(_missing_pop_cols)}' for this country "
-            f"before river-flood tile impact views can be computed."
-        )
+    _require_population_cols(gdf_tiles)
 
     if tiles_viewer is not None:
         tiles_viewer._view = None
@@ -181,7 +236,7 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
         # dict comprehension: the real cost was never the sjoin/groupby above
         # (cheap, scales with pixel count), it was that step doing hundreds of
         # thousands of individual Series.get() calls regardless of how few
-        # tiles matched (measured flat ~2.3-3.2s per call whether 9 or 1.77M
+        # tiles matched (flat ~2.3-3.2s per call whether 9 or 1.77M
         # pixels fed it). add_variable_to_view() accepts a plain Series exactly
         # like a dict (wraps it in pd.Series(data_dict, name=...) either way).
         probs = (member_counts.reindex(all_tile_ids, fill_value=0).astype(float)
@@ -201,6 +256,43 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
         probs = pd.Series(0.0, index=all_tile_ids)
         basin = pd.Series(False, index=all_tile_ids)
 
+    return _assemble_river_tile_view(tiles_viewer, probs, basin, is_standin)
+
+
+def create_river_tile_view_from_counts(gdf_tiles, member_counts, basin_flags, is_standin,
+                                       num_ensembles=FULL_ENSEMBLE_SIZE, tiles_viewer=None):
+    """
+    The same per-tile flood-extent probability frame create_river_tile_view()
+    returns, built from already aggregated per-tile results instead of a
+    pixel GeoDataFrame: `member_counts` (distinct flooded members per tile,
+    Series indexed by tile_id, only tiles with at least one) and
+    `basin_flags` (any contributing pixel flagged below_min_basin, same
+    index). Both may be empty (no flooded tile in this window). Tiles absent
+    from the counts get probability 0 and basin False. Unlike
+    create_river_tile_view(), a failure is raised, not defaulted to zero
+    probabilities.
+    """
+    _require_population_cols(gdf_tiles)
+
+    if tiles_viewer is not None:
+        tiles_viewer._view = None
+    else:
+        tiles_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_tiles, zone_id_column='tile_id')
+    all_tile_ids = gdf_tiles['tile_id']
+    probs = (member_counts.reindex(all_tile_ids, fill_value=0).astype(float)
+             / float(num_ensembles))
+    basin = basin_flags.reindex(all_tile_ids, fill_value=False).astype(bool)
+    return _assemble_river_tile_view(tiles_viewer, probs, basin, is_standin)
+
+
+def _assemble_river_tile_view(tiles_viewer, probs, basin, is_standin):
+    """
+    Final shape of a river tile view from per-tile probabilities and basin
+    flags (both indexed by tile_id over the full tile grid): attaches them to
+    the tile viewer, derives the E_* breakdown and the is_standin constant,
+    and normalises the zone_id column. Shared by every builder of a river tile
+    view so they all return the identical frame.
+    """
     tiles_viewer.add_variable_to_view(probs, 'probability')
     tiles_viewer.add_variable_to_view(basin, 'below_min_basin')
     df_view = tiles_viewer.to_dataframe()
@@ -232,79 +324,6 @@ def create_river_tile_view(gdf_tiles, gdf_pixels_step, rp_tier, is_standin,
         df_view = df_view[[c for c in df_view.columns if c not in _pov_cols] + _pov_cols]
 
     return df_view
-
-
-def calculate_river_tile_member_bitmask(gdf_tiles, gdf_pixels_step):
-    """
-    Per-z14-tile, per-ensemble-member 64-bit coverage bitmask for one
-    (rp_tier, step_h window) of river flood extent (bit `m-1` set <=> member
-    `m` has >=1 flooded JRC pixel inside that tile), same convention/shape
-    as Wind/Gust's own calculate_tile_member_bitmask() (mirrors it directly,
-    see that function's own docstring for the full rationale), applied to
-    River instead, persisted as a real pipeline output (mirrors this repo's
-    dashboard sibling's own live decode of the same raw per-member GloFAS
-    parquet, `_RiverExtentCache` in services/tile_server.py, `bits =
-    uint64(1) << (member - 1)`).
-
-    Genuinely near-zero new I/O: reuses the same per-member pixel data
-    create_river_tile_view() already reads (gdf_pixels_step, already
-    country-scoped and step_h-filtered by the caller), running an
-    independent gpd.sjoin() with the identical inputs/predicate/direction
-    that function's own `joined` already uses (pixels left, tiles right,
-    predicate='within', required by 'within' semantics, not a style
-    choice, see create_river_tile_view's own comment). The sjoin itself is
-    cheap; the cost of downloading/DuckDB-filtering the raw global
-    parquet already happened upstream, once, before either function runs.
-
-    Args:
-        gdf_tiles: GeoDataFrame of mercator tiles (from load_mercator_view()),
-            needs only 'tile_id' and 'geometry'.
-        gdf_pixels_step: same shape create_river_tile_view() takes: this
-            country's flooded pixels for every real day up through the
-            caller's selected window already (member, below_min_basin,
-            geometry columns), may be empty (a normal, common outcome).
-
-    Returns:
-        DataFrame with columns ['tile_id' (string), 'bits' (uint64)], one
-        row per distinct tile with >=1 member's flooded pixel falling
-        inside it, sparse, same convention Wind's own bitmask uses. An empty
-        gdf_pixels_step, a zero-intersection result, or a sjoin failure
-        (e.g. a CRS mismatch, logged as a warning) all return an empty
-        DataFrame; there is only ever ONE call per (rp_tier, step_h) here,
-        so the caller's own `files_written` bookkeeping simply skips writing
-        a file when this returns empty, no separate None sentinel needed.
-    """
-    if gdf_pixels_step.empty:
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    tiles_geom = gdf_tiles[['tile_id', 'geometry']].copy()
-    pix_geom = gdf_pixels_step[['member', 'geometry']].copy()
-    try:
-        if pix_geom.crs != tiles_geom.crs:
-            pix_geom = pix_geom.to_crs(tiles_geom.crs)
-        joined = gpd.sjoin(pix_geom, tiles_geom, how='inner', predicate='within')
-    except Exception as e:
-        logger.warning(f"River tile_member_bitmask sjoin FAILED, no bitmask file will be written: {e}")
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    if joined.empty:
-        return pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
-
-    # Same vectorized OR-reduction as Wind's own calculate_tile_member_bitmask
-    # (np.unique(..., return_inverse=True) + np.bitwise_or.at), and the same
-    # 1-indexed member convention the dashboard's own _RiverExtentCache
-    # already assumes for this exact raw data (`bits = 1 << (member - 1)`).
-    member_arr = joined['member'].to_numpy().astype(np.uint64)
-    bits = np.uint64(1) << (member_arr - np.uint64(1))
-    tile_ids = joined['tile_id'].to_numpy()
-    uniq_tiles, inverse = np.unique(tile_ids, return_inverse=True)
-    tile_bits = np.zeros(len(uniq_tiles), dtype=np.uint64)
-    np.bitwise_or.at(tile_bits, inverse, bits)
-
-    return pd.DataFrame({
-        'tile_id': pd.array(uniq_tiles.astype(str), dtype='string'),
-        'bits': tile_bits,
-    })
 
 
 def create_river_admin_view(gdf_admin, gdf_tiles, gdf_pixels_step, rp_tier, is_standin, tile_view=None):
@@ -441,14 +460,15 @@ def create_river_facility_view(gdf_facilities, facility_tile_map, tile_view_df, 
 def save_river_tile_view(df, country, forecast_time, rp_tier, step_h):
     """mercator_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.csv"""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.csv"
-    write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_river', file_name))
+    write_dataset(_tile_view_for_write(df, 'river', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_river', file_name))
 
 
-def river_country_tier_already_processed(country, forecast_time, rp_tier, max_step_h):
+def river_country_tier_already_processed(country, forecast_time, rp_tier, step_hs):
     """
     Checks whether a (country, rp_tier, forecast_time) combination already has
-    real river-flood output on disk for the largest lead-time step, used by
-    run_river_flood_analysis() as a per-(country, tier) idempotency check.
+    real river-flood output on disk for the lead-time steps in `step_hs`,
+    used by run_river_flood_analysis()
+    as a per-(country, tier) idempotency check.
 
     AMBIENT_HAZARD_RUN_LOG only marks a whole (source, param, forecast_time)
     processed once every country in a run has been attempted, so a crash
@@ -456,19 +476,26 @@ def river_country_tier_already_processed(country, forecast_time, rp_tier, max_st
     though most countries genuinely already have real, saved output for this
     exact cycle. Without this check, a retry re-downloads every tier's file
     and reprocesses every country from scratch, discarding real completed
-    work. RIVER_LEADTIME_STEPS_H's own values are cumulative window
-    boundaries (see that constant's own comment), so the largest step_h's
-    tile view existing on disk is a reliable proxy for "this (country, tier,
-    forecast_time) already ran to completion"; a country that only got partway
-    through the step_h loop before a crash correctly reports False here and
-    is safely, idempotently reprocessed (every save_river_*() call overwrites
-    in place).
+    work.
+
+    Every step in `step_hs` must have its file, not only the largest: a tier
+    missing any window, even when the largest is present, is not complete and
+    is reprocessed. Every step's tile view is written (a thin file with a
+    marker row when nothing is flooded), so a complete tier has all of them.
+    A tier that stopped
+    partway through the step loop reports False and is reprocessed
+    idempotently (every save_river_*() call overwrites in place).
     """
     forecast_time_str = forecast_time.strftime('%Y%m%d%H%M%S') if hasattr(forecast_time, 'strftime') else str(forecast_time)
-    file_name = f"{country}_{forecast_time_str}_{rp_tier}_{max_step_h}h.csv"
-    path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_river', file_name)
+    required = list(step_hs)
     try:
-        return data_store.file_exists(path)
+        return all(
+            data_store.file_exists(
+                os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'mercator_views_river',
+                              f"{country}_{forecast_time_str}_{rp_tier}_{step_h}h.csv")
+            )
+            for step_h in required
+        )
     except Exception:
         return False
 
@@ -478,8 +505,7 @@ def save_river_tile_bitmask_view(df, country, forecast_time, rp_tier, step_h):
 
     Same filename token order as save_river_tile_view's own mercator_views_river/
     convention (real key: country, forecast_time, rp_tier, step_h; river is
-    date/cycle-keyed, not storm-keyed, see calculate_river_tile_member_bitmask's
-    own docstring), separate top-level directory mirroring Wind's own
+    date/cycle-keyed, not storm-keyed), separate top-level directory mirroring Wind's own
     save_tracks_tile_bitmask_view (track_tile_bitmask_views/) convention."""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
     write_dataset(df, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'track_tile_bitmask_views_river', file_name))
@@ -494,23 +520,23 @@ def save_river_admin_view(df, country, forecast_time, rp_tier, step_h, admin_lev
 def save_river_school_view(gdf, country, forecast_time, rp_tier, step_h):
     """school_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_river', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'river', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'school_views_river', file_name))
 
 
 def save_river_hc_view(gdf, country, forecast_time, rp_tier, step_h):
     """hc_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_river', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'river', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'hc_views_river', file_name))
 
 
 def save_river_shelter_view(gdf, country, forecast_time, rp_tier, step_h):
     """shelter_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_river', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'river', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'shelter_views_river', file_name))
 
 
 def save_river_wash_view(gdf, country, forecast_time, rp_tier, step_h):
     """wash_views_river/{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"""
     file_name = f"{country}_{forecast_time}_{rp_tier}_{step_h}h.parquet"
-    write_dataset(gdf, data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_river', file_name))
+    write_dataset(_facility_view_for_write(gdf, 'river', file_name), data_store, os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'wash_views_river', file_name))
 

@@ -46,7 +46,7 @@ where available so queries work consistently across countries.
 | `electricity` | string | Electricity availability |
 | `is_in_health_area` | string | Administrative health area |
 | `is_in_health_zone` | string | Administrative health zone |
-| `completeness` | float | HealthSites.io data completeness score (0–100) |
+| `completeness` | float | HealthSites.io data completeness score (0-100) |
 | `url` | string | Website |
 | `addr_housenumber` | string | Address |
 | `addr_street` | string | Street name |

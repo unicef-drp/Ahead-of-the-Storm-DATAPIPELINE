@@ -11,7 +11,7 @@ Key Features:
   index (HDX RWI), schools (GIGA API), health centers (HealthSites.io), shelters and
   WASH infrastructure (OSM Overpass)
 - Intersects hurricane wind envelopes with country infrastructure at each wind speed
-  threshold (34–137 kt) to produce per-facility and per-tile impact views
+  threshold (34-137 kt) to produce per-facility and per-tile impact views
 - Supports custom data overrides: place a CSV in geodb/custom/ to replace any API or
   raster source for a specific country (never overwritten by the pipeline)
 - Patches specific columns in existing mercator parquets without full re-initialisation
@@ -25,9 +25,9 @@ Entry points called from main_pipeline.py:
     create_views_from_envelopes_in_country(): --type update
     patch_country_layer():                    --type patch
 
-This was originally one ~6600-line file; it has since been split into five
-sibling modules, each covering one concern, with this module (the "core")
-retaining wind/gust view creation and the main per-country orchestrator:
+This module is the "core" of the impact analysis code, which is split across
+five sibling modules, each covering one concern; the core holds wind/gust view
+creation and the main per-country orchestrator:
     pipeline_shared.py      - state/helpers every module below needs, with no
                               dependency of its own on any of them (data_store,
                               path/column constants, admins_overlay(), the
@@ -45,13 +45,14 @@ retaining wind/gust view creation and the main per-country orchestrator:
                               and persistence
     river_views.py          - all river-flood (GloFAS x JRC) tile/admin/
                               facility view creation and persistence
-This module imports several names back from facility_io.py/country_boundaries.py/
-precip_views.py/river_views.py (real internal dependencies - e.g.
-create_views_from_envelopes_in_country() fetches/saves facilities and writes
-country boundaries as part of its own per-country orchestration), all as
-plain top-of-file imports; since every one of those four modules gets its own
-shared state from pipeline_shared.py rather than from this module, there is no
-circular import to work around.
+This module imports several names back from facility_io.py/country_boundaries.py
+(real internal dependencies - e.g. create_views_from_envelopes_in_country()
+fetches/saves facilities and writes country boundaries as part of its own
+per-country orchestration), plus sparse_output.py/sparse_build.py for the
+sparse writers and frame builders, all as plain top-of-file imports; since
+facility_io.py and country_boundaries.py get their own shared state from
+pipeline_shared.py rather than from this module, there is no circular import
+to work around.
 
 Module structure (sections in order, this file only):
     CUSTOM DATA HELPERS: _load_custom_tiles_csv, _vulnerability_file_path,
@@ -91,13 +92,7 @@ Module structure (sections in order, this file only):
 import io
 import json
 import os
-import re
-import tempfile
-import contextlib
 import sys
-import time
-import threading
-import queue
 import logging
 import warnings
 import geopandas as gpd
@@ -114,32 +109,22 @@ if project_root not in sys.path:
 from config import config
 
 # Import GigaSpatial components
-from gigaspatial.handlers import AdminBoundaries, RWIHandler
+from gigaspatial.handlers import RWIHandler
 from gigaspatial.processing import convert_to_geodataframe, buffer_geodataframe
-from gigaspatial.handlers import GigaSchoolLocationFetcher
+from gigaspatial.processing.geo import aggregate_points_to_zones
 from gigaspatial.generators import GeometryBasedZonalViewGenerator, MercatorViewGenerator, AdminBoundariesViewGenerator
-from gigaspatial.handlers.healthsites import HealthSitesFetcher
-from gigaspatial.handlers.unicef.georepo import GeoRepoClient
 from gigaspatial.core.io.readers import read_dataset
 from gigaspatial.core.io.writers import write_dataset
-from gigaspatial.processing.tif_processor import TifProcessor
-from gigaspatial.core.io.local_data_store import LocalDataStore
-import pyproj
-from shapely.geometry import shape, MultiPolygon, Polygon
-from shapely.ops import unary_union
-from shapely.ops import transform as shapely_transform
 
 from country_utils import update_country_initialized
 
 # Import hazard source data retrieval functions. get_envelopes/get_gust_envelopes
 # dispatch to Snowflake or LOCAL/BLOB based on config.HAZARD_DATA_SOURCE (see
-# snowflake_utils.py's "HAZARD_DATA_SOURCE DISPATCH" section); get_snowflake_connection
-# is unrelated (used only for the country pre-filter, always Snowflake).
+# snowflake_utils.py's "HAZARD_DATA_SOURCE DISPATCH" section).
 from snowflake_utils import (
     get_envelopes,
     get_gust_envelopes,
     convert_envelopes_to_geodataframe,
-    get_snowflake_connection
 )
 
 # Shared state/generic helpers with no dependency of their own on this module
@@ -160,12 +145,11 @@ from pipeline_shared import (
     _custom_file_path,
 )
 
-# The four sibling modules impact_analysis.py was split from. Each imports its
-# own shared state from pipeline_shared.py (not from here), so there's no
-# cycle - these are plain, ordinary top-of-file imports.
+# Sibling modules impact_analysis.py imports from. facility_io and
+# country_boundaries import their own shared state from pipeline_shared.py (not
+# from here), so there's no cycle - these are plain, ordinary top-of-file imports.
 from facility_io import (
     HC_FACILITY_TYPES,
-    WASH_LOCATION_TYPES,
     fetch_health_centers,
     fetch_schools,
     fetch_shelters,
@@ -184,19 +168,16 @@ from facility_io import (
     wash_exist,
 )
 from country_boundaries import (
-    get_country_boundaries,
     add_admin_ids,
     get_initialized_admin_levels,
-    get_initialized_admin_levels_bulk,
     write_country_boundary,
 )
-from precip_views import (
-    create_precip_tile_view,
-    create_precip_admin_view,
+from sparse_output import (
+    describe_reduction,
+    sparsify_facility_frame,
+    sparsify_tile_frame,
 )
-from river_views import (
-    create_river_tile_view,
-)
+from sparse_build import EnvelopeSparse
 
 # =============================================================================
 # CONSTANTS
@@ -286,14 +267,13 @@ VULNERABILITY_WIND_FULL_THRESHOLD   = 96   # kt (Category 3)
 
 # Configuration constants
 BUFFER_DISTANCE_METERS = 150  # Buffer distance for schools and health centers (meters)
-WORLDPOP_RESOLUTION_HIGH = 1000  # High resolution for WorldPop data (meters)
 WORLDPOP_RESOLUTION_LOW = 100  # Low resolution for WorldPop data (meters)
-SCHOOL_AGE_MIN = 5   # GR2 min_age: picks _05_ (5–9y) and _10_ (10–14y) bands
-SCHOOL_AGE_MAX = 10  # GR2 max_age: picks _05_ (5–9y) and _10_ (10–14y) bands
-INFANT_AGE_MIN = 0   # GR2 min_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
-INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0–12mo) and _01_ (1–4y) bands
-ADOLESCENT_AGE_MIN = 15  # GR2 min_age: picks _15_ (15–19y) band
-ADOLESCENT_AGE_MAX = 15  # GR2 max_age: picks _15_ (15–19y) band (1 file only)
+SCHOOL_AGE_MIN = 5   # GR2 min_age: picks _05_ (5-9y) and _10_ (10-14y) bands
+SCHOOL_AGE_MAX = 10  # GR2 max_age: picks _05_ (5-9y) and _10_ (10-14y) bands
+INFANT_AGE_MIN = 0   # GR2 min_age: picks _00_ (0-12mo) and _01_ (1-4y) bands
+INFANT_AGE_MAX = 1   # GR2 max_age: picks _00_ (0-12mo) and _01_ (1-4y) bands
+ADOLESCENT_AGE_MIN = 15  # GR2 min_age: picks _15_ (15-19y) band
+ADOLESCENT_AGE_MAX = 15  # GR2 max_age: picks _15_ (15-19y) band (1 file only)
 CCI_WEIGHT_MULTIPLIER = 1e-6  # Multiplier for CCI weight calculation (wind_speed^2 * 1e-6)
 # FULL_ENSEMBLE_SIZE lives in pipeline_shared.py (imported above); not redefined here.
 
@@ -316,7 +296,7 @@ SMOD_L2_TO_L1 = {
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-# VIEWS_DIR/ROOT_DATA_DIR/data_store now come from pipeline_shared.py (imported
+# VIEWS_DIR/ROOT_DATA_DIR/data_store come from pipeline_shared.py (imported
 # above) - RESULTS_DIR/STORMS_FILE are only ever used in this file, so they stay.
 RESULTS_DIR = config.RESULTS_DIR
 STORMS_FILE = config.STORMS_FILE
@@ -343,7 +323,7 @@ else:
 # =============================================================================
 # CUSTOM DATA HELPERS
 # =============================================================================
-# _custom_file_path/_load_custom_points_csv moved to pipeline_shared.py
+# _custom_file_path/_load_custom_points_csv live in pipeline_shared.py
 # (facility_io.py needs them too); imported above alongside data_store etc.
 def _load_custom_tiles_csv(country, kind, zoom):
     """
@@ -517,7 +497,7 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0, fast_fail=F
 
     Returns:
         gpd.GeoDataFrame: GeoDataFrame with mercator tiles and all demographic/infrastructure
-                         columns. 'zone_id' renamed to 'tile_id'.
+                         columns, indexed by 'tile_id'.
     """
     # Fetch facility locations using helper functions with caching
     gdf_schools = fetch_schools(country, rewrite, fast_fail=fast_fail)
@@ -542,8 +522,8 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0, fast_fail=F
         _wp_attempts = 3
         for _wp_attempt in range(_wp_attempts):
             try:
-                # Map school-age population (5–14y): hard requirement, raises on failure
-                # GR2: uses individual 5-year age bands (_05_ = 5–9y, _10_ = 10–14y), sex='T' for combined total
+                # Map school-age population (5-14y): hard requirement, raises on failure
+                # GR2: uses individual 5-year age bands (_05_ = 5-9y, _10_ = 10-14y), sex='T' for combined total
                 tiles_viewer.map_wp_pop(
                     country=country,
                     resolution=WORLDPOP_RESOLUTION_LOW,
@@ -557,8 +537,8 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0, fast_fail=F
                     max_age=SCHOOL_AGE_MAX,
                     sex='T',
                 )
-                # Map infant population (0–4y): hard requirement, raises on failure
-                # GR2: uses individual 5-year age bands (_00_ = 0–12mo, _01_ = 1–4y), sex='T' for combined total
+                # Map infant population (0-4y): hard requirement, raises on failure
+                # GR2: uses individual 5-year age bands (_00_ = 0-12mo, _01_ = 1-4y), sex='T' for combined total
                 tiles_viewer.map_wp_pop(
                     country=country,
                     resolution=WORLDPOP_RESOLUTION_LOW,
@@ -573,8 +553,8 @@ def create_mercator_country_layer(country, zoom_level=14, rewrite=0, fast_fail=F
                     max_age=INFANT_AGE_MAX,
                     sex='T',
                 )
-                # Map adolescent population (15–19y): hard requirement, raises on failure
-                # GR2: picks _15_ band only (15–19y), sex='T' for combined total (1 file)
+                # Map adolescent population (15-19y): hard requirement, raises on failure
+                # GR2: picks _15_ band only (15-19y), sex='T' for combined total (1 file)
                 tiles_viewer.map_wp_pop(
                     country=country,
                     resolution=WORLDPOP_RESOLUTION_LOW,
@@ -748,7 +728,7 @@ def patch_country_layer(country, zoom_level, columns):
         population             : re-runs WorldPop total population (or uses custom population_z<N>.csv)
         school_age_population  : re-runs WorldPop school-age population
         infant_population      : re-runs WorldPop infant population
-        adolescent_population  : re-runs WorldPop adolescent population (15–19y)
+        adolescent_population  : re-runs WorldPop adolescent population (15-19y)
         built_surface_m2       : re-runs GHSL built surface (or uses custom built_surface_z<N>.csv)
         smod_class             : re-runs GHSL SMOD (or uses custom smod_z<N>.csv); also updates smod_class_l1
         smod_class_l1          : alias for smod_class (both are always updated together)
@@ -1202,6 +1182,37 @@ def load_json_storms():
     return {'storms': {}}
 
 
+# Real, DYNAMIC memory of which countries have needed a second-pass deferral
+# (see the COUNTRY_PASS1_CAP_S comment in main_pipeline.py for the full
+# "why"). Learned from real run outcomes and self-correcting (fewer real
+# deferrals over time -> naturally stops being treated as a likely
+# straggler). Same real Blob-backed JSON pattern as
+# save_json_storms()/load_json_storms() above, deliberately a separate file
+# (not folded into storms.json) since its own schema/purpose is unrelated.
+SLOW_COUNTRIES_FILE = 'slow_countries.json'
+
+
+def save_json_slow_countries(d):
+    """Save the real, dynamic per-country deferral-history JSON."""
+    filename = os.path.join(RESULTS_DIR, SLOW_COUNTRIES_FILE)
+    data_store.write_file(filename, json.dumps(d).encode())
+
+
+def load_json_slow_countries():
+    """
+    Read the real, dynamic per-country deferral-history JSON. Schema:
+    {"windgust": {"<COUNTRY>": {"defer_count": int, "last_deferred_at":
+    ISO-8601 str, "last_tier": "pass1" | "pass2"}}}. Namespaced by hazard
+    ("windgust" today) so a future precip/river-specific use of this same
+    file, if ever added, can't collide with wind/gust's own entries.
+    """
+    filename = os.path.join(RESULTS_DIR, SLOW_COUNTRIES_FILE)
+    if data_store.file_exists(filename):
+        raw = data_store.read_file(filename)
+        return json.loads(raw)
+    return {'windgust': {}}
+
+
 def load_mercator_view(country, zoom_level=14):
     """Load mercator view for country"""
     file_name = f"{country}_{zoom_level}.parquet"
@@ -1346,7 +1357,7 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_colu
 
     Returns:
         dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per school,
-              containing 'zone_id' (= school_id_giga) and 'probability' (0.0–1.0).
+              containing 'zone_id' (= school_id_giga) and 'probability' (0.0-1.0).
               Empty dict if gdf_schools is empty or invalid.
     """
     # Validate input is a GeoDataFrame
@@ -1400,8 +1411,8 @@ def create_school_view_from_envelopes(gdf_schools, gdf_envelopes, threshold_colu
                 # intersect any zone at this threshold (normal, e.g. no member
                 # reaches a high wind_threshold), aggregate_polygons_to_zones()
                 # early-returns before adding that column, so the read-back raises
-                # a bare KeyError. Narrowed from a broad except so an unrelated bug
-                # isn't silently misattributed here, matching
+                # a bare KeyError. Only KeyError is caught so an unrelated error
+                # isn't misattributed here, matching
                 # create_tracks_view_from_envelopes()'s tile aggregation below.
                 logger.info(f"No envelope/school intersections at {wind_th} ({threshold_column}), defaulting probability to 0.0: {e}")
                 probs = {k: 0.0 for k in schools_viewer.view['zone_id'].unique()}
@@ -1471,17 +1482,17 @@ def create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, threshold_c
             buffered version of gdf_hcs (see _precompute_facility_buffer()'s
             own docstring), reused instead of filtering/deduplicating/
             buffering gdf_hcs again here. None (the default) computes it
-            here exactly as before.
+            here.
 
     Returns:
         dict: Maps wind threshold (int, knots) → GeoDataFrame with one row per facility,
-              containing 'zone_id' (= osm_id) and 'probability' (0.0–1.0).
+              containing 'zone_id' (= osm_id) and 'probability' (0.0-1.0).
               Empty dict if gdf_hcs is empty or invalid.
     """
     # Validate input is a GeoDataFrame with usable geometry, matching the same
     # guards create_school_view_from_envelopes/create_shelter_view_from_envelopes/
     # create_wash_view_from_envelopes all apply: without this, a malformed
-    # gdf_hcs (e.g. a corrupted/legacy cache read back without an active
+    # gdf_hcs (e.g. a corrupted or older cache read back without an active
     # geometry column) would crash uncaught inside buffer_geodataframe() below
     # instead of returning {} gracefully like its siblings.
     if not isinstance(gdf_hcs, gpd.GeoDataFrame):
@@ -1551,7 +1562,7 @@ def create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, threshold_co
         precomputed_buff: Optional, an already-deduplicated-and-buffered
             version of gdf_shelters (see _precompute_facility_buffer()'s own
             docstring), reused instead of deduplicating/buffering gdf_shelters
-            again here. None (the default) computes it here exactly as before.
+            again here. None (the default) computes it here.
 
     Returns:
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
@@ -1615,7 +1626,7 @@ def create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, threshold_column='w
         precomputed_buff: Optional, an already-deduplicated-and-buffered
             version of gdf_wash (see _precompute_facility_buffer()'s own
             docstring), reused instead of deduplicating/buffering gdf_wash
-            again here. None (the default) computes it here exactly as before.
+            again here. None (the default) computes it here.
 
     Returns:
         dict: wind threshold → GeoDataFrame with 'zone_id' (=osm_id) and 'probability'.
@@ -1712,8 +1723,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_colu
         threshold_column: 'wind_threshold' or 'gust_threshold'.
         bitmask_views: Optional, an already-computed {threshold: DataFrame}
             result of calculate_tile_member_bitmask(), reused instead of
-            recomputing it here. None (the default) computes it here exactly
-            as before.
+            recomputing it here. None (the default) computes it here.
 
     Returns:
         dict: Dictionary mapping wind threshold (int) to DataFrame with tile impact data.
@@ -1805,7 +1815,7 @@ def create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, threshold_colu
                     # Index has no name, explicitly name it 'zone_id'
                     df_view = df_view.reset_index(names=['zone_id'])
 
-            # Keep poverty columns last so CSV positions $2–$16 are identical
+            # Keep poverty columns last so CSV positions $2-$16 are identical
             # to the 16-column format. The procedure's IFF($13 IS NULL) detection
             # continues to work; $17/$18 are ignored by the current INSERT.
             _pov_cols = [c for c in ['moderate_poverty_prob', 'severe_poverty_prob'] if c in df_view.columns]
@@ -1983,6 +1993,49 @@ def create_admin_view_from_envelopes_new(gdf_admin, gdf_tiles, gdf_envelopes, th
     return wind_views
 
 
+def _map_points_exploded(gdf_zones, zone_id_column, points, predicate='intersects'):
+    """Counts how many points intersect each zone, after splitting every
+    zone geometry into its individual disjoint polygon parts first.
+
+    A zone geometry can be a MultiPolygon scattered across a large area as
+    many disjoint parts, for example a low threshold gust envelope member.
+    The spatial index used to find candidate points for a zone prunes using
+    that zone's own bounding box. A zone scattered across a wide area has an
+    enormous bounding box, so the index cannot prune anything for it, and
+    every point in the country ends up paying a full geometric check
+    against it.
+
+    Splitting each zone into one row per disjoint part first gives every
+    row its own small, real bounding box, so the index can prune correctly.
+    Because a zone's own parts never overlap each other, summing the counts
+    from its parts back together after aggregation gives the exact same
+    total for that zone. No geometry is changed, only reorganized for the
+    index.
+
+    Returns a dictionary mapping each real zone id to its point count.
+    """
+    rows = []
+    for _, row in gdf_zones.iterrows():
+        geom = row.geometry
+        parts = list(geom.geoms) if geom.geom_type == 'MultiPolygon' else [geom]
+        for part in parts:
+            r = row.copy()
+            r['geometry'] = part
+            rows.append(r)
+    exploded = gpd.GeoDataFrame(rows, crs=gdf_zones.crs).reset_index(drop=True)
+    exploded['_explode_zone_id'] = range(len(exploded))
+
+    result = aggregate_points_to_zones(
+        points=points, zones=exploded, aggregation='count',
+        point_zone_predicate=predicate, zone_id_column='_explode_zone_id',
+    )
+    # A zone's own exploded parts never overlap each other, since they are
+    # the same MultiPolygon's own disjoint pieces, so summing point_count
+    # across them is an exact recombination and does not count anything
+    # twice.
+    return result.groupby(zone_id_column)['point_count'].sum().to_dict()
+
+
 def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member',
                                        gdf_shelters=None, gdf_wash=None, threshold_column='wind_threshold', bitmask_views=None,
                                        schools_buff=None, hcs_buff=None, shelters_buff=None, wash_buff=None):
@@ -1998,8 +2051,8 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
     envelopes()/create_shelter_view_from_envelopes()/create_wash_view_from_
     envelopes() calls (for both wind and, when present, gust), instead of
     every one of those calls independently re-running buffer_geodataframe()
-    on the exact same input. None (the default for each) computes it here
-    exactly as before, for any caller that doesn't have one handy.
+    on the exact same input. None (the default for each) computes it here,
+    for any caller that doesn't have one handy.
     """
     wind_views = {}
 
@@ -2062,11 +2115,11 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         tracks_viewer = GeometryBasedZonalViewGenerator(zone_data=gdf_envelopes_wth, zone_id_column=index_column)
 
         # Schools
-        schools = tracks_viewer.map_points(points=gdf_schools_buff, predicate='intersects')
+        schools = _map_points_exploded(gdf_envelopes_wth, index_column, gdf_schools_buff, predicate='intersects')
         tracks_viewer.add_variable_to_view(schools, "severity_schools")
 
         # Health centers
-        hcs = tracks_viewer.map_points(points=gdf_hcs_buff, predicate='intersects')
+        hcs = _map_points_exploded(gdf_envelopes_wth, index_column, gdf_hcs_buff, predicate='intersects')
         tracks_viewer.add_variable_to_view(hcs, "severity_hcs")
 
         # Shelters
@@ -2074,13 +2127,13 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         if gdf_shelters_buff is None or gdf_shelters_buff.empty:
             tracks_viewer.add_variable_to_view(_nan_members, "severity_num_shelters")
         else:
-            tracks_viewer.add_variable_to_view(tracks_viewer.map_points(points=gdf_shelters_buff, predicate='intersects'), "severity_num_shelters")
+            tracks_viewer.add_variable_to_view(_map_points_exploded(gdf_envelopes_wth, index_column, gdf_shelters_buff, predicate='intersects'), "severity_num_shelters")
 
         # WASH facilities
         if gdf_wash_buff is None or gdf_wash_buff.empty:
             tracks_viewer.add_variable_to_view(_nan_members, "severity_num_wash")
         else:
-            tracks_viewer.add_variable_to_view(tracks_viewer.map_points(points=gdf_wash_buff, predicate='intersects'), "severity_num_wash")
+            tracks_viewer.add_variable_to_view(_map_points_exploded(gdf_envelopes_wth, index_column, gdf_wash_buff, predicate='intersects'), "severity_num_wash")
 
         members_present = gdf_envelopes_wth[index_column].unique()
         _zero_members = {m: 0.0 for m in members_present}
@@ -2088,9 +2141,9 @@ def create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envel
         # Per-member SUM over tiles covered by that member's own envelope,
         # derived from the same canonical bitmask create_mercator_view_
         # from_envelopes()/create_admin_view_from_envelopes_new() also use. A
-        # member with zero tile coverage gets NaN, not 0.0 (matching the old
-        # gpd.sjoin-based aggregate_polygons_to_zones()'s "no matching rows" ->
-        # NaN fill for "sum"); only a threshold with ZERO tiles covered by every
+        # member with zero tile coverage gets NaN, not 0.0 (matching
+        # aggregate_polygons_to_zones()'s "no matching rows" -> NaN fill for
+        # "sum"); only a threshold with ZERO tiles covered by every
         # member falls back to 0.0 for all (bm_df.empty or a rasterize failure).
         bm_df = bitmask_views.get(int(wind_th))
         if bm_df is None:
@@ -2163,7 +2216,7 @@ def create_admin_country_layer(country, rewrite=0, admin_level=1, fast_fail=Fals
 
     Returns:
         gpd.GeoDataFrame: GeoDataFrame with admin boundaries and all demographic/
-                         infrastructure columns. 'zone_id' renamed to 'tile_id'.
+                         infrastructure columns, indexed by 'tile_id'.
     """
     # Fetch facility locations: custom data priority handled inside fetch_*
     gdf_schools = fetch_schools(country, rewrite, fast_fail=fast_fail)
@@ -2314,21 +2367,6 @@ def save_admin_view(gdf, country, admin_level=1):
     path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, 'admin_views', file_name)
     write_dataset(gdf, data_store, path)
 
-def save_admin_views(countries, rewrite=0, admin_level=1):
-    """
-    Generates and saves all country admin views for a given admin level.
-
-    Args:
-        countries: List of country codes
-        rewrite: If 1, replace existing files; if 0, skip if exists
-        admin_level: Admin level to generate views for (default: 1)
-    """
-    for country in countries:
-        view = create_admin_country_layer(country, rewrite, admin_level=admin_level)
-        save_admin_view(view, country, admin_level=admin_level)
-
-
-
 def project_tiles_for_facility_assignment(gdf_tiles):
     """
     Reproject gdf_tiles (tile_id + geometry only) to ESRI:54009 once, exposed
@@ -2380,7 +2418,7 @@ def assign_facilities_to_tiles(gdf_facilities, gdf_tiles, id_column, tiles_proj=
             project_tiles_for_facility_assignment(gdf_tiles) result, reused
             instead of reprojecting gdf_tiles to ESRI:54009 here. None (the
             default, and what every caller other than main_pipeline.py's
-            river worker passes) reprojects internally exactly as before -
+            river worker passes) reprojects internally -
             required only when `unmatched` below is non-empty, so a caller
             that never passes this still pays that cost at most once, same
             as pre-existing behaviour. When passed, it must have been built
@@ -2441,8 +2479,32 @@ def save_tiles_view(gdf, country, storm, date, wind_th, zoom_level, dataset='win
     th_token = f"g{wind_th}" if dataset == 'gust' else f"{wind_th}"
     file_name = f"{country}_{storm}_{date}_{th_token}_{zoom_level}.csv"
     out_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, dir_name, file_name)
-    write_dataset(gdf, data_store, out_path)
+    # Thin copy for the file only; the caller's dense frame is untouched.
+    # A failure here falls back to the dense file rather than losing the view.
+    try:
+        frame = sparsify_tile_frame(gdf).reset_index(drop=True)
+        logger.info(f"    Sparse {dataset} tile view {file_name}: {describe_reduction(gdf, frame)}")
+    except Exception as e:
+        frame = gdf
+        logger.warning(f"    Sparse {dataset} tile view {file_name} not applied, writing the dense file: {e}")
+    write_dataset(frame, data_store, out_path)
     return out_path
+
+
+def _facility_view_for_write(gdf, dataset, label):
+    """
+    Frame handed to a facility view writer: zero-probability rows are dropped
+    from a copy. The result may be empty; the file is still written so
+    existence checks and stale-file cleanup see it.
+    """
+    try:
+        # Contiguous index, so the parquet file carries no extra index column.
+        frame = sparsify_facility_frame(gdf).reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"    Sparse {dataset} {label} not applied, writing the dense file: {e}")
+        return gdf
+    logger.debug(f"    Sparse {dataset} {label}: {describe_reduction(gdf, frame)}")
+    return frame
 
 
 def save_cci_tiles(gdf, country, storm, date, zoom_level):
@@ -2614,7 +2676,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     
     Returns:
         DataFrame: CCI tile view with columns:
-            - CCI_children: Child Cyclone Index for children (0–19: infants + school-age + adolescents)
+            - CCI_children: Child Cyclone Index for children (0-19: infants + school-age + adolescents)
             - E_CCI_children: Expected CCI for children
             - CCI_school_age: CCI for school-age population
             - E_CCI_school_age: Expected CCI for school-age population
@@ -2655,7 +2717,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
             gdf_tiles_index[pop_col] = np.nan
     cci_tiles_view = pd.DataFrame(index=gdf_tiles_index.index)
 
-    # Children cci (0–19: school_age 5–14 + infants 0–4 + adolescents 15–19)
+    # Children cci (0-19: school_age 5-14 + infants 0-4 + adolescents 15-19)
     for i in range(k-1):
         wind = winds[i]
         cci_tiles_view[f"{wind}"] = ((gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'] + gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i]['probability']>0)  - (gdf_tiles_index['school_age_population'] + gdf_tiles_index['infant_population'] + gdf_tiles_index['adolescent_population'])*(sorted_wind_views_indexed[i+1]['probability']>0)).clip(lower=0.0)
@@ -2666,7 +2728,7 @@ def calculate_ccis(wind_tiles_views, gdf_tiles):
     cci_tiles_view['CCI_children'] = sum(wcols)
     cci_tiles_view = cci_tiles_view[['CCI_children']]
 
-    # Children e cci (0–19: school_age 5–14 + infants 0–4 + adolescents 15–19)
+    # Children e cci (0-19: school_age 5-14 + infants 0-4 + adolescents 15-19)
     for i in range(k-1):
         wind = winds[i]
         cci_tiles_view[f"{wind}"] = ((sorted_wind_views_indexed[i]['E_school_age_population'] + sorted_wind_views_indexed[i]['E_infant_population'] + sorted_wind_views_indexed[i]['E_adolescent_population']) - (sorted_wind_views_indexed[i+1]['E_school_age_population'] + sorted_wind_views_indexed[i+1]['E_infant_population'] + sorted_wind_views_indexed[i+1]['E_adolescent_population'])).clip(lower=0.0)
@@ -2792,7 +2854,7 @@ def calculate_vulnerability_view(wind_tiles_views, gdf_tiles):
           rate = severe_poverty_prob  (only the severely poor are considered immediately vulnerable)
       VULNERABILITY_WIND_SEVERE_THRESHOLD ≤ band < VULNERABILITY_WIND_FULL_THRESHOLD (96 kt):
           rate linearly interpolates: moderate_poverty_prob (at 50 kt) → 1.0 (at 96 kt)
-          rate = moderate_poverty_prob × (1 − t) + t,  where t = (band − 50) / (96 − 50)
+          rate = moderate_poverty_prob × (1 - t) + t,  where t = (band - 50) / (96 - 50)
       band ≥ VULNERABILITY_WIND_FULL_THRESHOLD (96 kt):
           rate = 1.0 (catastrophic, all people need assistance)
 
@@ -2926,7 +2988,7 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
     For each tile the member covers, the effective vulnerability rate is determined
     by the *highest* wind band that member's envelope reaches over that tile:
       - Highest band < 50 kt  → rate = severe_poverty_prob
-      - Highest band 50–96 kt → rate linearly interpolates moderate_poverty_prob → 1.0
+      - Highest band 50-96 kt → rate linearly interpolates moderate_poverty_prob → 1.0
       - Highest band ≥ 96 kt  → rate = 1.0
 
     The per-member sum across all covered tiles gives the severity_* columns,
@@ -2943,9 +3005,9 @@ def calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles):
             zone_id                    : ensemble member number
             severity_people_in_need    : total PIN for tiles this member affects
             severity_children_in_need  : CHIN (infants + school-age + adolescents)
-            severity_infant_in_need    : infants (0–4)
-            severity_school_age_in_need: school age (5–14)
-            severity_adolescent_in_need: adolescents (15–19)
+            severity_infant_in_need    : infants (0-4)
+            severity_school_age_in_need: school age (5-14)
+            severity_adolescent_in_need: adolescents (15-19)
         All severity_* columns are NaN when no vulnerability data has been
         patched for the country (same guard as calculate_vulnerability_view).
     """
@@ -3131,7 +3193,7 @@ _WEB_MERCATOR_CIRCUMFERENCE_M = 40075016.6855785
 def _z14_tile_size_m(zoom_level: int = 14) -> float:
     """Real Web Mercator tile size in meters at the given zoom level (a tile
     is a fixed-size square everywhere in EPSG:3857, unlike in EPSG:4326 where
-    tile height in degrees varies by latitude, a real, measured difference,
+    tile height in degrees varies by latitude, a real difference,
     not a theoretical concern)."""
     return _WEB_MERCATOR_CIRCUMFERENCE_M / (2 ** zoom_level)
 
@@ -3151,7 +3213,7 @@ def _rasterize_member_envelope_mask(geom_3857, tile_size_m: float):
        tile geometries shows tile width in degrees is constant, but tile
        HEIGHT in degrees varies by latitude band (an inherent Web Mercator
        property), so a single global dy misaligns rows far from where it was
-       measured. Fixed by working entirely in EPSG:3857, where tiles are
+       measured. The grid works entirely in EPSG:3857, where tiles are
        exact fixed-size squares everywhere.
     2. A rasterize grid anchored to the polygon's own bounding box (not the
        real, fixed-origin XYZ tile lattice) silently offsets every result by
@@ -3389,7 +3451,7 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
             bitmask_views[th] = pd.DataFrame({'tile_id': pd.Series(dtype='string'), 'bits': pd.Series(dtype='uint64')})
             continue
 
-        # Sparse output, same convention as before (only tiles with at least
+        # Sparse output (only tiles with at least
         # one member's real coverage appear), via a vectorized boolean-mask
         # select.
         nonzero = tile_bits_accum != 0
@@ -3430,7 +3492,8 @@ def calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles, threshold_column='wi
 # Coordinates all view generation, CCI calculation, and report writing.
 # =============================================================================
 def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, zoom, gdf_envelopes_gust=None,
-                                            admin_levels_by_country=None):
+                                            admin_levels_by_country=None, heartbeat=None, on_wind_complete=None,
+                                            skip_wind=False):
     """
     Create and save all impact views for a country from hurricane envelopes.
 
@@ -3466,8 +3529,38 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             that same shared, country-independent directory redundantly for
             every country a caller processes in a loop. None (the default,
             for any caller that doesn't have a bulk mapping handy, e.g. a
-            standalone/test invocation) falls back to the original
+            direct call outside the pipeline) falls back to the original
             per-country listing so this function stays correct on its own.
+        heartbeat: Optional zero-arg callable, invoked after every real save
+            checkpoint below (schools, HCs, shelters, WASH, tiles, each admin
+            level, tracks, bitmask: both wind and gust). Lets the caller's
+            own subprocess supervisor (see _process_one_country_isolated() in
+            main_pipeline.py) distinguish "still genuinely working" from "truly
+            stalled" instead of using a single flat wall-clock timeout for the
+            whole call: see that function's own docstring for the full "why".
+            None (the default) is a safe no-op, for any caller (e.g. a
+            direct call outside the pipeline) that doesn't need this.
+        on_wind_complete: Optional callable(wrote_base_parquet, files_written),
+            invoked exactly once, right after wind processing has fully
+            succeeded and saved but before gust processing begins (see the
+            real call site's own comment for why this exact point). Lets the
+            caller's own subprocess supervisor persist wind's already-good
+            result BEFORE gust starts, so a later external kill of this whole
+            OS process (for example gust hangs, the parent's stall-watchdog
+            SIGKILLs the entire subprocess, and wind's already-saved result,
+            held only in this process's own memory and not yet returned via
+            the result queue, is destroyed along with it) does not have to
+            discard a genuinely successful wind outcome. None (the default) is a safe
+            no-op, for any caller that doesn't need this.
+        skip_wind: If True, skip wind envelope processing entirely (gust
+            processing is unaffected either way, and requires gdf_envelopes_gust
+            to actually have data or this call does nothing). The shared raw
+            inputs gust also needs (facility fetches, tile/admin loading) are
+            still loaded, just never turned into wind views/saves. Lets a
+            gust-only scheduler invocation reuse this same function without
+            redoing wind's own view creation for a country wind has already
+            finished. on_wind_complete is never invoked when this is True
+            (there is no real wind completion to report).
 
     Note:
         Base data (mercator tiles, admin views) are loaded if available, or created
@@ -3488,6 +3581,13 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             visible even on an otherwise STATUS=SUCCESS run, rather than only
             ever reaching a container's own stdout log.
     """
+    heartbeat = heartbeat or (lambda: None)
+    on_wind_complete = on_wind_complete or (lambda wrote_base, files_written: None)
+
+    # Computed once, reused both for the stale-cleanup dir list below and the
+    # gust branch further down, so the two can never drift out of sync.
+    process_gust = gdf_envelopes_gust is not None and not gdf_envelopes_gust.empty
+
     if admin_levels_by_country is not None:
         admin_levels = admin_levels_by_country.get(country) or [1]
     else:
@@ -3517,11 +3617,20 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # capture the pre-run file list here; written_paths (populated at every
     # save_*() call below) is diffed against it at the end, and only genuinely
     # stale leftovers (existed before, never rewritten this call) are deleted.
+    #
+    # Only the dirs for a hazard actually being processed THIS call are
+    # included: skip_wind/skip_gust (or gust simply having no data this cycle)
+    # mean the corresponding views are never in written_paths below, so
+    # including their dirs here would make every one of that hazard's real,
+    # still-current files look like a stale leftover and delete them.
     prefix = f"{country}_{storm}_{date}_"
-    view_dirs_to_clean = ('school_views', 'hc_views', 'shelter_views', 'wash_views',
-                          'mercator_views', 'admin_views', 'track_views', 'track_tile_bitmask_views',
-                          'school_views_gust', 'hc_views_gust', 'shelter_views_gust', 'wash_views_gust',
-                          'mercator_views_gust', 'admin_views_gust', 'track_views_gust', 'track_tile_bitmask_views_gust')
+    view_dirs_to_clean = []
+    if not skip_wind:
+        view_dirs_to_clean += ['school_views', 'hc_views', 'shelter_views', 'wash_views',
+                               'mercator_views', 'admin_views', 'track_views', 'track_tile_bitmask_views']
+    if process_gust:
+        view_dirs_to_clean += ['school_views_gust', 'hc_views_gust', 'shelter_views_gust', 'wash_views_gust',
+                               'mercator_views_gust', 'admin_views_gust', 'track_views_gust', 'track_tile_bitmask_views_gust']
     existing_before = {}
     for view_dir in view_dirs_to_clean:
         dir_path = os.path.join(ROOT_DATA_DIR, VIEWS_DIR, view_dir)
@@ -3551,11 +3660,13 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # exact same gdf_schools.
     gdf_schools_buff = _precompute_facility_buffer(gdf_schools, 'school_id_giga', 'school')
 
-    wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes, precomputed_buff=gdf_schools_buff)
-    for wind_th in wind_school_views:
-        written_paths.add(save_school_view(wind_school_views[wind_th], country, storm, date, wind_th))
-    files_written += len(wind_school_views)
-    logger.info(f"    Created {len(wind_school_views)} school views")
+    if not skip_wind:
+        wind_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes, precomputed_buff=gdf_schools_buff)
+        for wind_th in wind_school_views:
+            written_paths.add(save_school_view(_facility_view_for_write(wind_school_views[wind_th], 'wind', f'school {country} {wind_th}kt'), country, storm, date, wind_th))
+        files_written += len(wind_school_views)
+        logger.info(f"    Created {len(wind_school_views)} school views")
+        heartbeat()
 
     # Health centers
     logger.info(f"    Processing health centers...")
@@ -3565,33 +3676,39 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # buffer matches what every HC-facing call below would have filtered to
     # on its own.
     gdf_hcs_buff = _precompute_facility_buffer(gdf_hcs, 'osm_id', 'health center', filter_fn=_filter_hcs_to_relevant_types)
-    wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, precomputed_buff=gdf_hcs_buff)
-    for wind_th in wind_hc_views:
-        written_paths.add(save_hc_view(wind_hc_views[wind_th], country, storm, date, wind_th))
-    files_written += len(wind_hc_views)
-    logger.info(f"    Created {len(wind_hc_views)} health center views")
+    if not skip_wind:
+        wind_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes, precomputed_buff=gdf_hcs_buff)
+        for wind_th in wind_hc_views:
+            written_paths.add(save_hc_view(_facility_view_for_write(wind_hc_views[wind_th], 'wind', f'hc {country} {wind_th}kt'), country, storm, date, wind_th))
+        files_written += len(wind_hc_views)
+        logger.info(f"    Created {len(wind_hc_views)} health center views")
+        heartbeat()
 
     # Shelters
     logger.info(f"    Processing shelters...")
     gdf_shelters = fetch_shelters(country, rewrite=0, fast_fail=True)
     # Same single-buffer reuse as gdf_schools_buff above.
     gdf_shelters_buff = _precompute_facility_buffer(gdf_shelters, 'osm_id', 'shelter')
-    wind_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, precomputed_buff=gdf_shelters_buff)
-    for wind_th in wind_shelter_views:
-        written_paths.add(save_shelter_view(wind_shelter_views[wind_th], country, storm, date, wind_th))
-    files_written += len(wind_shelter_views)
-    logger.info(f"    Created {len(wind_shelter_views)} shelter views")
+    if not skip_wind:
+        wind_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes, precomputed_buff=gdf_shelters_buff)
+        for wind_th in wind_shelter_views:
+            written_paths.add(save_shelter_view(_facility_view_for_write(wind_shelter_views[wind_th], 'wind', f'shelter {country} {wind_th}kt'), country, storm, date, wind_th))
+        files_written += len(wind_shelter_views)
+        logger.info(f"    Created {len(wind_shelter_views)} shelter views")
+        heartbeat()
 
     # WASH
     logger.info(f"    Processing WASH...")
     gdf_wash = fetch_wash(country, rewrite=0, fast_fail=True)
     # Same single-buffer reuse as gdf_schools_buff above.
     gdf_wash_buff = _precompute_facility_buffer(gdf_wash, 'osm_id', 'WASH facility')
-    wind_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, precomputed_buff=gdf_wash_buff)
-    for wind_th in wind_wash_views:
-        written_paths.add(save_wash_view(wind_wash_views[wind_th], country, storm, date, wind_th))
-    files_written += len(wind_wash_views)
-    logger.info(f"    Created {len(wind_wash_views)} WASH views")
+    if not skip_wind:
+        wind_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes, precomputed_buff=gdf_wash_buff)
+        for wind_th in wind_wash_views:
+            written_paths.add(save_wash_view(_facility_view_for_write(wind_wash_views[wind_th], 'wind', f'wash {country} {wind_th}kt'), country, storm, date, wind_th))
+        files_written += len(wind_wash_views)
+        logger.info(f"    Created {len(wind_wash_views)} WASH views")
+        heartbeat()
 
     # Tiles
     logger.info(f"    Processing tiles...")
@@ -3635,31 +3752,33 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # Repeating it 4x per hazard (8 total) with no memory released between is
     # an avoidable OOM risk at large-country scale. See
     # calculate_tile_member_bitmask's own docstring for the computation itself.
-    wind_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
-                                                       threshold_column='wind_threshold',
-                                                       label='wind tile')
+    if not skip_wind:
+        wind_bitmask_views = calculate_tile_member_bitmask(gdf_envelopes, gdf_tiles,
+                                                           threshold_column='wind_threshold',
+                                                           label='wind tile')
 
-    wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, bitmask_views=wind_bitmask_views)
-    for wind_th in wind_tiles_views:
-        written_paths.add(save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom))
-    files_written += len(wind_tiles_views)
-    logger.info(f"    Created {len(wind_tiles_views)} tile views")
+        wind_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes, bitmask_views=wind_bitmask_views)
+        for wind_th in wind_tiles_views:
+            written_paths.add(save_tiles_view(wind_tiles_views[wind_th], country, storm, date, wind_th, zoom))
+        files_written += len(wind_tiles_views)
+        logger.info(f"    Created {len(wind_tiles_views)} tile views")
+        heartbeat()
 
-    # CCI for tiles
-    cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
-    written_paths.add(save_cci_tiles(cci_tiles_view, country, storm, date, zoom))
-    files_written += 1
+        # CCI for tiles
+        cci_tiles_view = calculate_ccis(wind_tiles_views, gdf_tiles)
+        written_paths.add(save_cci_tiles(cci_tiles_view, country, storm, date, zoom))
+        files_written += 1
 
-    # Vulnerability (people/children in need): wind-dependent poverty weighting
-    vuln_tiles_view = calculate_vulnerability_view(wind_tiles_views, gdf_tiles)
-    written_paths.add(save_vulnerability_tiles(vuln_tiles_view, country, storm, date, zoom))
-    files_written += 1
+        # Vulnerability (people/children in need): wind-dependent poverty weighting
+        vuln_tiles_view = calculate_vulnerability_view(wind_tiles_views, gdf_tiles)
+        written_paths.add(save_vulnerability_tiles(vuln_tiles_view, country, storm, date, zoom))
+        files_written += 1
 
-    # Per-member vulnerability: analogous to per-threshold track parquets
-    vuln_tracks_view = calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles)
-    written_paths.add(save_vulnerability_tracks(vuln_tracks_view, country, storm, date, zoom))
-    files_written += 1
-    logger.info(f"    Created vulnerability tracks view ({len(vuln_tracks_view)} members)")
+        # Per-member vulnerability: analogous to per-threshold track parquets
+        vuln_tracks_view = calculate_vulnerability_tracks(gdf_envelopes, gdf_tiles)
+        written_paths.add(save_vulnerability_tracks(vuln_tracks_view, country, storm, date, zoom))
+        files_written += 1
+        logger.info(f"    Created vulnerability tracks view ({len(vuln_tracks_view)} members)")
 
     # Admins: one pass per requested admin level
     logger.info(f"    Processing admins (levels: {admin_levels})...")
@@ -3691,80 +3810,92 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
         gdf_admin_by_level[admin_level] = gdf_admin
         gdf_tiles_for_admin_by_level[admin_level] = gdf_tiles_for_admin
 
-        # precomputed_tile_views reuses wind_tiles_views (this country's
-        # already-computed mercator tile view) for admin level 1 only:
-        # `gdf_tiles_for_admin is gdf_tiles` is the same identity check its
-        # construction above already keys off (admin_level == 1 sets
-        # gdf_tiles_for_admin = gdf_tiles directly), so this stays correct
-        # even if admin_levels is reordered. See
-        # create_admin_view_from_envelopes_new()'s docstring for why this
-        # reuse is safe (byte-identical per-tile inputs).
-        wind_admin_views = create_admin_view_from_envelopes_new(
-            gdf_admin, gdf_tiles_for_admin, gdf_envelopes,
-            bitmask_views=wind_bitmask_views,
-            precomputed_tile_views=(wind_tiles_views if gdf_tiles_for_admin is gdf_tiles else None))
-        for wind_th in wind_admin_views:
-            written_paths.add(save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th,
-                                                     admin_level=admin_level))
-        files_written += len(wind_admin_views)
-        logger.info(f"    Created {len(wind_admin_views)} admin{admin_level} views")
+        if not skip_wind:
+            # precomputed_tile_views reuses wind_tiles_views (this country's
+            # already-computed mercator tile view) for admin level 1 only:
+            # `gdf_tiles_for_admin is gdf_tiles` is the same identity check its
+            # construction above already keys off (admin_level == 1 sets
+            # gdf_tiles_for_admin = gdf_tiles directly), so this stays correct
+            # even if admin_levels is reordered. See
+            # create_admin_view_from_envelopes_new()'s docstring for why this
+            # reuse is safe (byte-identical per-tile inputs).
+            wind_admin_views = create_admin_view_from_envelopes_new(
+                gdf_admin, gdf_tiles_for_admin, gdf_envelopes,
+                bitmask_views=wind_bitmask_views,
+                precomputed_tile_views=(wind_tiles_views if gdf_tiles_for_admin is gdf_tiles else None))
+            for wind_th in wind_admin_views:
+                written_paths.add(save_admin_tiles_view(wind_admin_views[wind_th], country, storm, date, wind_th,
+                                                         admin_level=admin_level))
+            files_written += len(wind_admin_views)
+            logger.info(f"    Created {len(wind_admin_views)} admin{admin_level} views")
 
-        # CCI for this admin level
-        # min_count=1 (not plain "sum"): matches vagg_dict below, a country whose
-        # tile-level CCI columns are entirely NaN (e.g. an old mercator parquet
-        # pre-dating the WorldPop age-structure columns) must roll up to NaN at
-        # admin level too, not silently to 0 ("zero children impacted" when the
-        # real state is "data unavailable, needs --type patch").
-        agg_dict = {col: (lambda x: x.sum(min_count=1)) for col in sum_cols_cci}
-        agg = cci_tiles_view.copy()
-        if admin_level != 1:
-            # Map quadkey tile IDs (zone_id) to this admin level's ucodes.
-            # agg['id'] holds admin1 ucodes at this point, not quadkeys, so we
-            # must re-derive from zone_id which is the original quadkey.
-            id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
-            agg['id'] = agg['zone_id'].map(id_map)
-        agg = agg.groupby("id").agg(agg_dict).reset_index()
-        cci_admin_view = agg.rename(columns={'id': 'tile_id'})
-        written_paths.add(save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level))
-        files_written += 1
+            # CCI for this admin level
+            # min_count=1 (not plain "sum"): matches vagg_dict below, a country whose
+            # tile-level CCI columns are entirely NaN (e.g. an old mercator parquet
+            # pre-dating the WorldPop age-structure columns) must roll up to NaN at
+            # admin level too, not silently to 0 ("zero children impacted" when the
+            # real state is "data unavailable, needs --type patch").
+            agg_dict = {col: (lambda x: x.sum(min_count=1)) for col in sum_cols_cci}
+            agg = cci_tiles_view.copy()
+            if admin_level != 1:
+                # Map quadkey tile IDs (zone_id) to this admin level's ucodes.
+                # agg['id'] holds admin1 ucodes at this point, not quadkeys, so we
+                # must re-derive from zone_id which is the original quadkey.
+                id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
+                agg['id'] = agg['zone_id'].map(id_map)
+            agg = agg.groupby("id").agg(agg_dict).reset_index()
+            cci_admin_view = agg.rename(columns={'id': 'tile_id'})
+            written_paths.add(save_cci_admin(cci_admin_view, country, storm, date, admin_level=admin_level))
+            files_written += 1
 
-        # Vulnerability for this admin level
-        vagg_dict = {col: lambda x: x.sum(min_count=1) for col in sum_cols_vulnerability}
-        vagg = vuln_tiles_view.copy()
-        if admin_level != 1:
-            id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
-            vagg['id'] = vagg['zone_id'].map(id_map)
-        vagg = vagg.groupby("id").agg(vagg_dict).reset_index()
-        vuln_admin_view = vagg.rename(columns={'id': 'tile_id'})
-        written_paths.add(save_vulnerability_admin(vuln_admin_view, country, storm, date, admin_level=admin_level))
-        files_written += 1
+            # Vulnerability for this admin level
+            vagg_dict = {col: lambda x: x.sum(min_count=1) for col in sum_cols_vulnerability}
+            vagg = vuln_tiles_view.copy()
+            if admin_level != 1:
+                id_map = gdf_tiles_for_admin.set_index('tile_id')['id'].to_dict()
+                vagg['id'] = vagg['zone_id'].map(id_map)
+            vagg = vagg.groupby("id").agg(vagg_dict).reset_index()
+            vuln_admin_view = vagg.rename(columns={'id': 'tile_id'})
+            written_paths.add(save_vulnerability_admin(vuln_admin_view, country, storm, date, admin_level=admin_level))
+            files_written += 1
+            heartbeat()
 
-    # Tracks
-    logger.info(f"    Processing tracks...")
-    wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=gdf_shelters, gdf_wash=gdf_wash,
-                                                           bitmask_views=wind_bitmask_views,
-                                                           schools_buff=gdf_schools_buff, hcs_buff=gdf_hcs_buff,
-                                                           shelters_buff=gdf_shelters_buff, wash_buff=gdf_wash_buff)
-    for wind_th in wind_tracks_views:
-        written_paths.add(save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th))
-    files_written += len(wind_tracks_views)
-    logger.info(f"    Created {len(wind_tracks_views)} track views")
+    if not skip_wind:
+        # Tracks
+        logger.info(f"    Processing tracks...")
+        wind_tracks_views = create_tracks_view_from_envelopes(gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes, index_column='ensemble_member', gdf_shelters=gdf_shelters, gdf_wash=gdf_wash,
+                                                               bitmask_views=wind_bitmask_views,
+                                                               schools_buff=gdf_schools_buff, hcs_buff=gdf_hcs_buff,
+                                                               shelters_buff=gdf_shelters_buff, wash_buff=gdf_wash_buff)
+        for wind_th in wind_tracks_views:
+            written_paths.add(save_tracks_view(wind_tracks_views[wind_th], country, storm, date, wind_th))
+        files_written += len(wind_tracks_views)
+        logger.info(f"    Created {len(wind_tracks_views)} track views")
+        heartbeat()
 
-    # Per-tile, per-member coverage bitmask: already computed once, above,
-    # and reused here rather than recomputed (see the comment at its first
-    # computation for the full "why").
-    # A None entry means that threshold's sjoin genuinely FAILED (see
-    # calculate_tile_member_bitmask's own Returns section), skip it rather
-    # than persisting a zero-row parquet that downstream cannot tell apart
-    # from a real 'no member reaches this threshold'.
-    wind_bitmask_written = 0
-    for wind_th, bm in wind_bitmask_views.items():
-        if bm is None:
-            continue
-        written_paths.add(save_tracks_tile_bitmask_view(bm, country, storm, date, wind_th))
-        wind_bitmask_written += 1
-    files_written += wind_bitmask_written
-    logger.info(f"    Created {wind_bitmask_written} tile-member bitmask views")
+        # Per-tile, per-member coverage bitmask: already computed once, above,
+        # and reused here rather than recomputed (see the comment at its first
+        # computation for the full "why").
+        # A None entry means that threshold's sjoin genuinely FAILED (see
+        # calculate_tile_member_bitmask's own Returns section), skip it rather
+        # than persisting a zero-row parquet that downstream cannot tell apart
+        # from a real 'no member reaches this threshold'.
+        wind_bitmask_written = 0
+        for wind_th, bm in wind_bitmask_views.items():
+            if bm is None:
+                continue
+            written_paths.add(save_tracks_tile_bitmask_view(bm, country, storm, date, wind_th))
+            wind_bitmask_written += 1
+        files_written += wind_bitmask_written
+        logger.info(f"    Created {wind_bitmask_written} tile-member bitmask views")
+        heartbeat()
+
+        # Wind is fully done and saved at this exact point (nothing below this line is
+        # wind-related). Report it here, before gust starts, so a caller-side subprocess
+        # supervisor has wind's real result durably recorded even if gust later hangs and
+        # this whole OS process gets killed from outside. See on_wind_complete's own
+        # docstring for the full "why".
+        on_wind_complete(wrote_base_parquet, files_written)
 
     # --- Gust envelopes (optional, core exposure views only) ---
     # No CCI, vulnerability, or JSON report for gust
@@ -3773,7 +3904,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # propagate to the per-country try/except in run_complete_impact_analysis(),
     # which would otherwise discard the wind results from this same call.
     gust_error = None
-    if gdf_envelopes_gust is not None and not gdf_envelopes_gust.empty:
+    if process_gust:
         try:
             logger.info(f"    Processing gust envelopes ({len(gdf_envelopes_gust)} records)...")
 
@@ -3784,23 +3915,27 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             # remains correct for gust's own facility calls as well.
             gust_school_views = create_school_view_from_envelopes(gdf_schools, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_schools_buff)
             for gth in gust_school_views:
-                written_paths.add(save_school_view(gust_school_views[gth], country, storm, date, gth, dataset='gust'))
+                written_paths.add(save_school_view(_facility_view_for_write(gust_school_views[gth], 'gust', f'school {country} g{gth}'), country, storm, date, gth, dataset='gust'))
             files_written += len(gust_school_views)
+            heartbeat()
 
             gust_hc_views = create_health_center_view_from_envelopes(gdf_hcs, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_hcs_buff)
             for gth in gust_hc_views:
-                written_paths.add(save_hc_view(gust_hc_views[gth], country, storm, date, gth, dataset='gust'))
+                written_paths.add(save_hc_view(_facility_view_for_write(gust_hc_views[gth], 'gust', f'hc {country} g{gth}'), country, storm, date, gth, dataset='gust'))
             files_written += len(gust_hc_views)
+            heartbeat()
 
             gust_shelter_views = create_shelter_view_from_envelopes(gdf_shelters, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_shelters_buff)
             for gth in gust_shelter_views:
-                written_paths.add(save_shelter_view(gust_shelter_views[gth], country, storm, date, gth, dataset='gust'))
+                written_paths.add(save_shelter_view(_facility_view_for_write(gust_shelter_views[gth], 'gust', f'shelter {country} g{gth}'), country, storm, date, gth, dataset='gust'))
             files_written += len(gust_shelter_views)
+            heartbeat()
 
             gust_wash_views = create_wash_view_from_envelopes(gdf_wash, gdf_envelopes_gust, threshold_column='gust_threshold', precomputed_buff=gdf_wash_buff)
             for gth in gust_wash_views:
-                written_paths.add(save_wash_view(gust_wash_views[gth], country, storm, date, gth, dataset='gust'))
+                written_paths.add(save_wash_view(_facility_view_for_write(gust_wash_views[gth], 'gust', f'wash {country} g{gth}'), country, storm, date, gth, dataset='gust'))
             files_written += len(gust_wash_views)
+            heartbeat()
 
             # Per-tile, per-member coverage bitmask: computed ONCE here, same
             # hoisting rationale as wind's own bitmask above (see that
@@ -3809,25 +3944,50 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
                                                                threshold_column='gust_threshold',
                                                                label='gust tile')
 
-            gust_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes_gust, threshold_column='gust_threshold',
-                                                                    bitmask_views=gust_bitmask_views)
+            # The tile and admin frames are built directly in their thin form
+            # from the bitmasks; any failure falls back to the dense builders below. Wind keeps the
+            # dense frames: CCI and vulnerability rank over every tile.
+            gust_sparse = None
+            gust_tiles_views = None
+            try:
+                gust_sparse = EnvelopeSparse(gdf_tiles, gdf_tiles_for_admin_by_level)
+                gust_tiles_views = gust_sparse.tile_frames(
+                    list(gdf_envelopes_gust['gust_threshold'].unique()), gust_bitmask_views)
+            except Exception as e:
+                logger.warning(f"    Sparse gust tile frames not applied for {country}, using the dense path: {e}")
+                gust_sparse = None
+                gust_tiles_views = None
+            if gust_tiles_views is None:
+                gust_tiles_views = create_mercator_view_from_envelopes(gdf_tiles, gdf_envelopes_gust, threshold_column='gust_threshold',
+                                                                        bitmask_views=gust_bitmask_views)
             for gth in gust_tiles_views:
                 written_paths.add(save_tiles_view(gust_tiles_views[gth], country, storm, date, gth, zoom, dataset='gust'))
             files_written += len(gust_tiles_views)
+            heartbeat()
 
             for admin_level in admin_levels:
                 # Same admin-level-1 reuse as wind's own call above, this
                 # time against gust_tiles_views: see wind's own call site
                 # comment and create_admin_view_from_envelopes_new()'s
                 # docstring for the full "why".
-                gust_admin_views = create_admin_view_from_envelopes_new(
-                    gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level],
-                    gdf_envelopes_gust, threshold_column='gust_threshold', bitmask_views=gust_bitmask_views,
-                    precomputed_tile_views=(gust_tiles_views if gdf_tiles_for_admin_by_level[admin_level] is gdf_tiles else None))
+                gust_admin_views = None
+                if gust_sparse is not None:
+                    try:
+                        gust_admin_views = gust_sparse.admin_views(
+                            admin_level, gdf_admin_by_level[admin_level],
+                            list(gdf_envelopes_gust['gust_threshold'].unique()), gust_bitmask_views)
+                    except Exception as e:
+                        logger.warning(f"    Sparse gust admin{admin_level} views not applied for {country}, using the dense path: {e}")
+                if gust_admin_views is None:
+                    gust_admin_views = create_admin_view_from_envelopes_new(
+                        gdf_admin_by_level[admin_level], gdf_tiles_for_admin_by_level[admin_level],
+                        gdf_envelopes_gust, threshold_column='gust_threshold', bitmask_views=gust_bitmask_views,
+                        precomputed_tile_views=(gust_tiles_views if (gdf_tiles_for_admin_by_level[admin_level] is gdf_tiles and gust_sparse is None) else None))
                 for gth in gust_admin_views:
                     written_paths.add(save_admin_tiles_view(gust_admin_views[gth], country, storm, date, gth,
                                                              admin_level=admin_level, dataset='gust'))
                 files_written += len(gust_admin_views)
+                heartbeat()
 
             gust_tracks_views = create_tracks_view_from_envelopes(
                 gdf_schools, gdf_hcs, gdf_tiles, gdf_envelopes_gust, index_column='ensemble_member',
@@ -3838,6 +3998,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
             for gth in gust_tracks_views:
                 written_paths.add(save_tracks_view(gust_tracks_views[gth], country, storm, date, gth, dataset='gust'))
             files_written += len(gust_tracks_views)
+            heartbeat()
 
             # Same skip-on-None contract as the wind call site above.
             for gth, bm in gust_bitmask_views.items():
@@ -3845,6 +4006,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
                     continue
                 written_paths.add(save_tracks_tile_bitmask_view(bm, country, storm, date, gth, dataset='gust'))
                 files_written += 1
+            heartbeat()
 
             logger.info(f"    Created gust views ({len(gust_school_views)} thresholds)")
         except Exception as e:
@@ -3862,7 +4024,7 @@ def create_views_from_envelopes_in_country(country, storm, date, gdf_envelopes, 
     # Matched by basename, not exact path string, since data_store.list_files()'s
     # returned path format isn't guaranteed identical to what write_dataset() was
     # given; the removal itself still uses list_files()'s own returned string,
-    # the same pattern the original upfront-delete loop already relied on.
+    # the same pattern the upfront-delete loop relies on.
     written_basenames = {os.path.basename(p) for p in written_paths if p}
     for view_dir, existing in existing_before.items():
         for f in existing:

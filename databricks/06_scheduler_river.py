@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # DATAPIPELINE on Databricks: River-Flood Scheduler
 # MAGIC
-# MAGIC One of 3 independently-scheduled Databricks Jobs, one per hazard, sharing the same cluster
+# MAGIC One of 4 independently-scheduled Databricks Jobs (wind, precip, river, gust), sharing the same cluster
 # MAGIC (see `04_scheduler_windgust.py`'s header for the current design).
 # MAGIC
 # MAGIC This one handles river-flood only, and unlike wind/gust and precip runs on its OWN, sparser
@@ -44,9 +44,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install pandas>=2.0.0 numpy>=1.24.0 geopandas>=0.13.0 shapely>=2.0.0 pyproj>=3.4.0 \
-# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0" "snowflake-connector-python[pandas]>=3.0.0" \
-# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4" "psutil>=5.9.0" "pycountry>=22.3.5" \
-# MAGIC     "quantulum3[classifier]>=0.1.0"
+# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0,<3" "snowflake-connector-python[pandas]>=3.0.0" \
+# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4,<0.10" "psutil>=5.9.0" "pycountry>=22.3.5" \
+# MAGIC     "quantulum3[classifier]>=0.1.0" "SQLAlchemy>=2.0,<2.1"
 
 # COMMAND ----------
 
@@ -165,6 +165,10 @@ os.environ["SNOWFLAKE_WAREHOUSE"] = dbutils.secrets.get("glofas-databricks-test"
 os.environ["SNOWFLAKE_DATABASE"] = dbutils.secrets.get("glofas-databricks-test", "snowflake_database")
 os.environ["SNOWFLAKE_SCHEMA"] = dbutils.secrets.get("glofas-databricks-test", "snowflake_schema")
 
+# Fork safety for the per-country child processes: the parent holds the logging locks across each
+# fork and drains large results. The child-side stream repair stays off (set to "probe" to arm it).
+os.environ["RIVER_FORK_SAFE_STREAMS"] = "off"
+
 if REPO_PATH not in sys.path:
     sys.path.insert(0, REPO_PATH)
 
@@ -178,10 +182,26 @@ print("Environment configured. Repo path on sys.path:", REPO_PATH in sys.path)
 # COMMAND ----------
 
 import logging
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("databricks_scheduler_river")
+
+# This cluster has no log delivery, so the run's own warnings, errors and RIVER_* telemetry lines are also
+# captured into a string that the last cell returns as the notebook result (readable through the Jobs API).
+import io
+
+
+class _RiverLineFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno >= logging.WARNING or "RIVER_" in record.getMessage()
+
+
+_log_buffer = io.StringIO()
+_buffer_handler = logging.StreamHandler(_log_buffer)
+_buffer_handler.setLevel(logging.INFO)
+_buffer_handler.addFilter(_RiverLineFilter())
+_buffer_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logging.getLogger().addHandler(_buffer_handler)
 
 from snowflake_utils import get_snowflake_connection
 
@@ -192,18 +212,22 @@ conn = get_snowflake_connection()
 cur = conn.cursor()
 river_backlog = {}
 for rp in RIVER_RP_TIERS:
-    param = f"extent_{rp}_bymember"
+    params = (f"extent_{rp}_bymember", f"extent_bymask_{rp}")
     cur.execute("""
         SELECT DISTINCT rf.FORECAST_TIME
         FROM   RIVER_FORECASTS rf
-        WHERE  rf.PARAM = %s
-          AND  rf.FORECAST_TIME >= DATEADD('day', -{}, CURRENT_TIMESTAMP())
+        WHERE  rf.PARAM IN (%s, %s)
+          -- SYSDATE(), not CURRENT_TIMESTAMP(): keeps this lookback window anchored to
+          -- real UTC current time regardless of the session's timezone parameter, same class
+          -- of issue as the wind/gust retry-lock fix (pipeline_runlog.py), lower-stakes
+          -- here (a shifted window, not a lockout).
+          AND  rf.FORECAST_TIME >= DATEADD('day', -{}, SYSDATE())
           AND  NOT EXISTS (
                    SELECT 1 FROM AMBIENT_HAZARD_RUN_LOG ahr
                    WHERE  ahr.SOURCE = 'river' AND ahr.PARAM = %s AND ahr.FORECAST_TIME = rf.FORECAST_TIME
                )
         ORDER BY rf.FORECAST_TIME ASC
-    """.format(LOOKBACK_DAYS), (param, rp))
+    """.format(LOOKBACK_DAYS), (*params, rp))
     river_backlog[rp] = [r[0] for r in cur.fetchall()]
 cur.close()
 # conn stays open here, reused immediately below for get_active_countries_from_snowflake(),
@@ -256,7 +280,7 @@ save_known_failed_facilities_cache(known_failed_facilities, logger)
 
 # COMMAND ----------
 
-from main_pipeline import signal_pipeline_complete
+from main_pipeline import signal_pipeline_complete, trigger_mat_refresh_if_due
 
 # Only open a connection when there's actually something to signal: on the overwhelmingly
 # common no-op poll (river_files_written == 0, expected on most polls since GloFAS updates
@@ -270,8 +294,16 @@ if river_files_written > 0:
             storm_ids=[],
             countries=active_countries,
             files_written=river_files_written,
+            refresh_families=["river"],
         )
         logger.info(f"Signalled pipeline completion for ambient river-flood data ({river_files_written} files written)")
+        # Direct MAT refresh trigger, replacing sole reliance on
+        # TRIGGER_REFRESH_TASK's own poll; see trigger_mat_refresh_if_due()'s own
+        # docstring. River checks only 4x/day and rarely coincides with
+        # wind/gust/precip's cron, so the debounce here mostly just guards
+        # against genuine edge-case overlap, not a routine same-cycle collision
+        # like wind/gust-vs-precip.
+        trigger_mat_refresh_if_due(conn, source="river", logger=logger, trailing=True)
     except Exception as e:
         logger.warning(f"Could not write ambient completion signal to Snowflake: {e}")
     finally:
@@ -288,3 +320,13 @@ else:
 
 print(f"River files written: {river_files_written}")
 print(f"Ambient completion signalled: {'yes' if river_files_written > 0 else 'no'}")
+
+# COMMAND ----------
+
+import json
+
+dbutils.notebook.exit(json.dumps({
+    "river_files_written": river_files_written,
+    "captured": "\n".join(
+        line for line in _log_buffer.getvalue().splitlines() if "snowflake.connector" not in line)[-30000:],
+}))

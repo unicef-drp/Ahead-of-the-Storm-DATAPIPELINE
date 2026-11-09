@@ -43,7 +43,9 @@ NASA-SEDAC-GRDI/
 
 vulnerability/
 metadata/
+backfill/
 
 databricks/deploy_main_pipeline.sh
 databricks/deploy.sh
 databricks/deploy_module.sh
+tests/

@@ -230,8 +230,8 @@ def get_initialized_admin_levels_bulk(countries=None):
     to get a plain {} on failure instead of the per-country fallback.
 
     On a listing failure with `countries` given, this falls back to the
-    original per-country listing (slower, but only on this failure path, not
-    the normal one) rather than returning {} unconditionally: a caller's own
+    per-country listing (slower, used only on this failure path, not the
+    normal one) rather than returning {} unconditionally: a caller's own
     `admin_levels_by_country.get(country) or [1]` pattern can't distinguish
     "genuinely has no admin2+ views" from "the one listing that would have
     found them failed", and a country still writes real tile/admin1/facility

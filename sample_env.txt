@@ -20,12 +20,6 @@ export STORMS_FILE=storms.json
 export ROOT_DATA_DIR=geodb
 export VIEWS_DIR=aos_views
 
-# Report files (optional - defaults shown)
-# JSON reports subdirectory under RESULTS_DIR (default: jsons)
-# export REPORTS_JSON_DIR=jsons
-# HTML template path (default: impact-report-template.html in project root)
-# export REPORT_TEMPLATE_PATH=impact-report-template.html
-
 # ---------------------------
 # Snowflake (required for data retrieval)
 # ---------------------------
@@ -60,7 +54,7 @@ export SNOWFLAKE_SCHEMA=your_schema
 # ACCOUNT_URL example: https://<account_name>.blob.core.windows.net
 # SAS_TOKEN should start with ?sv=...
 # CONTAINER_NAME is this repo's own output container (distinct from
-# HAZARD_BLOB_CONTAINER/ADLS_CONTAINER_NAME below)
+# HAZARD_BLOB_CONTAINER below)
 # export ACCOUNT_URL=
 # export SAS_TOKEN=
 # export CONTAINER_NAME=
@@ -71,13 +65,13 @@ export SNOWFLAKE_SCHEMA=your_schema
 # Where to read UPSTREAM hazard source data from (hurricane wind/gust
 # envelopes, tracks, precip/runoff), independent of DATA_PIPELINE_DB above,
 # which only controls where THIS repo's own output/cache is written.
-# SNOWFLAKE (default): query TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_COMBINED/
-#   TC_TRACKS/MET_FORECASTS directly, same as always: no extra vars needed.
+# BLOB (default): same data, from an Azure Blob container (HAZARD_BLOB_* below).
 # LOCAL: read directly from TC-ECMWF-Forecast-Pipeline's own local-disk
-#   output, mainly for local end-to-end testing without a live Snowflake
+#   output, mainly for local end-to-end runs without a live Snowflake
 #   connection populated with real storm data.
-# BLOB: same data, from an Azure Blob container.
-# export HAZARD_DATA_SOURCE=SNOWFLAKE
+# SNOWFLAKE: query TC_ENVELOPES_COMBINED/TC_GUST_ENVELOPES_COMBINED/
+#   TC_TRACKS/MET_FORECASTS directly: no extra vars needed.
+# export HAZARD_DATA_SOURCE=BLOB
 
 # Required only if HAZARD_DATA_SOURCE=LOCAL. Point these at
 # TC-ECMWF-Forecast-Pipeline's own output directories (WIND_EXTRACTED_DIR,

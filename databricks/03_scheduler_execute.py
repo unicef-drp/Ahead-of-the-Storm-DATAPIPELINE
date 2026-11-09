@@ -3,7 +3,7 @@
 # MAGIC # DATAPIPELINE on Databricks: Scheduler Execute
 # MAGIC
 # MAGIC Runs the real compute for whatever unprocessed wind/gust storm cycles and ambient precip/river
-# MAGIC backlog exist, using `02_scheduler_logic`'s discovery queries plus the real compute calls,
+# MAGIC backlog exist, using its own copy of the discovery queries plus the real compute calls,
 # MAGIC deliberately WITHOUT `signal_pipeline_complete()`. That makes this notebook a safe way to
 # MAGIC reprocess or backfill data without triggering the real `SEND_ALERT()`/`SEND_WARNING()` alert
 # MAGIC cascade, since `REFRESH_MATERIALIZED_VIEWS()` only picks up cycles that have been signaled
@@ -17,21 +17,21 @@
 # MAGIC the same calendar date, per its own documented "latest wins" behavior. For precip/river this
 # MAGIC notebook does exactly what production's own `main()` does on every invocation: call the
 # MAGIC analysis functions in plain "latest" mode and let their own idempotency gate decide if there
-# MAGIC is real new work. `02_scheduler_logic`'s lookback query is kept here purely as a DIAGNOSTIC
+# MAGIC is real new work. A copy of `02_scheduler_logic`'s lookback query is kept here purely as a DIAGNOSTIC
 # MAGIC (how deep the backlog is, if any), not as an input to what gets computed.
 # MAGIC
 # MAGIC Wind/gust is different: each storm cycle is distinct and worth its own processing, matching
-# MAGIC `CHECK_AND_TRIGGER_DATAPIPELINE()`'s own logic, so `02_scheduler_logic`'s wind/gust discovery
-# MAGIC results directly drive which `(storm, forecast_time)` pairs get processed below. Note this is
-# MAGIC `02_scheduler_logic`'s simpler, unhardened query (trusts a logged `SUCCESS` status
-# MAGIC unconditionally), not `04_scheduler_windgust.py`'s real-output-existence-checked one, so a
-# MAGIC backfill run here can therefore reprocess (real writes) a cycle the live wind/gust job would
-# MAGIC skip, or vice versa. Cross-check against `04_scheduler_windgust.py`'s own query first if that
-# MAGIC distinction matters for the backfill you're doing.
+# MAGIC `CHECK_AND_TRIGGER_DATAPIPELINE()`'s own logic, so this notebook's own wind/gust discovery
+# MAGIC query directly drives which `(storm, forecast_time)` pairs get processed below. It carries its
+# MAGIC own copy of the discovery query, with stale-lock and given-up-cycle exclusions, and dedups per
+# MAGIC `(storm, forecast_time)` cycle rather than per country like `04_scheduler_windgust.py`, so a
+# MAGIC backfill run here can reprocess (real writes) a cycle the live wind/gust job would skip, or vice
+# MAGIC versa. Cross-check against `04_scheduler_windgust.py`'s own query first if that distinction
+# MAGIC matters for the backfill you're doing.
 # MAGIC
-# MAGIC Real writes to the real Snowflake stage. No completion signal, no alert cascade risk. The 3
-# MAGIC live production scheduler notebooks, `04_scheduler_windgust.py` / `05_scheduler_precip.py` /
-# MAGIC `06_scheduler_river.py`, run this same compute logic (each scoped to its own hazard) plus a
+# MAGIC Real writes to the real Snowflake stage. No completion signal, no alert cascade risk. The
+# MAGIC production scheduler notebooks, `04_scheduler_windgust.py` / `05_scheduler_precip.py` /
+# MAGIC `06_scheduler_river.py` (and the paused `07_scheduler_gust.py`), run this same compute logic (each scoped to its own hazard) plus a
 # MAGIC real completion signal on their own live schedules.
 # MAGIC
 # MAGIC Self-contained: installs its own dependencies and patches directly, so it does not depend on
@@ -45,9 +45,9 @@
 # COMMAND ----------
 
 # MAGIC %pip install pandas>=2.0.0 numpy>=1.24.0 geopandas>=0.13.0 shapely>=2.0.0 pyproj>=3.4.0 \
-# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0" "snowflake-connector-python[pandas]>=3.0.0" \
-# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4" "psutil>=5.9.0" "pycountry>=22.3.5" \
-# MAGIC     "quantulum3[classifier]>=0.1.0"
+# MAGIC     "zarr>=3.0.0" "rasterio>=1.3.0" "duckdb>=1.2.0,<3" "snowflake-connector-python[pandas]>=3.0.0" \
+# MAGIC     "python-dotenv>=1.0.0" "giga-spatial[all]>=0.9.4,<0.10" "psutil>=5.9.0" "pycountry>=22.3.5" \
+# MAGIC     "quantulum3[classifier]>=0.1.0" "SQLAlchemy>=2.0,<2.1"
 
 # COMMAND ----------
 
@@ -148,23 +148,84 @@ RIVER_RP_TIERS = ['rp2', 'rp5', 'rp10', 'rp20', 'rp50', 'rp100']
 conn = get_snowflake_connection()
 cur = conn.cursor()
 
+# Must exist before this query's own NOT EXISTS check against it below:
+# see pipeline_runlog.py's ensure_windgust_giveup_table() docstring.
+from main_pipeline import ensure_windgust_giveup_table
+ensure_windgust_giveup_table(conn)
+
 cur.execute("""
     SELECT DISTINCT te.TRACK_ID, te.FORECAST_TIME
     FROM   TC_ENVELOPES_COMBINED te
     JOIN   PIPELINE_COUNTRIES pc
            ON ST_DWITHIN(pc.COUNTRY_BOUNDARY, te.ENVELOPE_REGION, 1500000)
     WHERE  pc.ACTIVE = TRUE
-      AND  te.FORECAST_TIME >= DATEADD('day', -2, CURRENT_TIMESTAMP())
+      -- SYSDATE(), not CURRENT_TIMESTAMP(): te.FORECAST_TIME is genuinely
+      -- TIMESTAMP_NTZ: see 04_scheduler_windgust.py's own comment for the
+      -- full reasoning (identical column type here).
+      AND  te.FORECAST_TIME >= DATEADD('day', -2, SYSDATE())
+      -- Split into two sibling NOT EXISTS clauses (SUCCESS-covers-it, then
+      -- IN_PROGRESS-not-stale), not one NOT EXISTS with an internal OR: Snowflake
+      -- rejects a correlated subquery whose WHERE clause ORs two conditions that
+      -- each reference outer-scope columns ("Unsupported subquery type cannot be
+      -- evaluated"). This mirrors
+      -- 04_scheduler_windgust.py's own discovery query, which already uses this
+      -- same sibling-NOT-EXISTS shape.
       AND  NOT EXISTS (
                SELECT 1
                FROM   TC_PIPELINE_RUN_LOG rl
                WHERE  rl.STORM_ID      = te.TRACK_ID
                  AND  rl.FORECAST_TIME = te.FORECAST_TIME
-                 AND  (
-                       rl.STATUS = 'SUCCESS'
-                       OR (rl.STATUS IN ('IN_PROGRESS', 'TRIGGERED')
-                           AND rl.STARTED_AT > DATEADD('hour', -6, CURRENT_TIMESTAMP()))
+                 AND  rl.STATUS = 'SUCCESS'
+           )
+      AND  NOT EXISTS (
+               SELECT 1
+               FROM   TC_PIPELINE_RUN_LOG rl
+               WHERE  rl.STORM_ID      = te.TRACK_ID
+                 AND  rl.FORECAST_TIME = te.FORECAST_TIME
+                 AND  rl.STATUS IN ('IN_PROGRESS', 'TRIGGERED')
+                 -- CURRENT_TIMESTAMP(), not SYSDATE(): rl.STARTED_AT is genuinely
+                 -- TIMESTAMP_TZ, a true absolute instant: CURRENT_TIMESTAMP()
+                 -- (TIMESTAMP_LTZ) compares against it correctly regardless of
+                 -- session timezone. rl.STARTED_AT's own value is written as a
+                 -- genuine, timezone-aware UTC instant by pipeline_runlog.py's
+                 -- log_run_start()/log_run_complete() (see their own comments),
+                 -- so this comparison holds correctly on both sides.
+                 --
+                 -- Stale-lock exclusion, same fix and same "why" as
+                 -- 04_scheduler_windgust.py's own discovery query (see that
+                 -- file's own comment for the full story: TC_PIPELINE_RUN_LOG
+                 -- is insert-only, so an attempt that already finished still
+                 -- leaves a permanent IN_PROGRESS row for up to 6h). RUN_ID
+                 -- exact match when available, falling back to the timestamp
+                 -- comparison only for a row that has no RUN_ID. Two
+                 -- separate NOT EXISTS again, same De Morgan reasoning as above.
+                 AND  rl.STARTED_AT > DATEADD('hour', -6, CURRENT_TIMESTAMP())
+                 AND  NOT EXISTS (
+                          SELECT 1
+                          FROM   TC_PIPELINE_RUN_LOG rl2
+                          WHERE  rl2.STORM_ID      = rl.STORM_ID
+                            AND  rl2.FORECAST_TIME = rl.FORECAST_TIME
+                            AND  rl2.STATUS IN ('SUCCESS', 'FAILURE')
+                            AND  rl.RUN_ID IS NOT NULL AND rl2.RUN_ID = rl.RUN_ID
                       )
+                 AND  NOT EXISTS (
+                          SELECT 1
+                          FROM   TC_PIPELINE_RUN_LOG rl2
+                          WHERE  rl2.STORM_ID      = rl.STORM_ID
+                            AND  rl2.FORECAST_TIME = rl.FORECAST_TIME
+                            AND  rl2.STATUS IN ('SUCCESS', 'FAILURE')
+                            AND  rl.RUN_ID IS NULL AND rl2.COMPLETED_AT > rl.STARTED_AT
+                      )
+           )
+      -- Given-up cycles (see pipeline_runlog.py's "GIVE-UP GATE") aren't
+      -- real backlog either: exclude them so this diagnostic count stays
+      -- meaningful instead of accumulating cycles the scheduler itself
+      -- will never touch again.
+      AND  NOT EXISTS (
+               SELECT 1
+               FROM   TC_PIPELINE_GAVE_UP_LOG gul
+               WHERE  gul.STORM_ID      = te.TRACK_ID
+                 AND  gul.FORECAST_TIME = te.FORECAST_TIME
            )
     ORDER BY te.FORECAST_TIME DESC
 """)
@@ -174,7 +235,7 @@ cur.execute(f"""
     SELECT DISTINCT mf.FORECAST_TIME
     FROM   MET_FORECASTS mf
     WHERE  mf.PARAM = 'tp'
-      AND  mf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, CURRENT_TIMESTAMP())
+      AND  mf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, SYSDATE())
       AND  NOT EXISTS (
                SELECT 1 FROM AMBIENT_HAZARD_RUN_LOG ahr
                WHERE  ahr.SOURCE = 'precip' AND ahr.PARAM = 'tp' AND ahr.FORECAST_TIME = mf.FORECAST_TIME
@@ -185,18 +246,18 @@ precip_backlog = [r[0] for r in cur.fetchall()]
 
 river_backlog = {}
 for rp in RIVER_RP_TIERS:
-    param = f"extent_{rp}_bymember"
+    params = (f"extent_{rp}_bymember", f"extent_bymask_{rp}")
     cur.execute(f"""
         SELECT DISTINCT rf.FORECAST_TIME
         FROM   RIVER_FORECASTS rf
-        WHERE  rf.PARAM = %s
-          AND  rf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, CURRENT_TIMESTAMP())
+        WHERE  rf.PARAM IN (%s, %s)
+          AND  rf.FORECAST_TIME >= DATEADD('day', -{LOOKBACK_DAYS}, SYSDATE())
           AND  NOT EXISTS (
                    SELECT 1 FROM AMBIENT_HAZARD_RUN_LOG ahr
                    WHERE  ahr.SOURCE = 'river' AND ahr.PARAM = %s AND ahr.FORECAST_TIME = rf.FORECAST_TIME
                )
         ORDER BY rf.FORECAST_TIME ASC
-    """, (param, rp))
+    """, (*params, rp))
     river_backlog[rp] = [r[0] for r in cur.fetchall()]
 cur.close()
 conn.close()
@@ -233,10 +294,10 @@ active_countries = get_active_countries_from_snowflake()
 print(f"Active countries: {len(active_countries)}")
 
 wind_results = []
-# The fix that makes `_seed_facility_failure_cache()`/`_new_facility_failures()`
-# (main_pipeline.py; see their own docstrings for the full "why") restore
-# cross-country facility-fetch-failure caching despite per-country subprocess
-# isolation: one set for this whole scheduler run, mutated in place by every
+# Shared state that lets `_seed_facility_failure_cache()`/`_new_facility_failures()`
+# (main_pipeline.py; see their own docstrings for the full "why") keep
+# facility-fetch failures cached across countries despite per-country
+# subprocess isolation: one set for this whole scheduler run, mutated in place by every
 # storm's own run_complete_impact_analysis() call below, then carried forward
 # into precip's and river's own calls further down this notebook.
 known_failed_facilities = set()

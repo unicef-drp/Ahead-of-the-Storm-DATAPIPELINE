@@ -19,7 +19,7 @@ def _update_active_in_boundary_cache(country_code, active: bool):
     Keep pipeline_countries_boundaries.parquet's ACTIVE flag in sync after a
     real Snowflake ACTIVE change here. Without this, the cache's ACTIVE value
     is a permanent one-time snapshot from whenever write_country_boundary()
-    last ran for this country (impact_analysis.py's
+    last ran for this country (country_boundaries.py's
     _update_pipeline_countries_cache()), never refreshed again, so
     get_countries_in_range_cached() would keep using a stale ACTIVE value
     forever after any real activate/deactivate call.
@@ -57,9 +57,8 @@ def get_active_countries_from_snowflake(conn=None):
             open connection for a nearby query (e.g. a Databricks scheduler's
             own backlog-discovery query, run moments earlier with no real I/O
             in between) avoid a second full connect/auth round trip just for
-            this call. When omitted (the default, and every pre-existing
-            caller's behavior), this opens and closes its own connection
-            exactly as before.
+            this call. When omitted (the default), this opens and closes its own
+            connection.
 
     Returns:
         list: List of active country codes (e.g., ['TWN', 'DOM', 'VNM'])
@@ -342,60 +341,6 @@ def deactivate_country(country_code):
             except:
                 pass
 
-def get_countries_needing_initialization(zoom_level=None):
-    """
-    Get list of countries that have never been initialized at a specific zoom level.
-    
-    Args:
-        zoom_level: Zoom level to check (if None, uses default from PIPELINE_COUNTRIES)
-    
-    Returns:
-        list: List of country codes that need initialization
-    """
-    conn = None
-    try:
-        conn = get_snowflake_connection()
-
-        if zoom_level is None:
-            # Get countries that haven't been initialized at their default zoom level
-            query = """
-                SELECT c.COUNTRY_CODE
-                FROM PIPELINE_COUNTRIES c
-                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z
-                    ON c.COUNTRY_CODE = z.COUNTRY_CODE
-                    AND c.ZOOM_LEVEL = z.ZOOM_LEVEL
-                WHERE c.ACTIVE = TRUE
-                  AND (c.IS_REGION IS NULL OR c.IS_REGION = FALSE)
-                  AND z.LAST_INITIALIZED IS NULL
-                ORDER BY c.COUNTRY_CODE
-            """
-        else:
-            # Get countries that haven't been initialized at the specified zoom level
-            query = """
-                SELECT c.COUNTRY_CODE
-                FROM PIPELINE_COUNTRIES c
-                LEFT JOIN PIPELINE_COUNTRY_ZOOM_LEVELS z
-                    ON c.COUNTRY_CODE = z.COUNTRY_CODE
-                    AND z.ZOOM_LEVEL = %s
-                WHERE c.ACTIVE = TRUE
-                  AND (c.IS_REGION IS NULL OR c.IS_REGION = FALSE)
-                  AND z.LAST_INITIALIZED IS NULL
-                ORDER BY c.COUNTRY_CODE
-            """
-
-        if zoom_level is None:
-            df = pd.read_sql(query, conn)
-        else:
-            df = pd.read_sql(query, conn, params=[zoom_level])
-
-        return df['COUNTRY_CODE'].tolist()
-    except Exception as e:
-        logger.error(f"Error retrieving countries needing initialization: {e}")
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
-
 def get_initialized_zoom_levels(country_code):
     """
     Get list of zoom levels that have been initialized for a country.
@@ -423,37 +368,6 @@ def get_initialized_zoom_levels(country_code):
     finally:
         if conn is not None:
             conn.close()
-
-def get_countries_needing_zoom_level(country_code, zoom_level):
-    """
-    Check if a specific country+zoom combination needs initialization.
-    
-    Args:
-        country_code: ISO3 country code
-        zoom_level: Zoom level to check
-    
-    Returns:
-        bool: True if needs initialization, False if already initialized
-    """
-    conn = None
-    try:
-        conn = get_snowflake_connection()
-        query = """
-            SELECT COUNT(*) as COUNT
-            FROM PIPELINE_COUNTRY_ZOOM_LEVELS 
-            WHERE COUNTRY_CODE = %s AND ZOOM_LEVEL = %s
-        """
-        df = pd.read_sql(query, conn, params=[country_code, zoom_level])
-        return df['COUNT'].iloc[0] == 0
-    except Exception as e:
-        logger.error(f"Error checking zoom level initialization: {e}")
-        return True  # Assume needs initialization if error
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
 
 def _apply_country_update(country_code, country_name=None, center_lat=None, center_lon=None, view_zoom=None, timezone=None):
     """Shared implementation for updating editable country fields."""
@@ -545,25 +459,3 @@ def update_country_config(country_code, country_name=None, center_lat=None, cent
     return _apply_country_update(country_code, country_name=country_name,
                                  center_lat=center_lat, center_lon=center_lon,
                                  view_zoom=view_zoom, timezone=timezone)
-
-
-def update_country_map_config(country_code, center_lat=None, center_lon=None, view_zoom=None):
-    """
-    Update the map configuration (center coordinates and/or view zoom) for a country.
-    Only updates fields that are provided (not None).
-
-    Args:
-        country_code: ISO3 country code
-        center_lat: Optional latitude for map center (None to skip update)
-        center_lon: Optional longitude for map center (None to skip update)
-        view_zoom: Optional zoom level for visualization map (None to skip update)
-
-    Returns:
-        bool: True if successful, False otherwise
-
-    Raises:
-        ValueError: If all parameters are None (nothing to update)
-    """
-    if center_lat is None and center_lon is None and view_zoom is None:
-        raise ValueError("At least one of center_lat, center_lon, or view_zoom must be provided")
-    return _apply_country_update(country_code, center_lat=center_lat, center_lon=center_lon, view_zoom=view_zoom)

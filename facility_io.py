@@ -43,7 +43,7 @@ from pipeline_shared import (
 logger = logging.getLogger(__name__)
 
 # HealthSites.io's own `country` filter doesn't recognize every active country's
-# name in any spelling/case/ISO-code form (confirmed via direct API testing:
+# name in any spelling/case/ISO-code form (the API behaves as follows:
 # 'Aruba'/'aruba'/'AW'/'ABW' and 'Curacao'/'Curaçao'/'Netherlands Antilles' all
 # return 400 "not found or not a country" - a gap in HealthSites' own country
 # list, not a name-resolution bug here). A bounding-box (`extent`) query reaches
@@ -334,9 +334,9 @@ def fetch_health_centers(country, rewrite=0, fast_fail=False):
     if hc_exist(country) and rewrite == 0:
         cached = load_hc_locations(country)
         if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
+            # A cache without a 'source' column is labelled with the
+            # standard source instead of being re-fetched to backfill
+            # provenance.
             if 'source' not in cached.columns:
                 cached['source'] = 'HealthSites.io'
             return cached
@@ -352,8 +352,12 @@ def fetch_health_centers(country, rewrite=0, fast_fail=False):
         # (an enrichment layer, not core hazard/impact data); --type
         # initialize/patch keep the patient retry path below to actually
         # discover/backfill this data.
-        logger.info(f"{country}: no persistent HealthSites.io cache exists yet, skipping live fetch under "
-                    f"fast_fail (run --type initialize/patch to populate real data for this country)")
+        # WARNING, not INFO: a missing cache does not clear itself, so this
+        # condition otherwise persists silently on every future cycle
+        # indefinitely for this country, and an INFO message with no
+        # corresponding failure-log entry would never surface it.
+        logger.warning(f"{country}: no persistent HealthSites.io cache exists yet, skipping live fetch under "
+                        f"fast_fail (run --type initialize/patch to populate real data for this country)")
         return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
     if (country, 'health_centers') in _FACILITY_FETCH_FAILURE_CACHE:
         logger.info(f"{country}: HealthSites.io fetch already failed this run, skipping retry (returning empty)")
@@ -391,7 +395,7 @@ def fetch_health_centers(country, rewrite=0, fast_fail=False):
     except Exception as e:
         if '403' in str(e):
             logger.error(f"{country}: HealthSites API returned 403 Forbidden: likely daily rate limit "
-                         f"exceeded (50 requests/day). Run scripts/test_healthsites.py to confirm. "
+                         f"exceeded (50 requests/day). Re-run a single healthsites.io request manually to confirm. "
                          f"To skip the API, provide a custom file at "
                          f"geodb/custom/{country}_health_centers.csv (see custom_data/README.md)")
         else:
@@ -452,9 +456,9 @@ def fetch_schools(country, rewrite=0, fast_fail=False):
         if (gdf_schools is not None and not gdf_schools.empty
                 and 'school_id_giga' in gdf_schools.columns and 'geometry' in gdf_schools.columns
                 and not gdf_schools.geometry.isna().all()):
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
+            # A cache without a 'source' column is labelled with the
+            # standard source instead of being re-fetched to backfill
+            # provenance.
             if 'source' not in gdf_schools.columns:
                 gdf_schools['source'] = 'UNICEF Giga school-location API'
             return gdf_schools
@@ -462,9 +466,10 @@ def fetch_schools(country, rewrite=0, fast_fail=False):
 
     # 3. Fetch from GIGA API
     if fast_fail and not school_exist(country):
-        # See fetch_health_centers()'s own identical guard for the full "why".
-        logger.info(f"{country}: no persistent GIGA API cache exists yet, skipping live fetch under "
-                    f"fast_fail (run --type initialize/patch to populate real data for this country)")
+        # See fetch_health_centers()'s own identical guard for the full "why",
+        # including why this is WARNING not INFO.
+        logger.warning(f"{country}: no persistent GIGA API cache exists yet, skipping live fetch under "
+                        f"fast_fail (run --type initialize/patch to populate real data for this country)")
         return gpd.GeoDataFrame(columns=['geometry', 'school_id_giga'], crs='EPSG:4326')
     if (country, 'schools') in _FACILITY_FETCH_FAILURE_CACHE:
         logger.info(f"{country}: GIGA API fetch already failed this run, skipping retry (returning empty)")
@@ -542,9 +547,9 @@ def fetch_shelters(country, rewrite=0, fast_fail=False):
     if shelter_exist(country) and rewrite == 0:
         cached = load_shelter_locations(country)
         if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
+            # A cache without a 'source' column is labelled with the
+            # standard source instead of being re-fetched to backfill
+            # provenance.
             if 'source' not in cached.columns:
                 cached['source'] = 'OpenStreetMap (social_facility=shelter tag)'
             return cached
@@ -552,9 +557,10 @@ def fetch_shelters(country, rewrite=0, fast_fail=False):
 
     # 3. Fetch from OSM via Overpass API
     if fast_fail and not shelter_exist(country):
-        # See fetch_health_centers()'s own identical guard for the full "why".
-        logger.info(f"{country}: no persistent OSM shelter cache exists yet, skipping live fetch under "
-                    f"fast_fail (run --type initialize/patch to populate real data for this country)")
+        # See fetch_health_centers()'s own identical guard for the full "why",
+        # including why this is WARNING not INFO.
+        logger.warning(f"{country}: no persistent OSM shelter cache exists yet, skipping live fetch under "
+                        f"fast_fail (run --type initialize/patch to populate real data for this country)")
         return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
     if (country, 'shelters') in _FACILITY_FETCH_FAILURE_CACHE:
         logger.info(f"{country}: OSM (Overpass) shelter fetch already failed this run, skipping retry (returning empty)")
@@ -617,9 +623,9 @@ def fetch_wash(country, rewrite=0, fast_fail=False):
     if wash_exist(country) and rewrite == 0:
         cached = load_wash_locations(country)
         if not cached.empty and 'osm_id' in cached.columns and 'geometry' in cached.columns and not cached.geometry.isna().all():
-            # Caches written before the 'source' column existed have none;
-            # label them with the standard source now rather than forcing a
-            # re-fetch just to backfill provenance.
+            # A cache without a 'source' column is labelled with the
+            # standard source instead of being re-fetched to backfill
+            # provenance.
             if 'source' not in cached.columns:
                 cached['source'] = 'OpenStreetMap (humanitarian WASH tags)'
             return cached
@@ -627,9 +633,10 @@ def fetch_wash(country, rewrite=0, fast_fail=False):
 
     # 3. Fetch from OSM via Overpass API
     if fast_fail and not wash_exist(country):
-        # See fetch_health_centers()'s own identical guard for the full "why".
-        logger.info(f"{country}: no persistent OSM WASH cache exists yet, skipping live fetch under "
-                    f"fast_fail (run --type initialize/patch to populate real data for this country)")
+        # See fetch_health_centers()'s own identical guard for the full "why",
+        # including why this is WARNING not INFO.
+        logger.warning(f"{country}: no persistent OSM WASH cache exists yet, skipping live fetch under "
+                        f"fast_fail (run --type initialize/patch to populate real data for this country)")
         return gpd.GeoDataFrame(columns=['geometry', 'osm_id'], crs='EPSG:4326')
     if (country, 'wash') in _FACILITY_FETCH_FAILURE_CACHE:
         logger.info(f"{country}: OSM (Overpass) WASH fetch already failed this run, skipping retry (returning empty)")

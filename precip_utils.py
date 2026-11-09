@@ -8,27 +8,25 @@ whether any named storm is active. The MET_FORECASTS pointer table (which
 cycle exists, and its STAGE_PATH) is always read from Snowflake regardless
 of config.HAZARD_DATA_SOURCE (see get_latest_met_forecast()'s own docstring
 for why); only the actual Zarr file body read dispatches on that setting:
-SNOWFLAKE (default) reads from the stage, LOCAL/BLOB read the same files
+SNOWFLAKE reads from the stage, BLOB (default) and LOCAL read the same files
 directly from TC-ECMWF-Forecast-Pipeline's own met_data/ output instead
 (see get_hazard_met_data_store() below). This module downloads and reads
 those Zarr files, and computes exceedance-probability grids from them.
 
 Usage:
-    from precip_utils import get_latest_met_forecast, read_precip_window, \
+    from precip_utils import get_latest_met_forecast, read_precip_windows, \
         exceedance_probability, ratio_exceedance_probability
     tp_row = get_latest_met_forecast('tp')
-    member_numbers, lat, lon, tp_grid = read_precip_window(tp_row['stage_path'], data_store, 0, 24)
+    windows = read_precip_windows(tp_row['stage_path'], data_store, [24])
+    member_numbers, lat_min, lat_max, lon_min, lon_max, tp_grid = windows[24]
     probability_grid = exceedance_probability(tp_grid, threshold_mm=50)
 """
 
-import os
 import tempfile
 import logging
 from typing import Optional
 
 import numpy as np
-import pandas as pd
-import rasterio
 import zarr
 
 from snowflake_utils import _execute_query
@@ -148,8 +146,8 @@ def get_met_forecast_for_date_snowflake(param: str, target_date) -> Optional[dic
 def get_hazard_met_data_store():
     """
     Data store for reading MET_FORECASTS-equivalent precip/runoff Zarr files,
-    governed by config.HAZARD_DATA_SOURCE. SNOWFLAKE (default) is identical
-    to get_met_forecasts_data_store(); LOCAL/BLOB read TC-ECMWF-Forecast-
+    governed by config.HAZARD_DATA_SOURCE. SNOWFLAKE is identical
+    to get_met_forecasts_data_store(); BLOB (default) and LOCAL read TC-ECMWF-Forecast-
     Pipeline's own met_data/ output instead.
 
     This governs only the FILE BODY read (once get_latest_met_forecast()/
@@ -175,7 +173,7 @@ def get_latest_met_forecast(param: str) -> Optional[dict]:
     Does NOT dispatch to a LOCAL/BLOB file-listing equivalent: a Blob-mirror
     of MET_FORECASTS can lag the real table by days, so a file-listing
     "latest" pointer risks staleness. Matches
-    glofas_utils.get_latest_river_forecast()'s own always-Snowflake pattern:
+    glofas_utils.get_river_tier_pointers()'s own always-Snowflake pattern:
     MET_FORECASTS.STAGE_PATH already uses the identical relative-path
     convention the LOCAL/BLOB file body read expects (e.g.
     'met/20260907_00/tp_20260907_00.zarr.zip'), so this Snowflake-sourced
@@ -199,80 +197,22 @@ def get_met_forecast_for_date(param: str, target_date) -> Optional[dict]:
 # ZARR DOWNLOAD + READ
 # =============================================================================
 
-def read_precip_window(stage_path: str, data_store, step_a_hour: int, step_b_hour: int):
-    """
-    Read an accumulated tp/ro window from a Zarr file on the stage.
-
-    tp/ro are stored accumulated from T+0 at 6h-step intervals (0, 6, 12, ...,
-    144), already in mm , so any window is just a difference of
-    two steps, no matter how wide, at no extra download or storage cost
-    beyond the one Zarr read.
-
-    Args:
-        stage_path: STAGE_PATH value from a MET_FORECASTS row.
-        data_store: giga-spatial DataStore instance (LOCAL/BLOB/SNOWFLAKE).
-        step_a_hour: window start, hours from T+0 (e.g. 0).
-        step_b_hour: window end, hours from T+0 (e.g. 24). Must be a real
-            step in the Zarr's own `steps` attribute (6h multiples, 0-144).
-
-    Returns:
-        (member_numbers, lat_min, lat_max, lon_min, lon_max, period_grid)
-        where period_grid has shape (51, n_lat, n_lon), the accumulated mm
-        over [step_a_hour, step_b_hour) per ensemble member. Row 0 of
-        period_grid corresponds to lat_max (rows run N->S), matching the
-        upstream Zarr's own row order and GeoTIFF's north-at-row-0
-        convention, so grid_to_geotiff() below needs no flip.
-    """
-    raw_bytes = data_store.read_file(stage_path)
-
-    with tempfile.NamedTemporaryFile(suffix='.zarr.zip') as tmp:
-        tmp.write(raw_bytes)
-        tmp.flush()
-        # Real ~1.3GB (tp) / ~266MB (ro) object, dead weight once flushed to
-        # disk (the Zarr store below reads back from tmp.name, never from
-        # raw_bytes again); freeing it here keeps this real transient
-        # allocation off this function's own peak.
-        del raw_bytes
-
-        store = zarr.storage.ZipStore(tmp.name, mode='r')
-        try:
-            root = zarr.open_group(store=store, mode='r')
-            z = root['data']  # shape (51, 25, n_lat, n_lon), float16, mm accumulated from T+0
-            attrs = dict(root.attrs)
-            steps = list(attrs['steps'])  # [0, 6, 12, ..., 144]
-
-            if step_a_hour not in steps or step_b_hour not in steps:
-                raise ValueError(
-                    f"Requested window [{step_a_hour}, {step_b_hour}] not in "
-                    f"available steps {steps} for {stage_path}"
-                )
-
-            ia, ib = steps.index(step_a_hour), steps.index(step_b_hour)
-            data_a = np.asarray(z[:, ia, :, :]).astype('float32')
-            data_b = np.asarray(z[:, ib, :, :]).astype('float32')
-            period_grid_mm = data_b - data_a
-
-            member_numbers = list(attrs.get('member_numbers', range(1, z.shape[0] + 1)))
-            lat_min, lat_max = float(attrs['lat_min']), float(attrs['lat_max'])
-            lon_min, lon_max = float(attrs['lon_min']), float(attrs['lon_max'])
-        finally:
-            store.close()
-
-    return member_numbers, lat_min, lat_max, lon_min, lon_max, period_grid_mm
-
-
 def read_precip_windows(stage_path: str, data_store, windows_h):
     """
-    Same real (member_numbers, lat_min, lat_max, lon_min, lon_max,
-    period_grid_mm) result read_precip_window() returns, for EVERY window in
-    `windows_h` at once, from a SINGLE download+open of the Zarr file.
+    Read the accumulated tp/ro grid of EVERY window in `windows_h` at once from
+    a SINGLE download+open of the Zarr file.
+
+    tp/ro are stored accumulated from T+0 at fixed step intervals, already in
+    mm, so any window [0, step_b_hour) is the difference of two steps, no
+    matter how wide, at no extra download or storage cost beyond the one Zarr
+    read. Row 0 of each period_grid_mm corresponds to lat_max (rows run N->S),
+    matching the upstream Zarr's own row order and GeoTIFF's north-at-row-0
+    convention.
 
     Downloads and opens the Zarr file once, then slices each window from the
     one open array, since the file is large (tp ~1.3GB, ro ~266MB) and a
     single file holds every step any window needs. Slices out each requested
-    window's own [0, step_b_hour) diff from the one already-open array,
-    matching read_precip_window()'s own accumulated-from-T+0 semantics
-    exactly (see that function's own docstring).
+    window's own [0, step_b_hour) diff from the one already-open array.
 
     Args:
         stage_path: STAGE_PATH value from a MET_FORECASTS row.
@@ -282,14 +222,13 @@ def read_precip_windows(stage_path: str, data_store, windows_h):
 
     Returns:
         dict {window_h: (member_numbers, lat_min, lat_max, lon_min, lon_max,
-        period_grid_mm)}, same per-window shape/semantics read_precip_window()
-        returns for that same window. May have fewer entries than windows_h
+        period_grid_mm)}, where period_grid_mm has shape (51, n_lat, n_lon),
+        the accumulated mm over [0, window_h) per ensemble member. May have fewer entries than windows_h
         if a specific window's own step is missing/malformed (logged, not
         raised): a per-window failure never loses any other window's already-
         successfully-extracted data. Only a failure that prevents the file
         itself from being downloaded/opened/read (network error, corrupt
-        zip, missing T+0 baseline) raises, exactly like read_precip_window()
-        already does for that same class of failure.
+        zip, missing T+0 baseline) raises.
     """
     raw_bytes = data_store.read_file(stage_path)
 
@@ -313,9 +252,8 @@ def read_precip_windows(stage_path: str, data_store, windows_h):
             lat_min, lat_max = float(attrs['lat_min']), float(attrs['lat_max'])
             lon_min, lon_max = float(attrs['lon_min']), float(attrs['lon_max'])
 
-            # T+0 baseline read once, shared by every window (every real call
-            # site so far always passes step_a_hour=0, matching
-            # read_precip_window()'s own accumulated-from-T+0 convention). A
+            # T+0 baseline read once, shared by every window (every window is
+            # accumulated from T+0). A
             # missing T+0 step means every window is unreadable from this
             # file, so this one still raises rather than returning an empty
             # dict; each caller already handles a total read failure the
@@ -383,14 +321,14 @@ def exceedance_bitmask(period_grid: np.ndarray, threshold_mm: float, member_numb
     set <=> member i's own accumulated rainfall exceeds threshold_mm at that
     cell), the same real per-member exceedance data exceedance_probability()
     collapses via `.sum(axis=0)/51`, kept instead of discarded. Exists so a
-    downstream tile-level bitmask (calculate_precip_tile_member_bitmask,
-    impact_analysis.py) can be computed and persisted as a real pipeline
+    downstream tile-level bitmask (calculate_precip_tile_member_bitmask in
+    precip_views.py) can be computed and persisted as a real pipeline
     output, mirroring Wind/River's own per-member bitmask outputs; this is
     the same real per-member exceedance check `_combine_bitmask_aware`'s own
     rain branch (services/tile_server.py, the dashboard repo) does live, per
     request.
 
-    `member_numbers` (NOT a plain 0-50 range) matters: read_precip_window()
+    `member_numbers` (NOT a plain 0-50 range) matters: read_precip_windows()
     returns this from the Zarr's own `member_numbers` attribute, defaulting
     to `range(1, 52)` only when that attribute is absent; a real ensemble
     member's own number, not its array position, is what determines which
@@ -404,7 +342,7 @@ def exceedance_bitmask(period_grid: np.ndarray, threshold_mm: float, member_numb
         threshold_mm: accumulated rainfall threshold in mm.
         member_numbers: real 1-indexed member numbers, len == period_grid.shape[0],
             aligned 1:1 with period_grid's own member axis (same list
-            read_precip_window() returns alongside period_grid itself).
+            read_precip_windows() returns alongside the period grid itself).
 
     Returns:
         (n_lat, n_lon) uint64 array, bit `m-1` set <=> member `m` exceeds
@@ -475,42 +413,3 @@ def ratio_exceedance_probability(
         )
     per_member_ratio = np.where(tp_grid >= min_tp_mm, ro_grid / np.maximum(tp_grid, 1e-6), 0.0)
     return (per_member_ratio > ratio_threshold).sum(axis=0) / FULL_ENSEMBLE_SIZE
-
-
-# =============================================================================
-# GRID -> GEOTIFF (for giga-spatial's TifProcessor)
-# =============================================================================
-
-def grid_to_geotiff(
-    grid_2d: np.ndarray,
-    lat_min: float, lat_max: float, lon_min: float, lon_max: float,
-    out_path: str,
-) -> None:
-    """
-    Materialize a 2D probability grid as a GeoTIFF, so it can be opened with
-    giga-spatial's TifProcessor and sampled per-tile via centroid-based point
-    sampling (see create_precip_tile_view() in impact_analysis.py).
-
-    Args:
-        grid_2d: (n_lat, n_lon) array. Row 0 must correspond to lat_max (rows
-            run N->S), matching read_precip_window()'s own row order and the
-            underlying Zarr's row order (both N->S from row 0), so this
-            already matches GeoTIFF's north-at-row-0 convention, no flip needed.
-        lat_min, lat_max, lon_min, lon_max: outermost grid point coordinates, degrees.
-        out_path: local file path to write the GeoTIFF to.
-    """
-    n_lat, n_lon = grid_2d.shape
-    dlat = (lat_max - lat_min) / (n_lat - 1) if n_lat > 1 else 0.0
-    dlon = (lon_max - lon_min) / (n_lon - 1) if n_lon > 1 else 0.0
-    transform = rasterio.transform.from_bounds(
-        lon_min - dlon / 2, lat_min - dlat / 2,
-        lon_max + dlon / 2, lat_max + dlat / 2,
-        n_lon, n_lat,
-    )
-
-    with rasterio.open(
-        out_path, 'w', driver='GTiff',
-        height=grid_2d.shape[0], width=grid_2d.shape[1],
-        count=1, dtype='float32', crs='EPSG:4326', transform=transform,
-    ) as dst:
-        dst.write(grid_2d.astype('float32'), 1)

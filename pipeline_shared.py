@@ -38,8 +38,8 @@ CUSTOM_DATA_DIR = os.path.join(ROOT_DATA_DIR, 'custom')
 # =============================================================================
 # DATA STORE
 # =============================================================================
-# Defaults to LOCAL if DATA_PIPELINE_DB is not set or is LOCAL. In production
-# (SPCS), DATA_PIPELINE_DB is SNOWFLAKE and credentials are available. One
+# Defaults to LOCAL if DATA_PIPELINE_DB is not set or is LOCAL. The production
+# Databricks schedulers set BLOB; SPCS runs set SNOWFLAKE and credentials are available. One
 # singleton, imported by name everywhere it's used (never re-constructed per
 # module) so a connection reset before a subprocess fork
 # (main_pipeline.py's own _reset_snowflake_connection_before_fork()) affects
